@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { writeFileSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { FORMATS, render } from "./render.mjs";
 
 const USAGE = `trawl — curl for the JavaScript web
@@ -203,8 +204,27 @@ export async function main(argv) {
 	return result.status && result.status >= 400 ? 22 : 0;
 }
 
-const invokedDirectly = process.argv[1]?.endsWith("cli.mjs");
-if (invokedDirectly) {
+// Are we the entry point, or were we imported as a library?
+//
+// This cannot match on the filename. npm installs `bin` as a symlink, and the
+// shebang re-execs as `node <symlink>`, so process.argv[1] is the symlink
+// (…/bin/trawl) rather than this file — Node never realpaths it. A suffix test
+// against "cli.mjs" is therefore false for every global install, and the CLI
+// exits 0 having done nothing (#14).
+//
+// Realpath BOTH sides: argv[1] because it may be a symlink, and import.meta.url
+// because --preserve-symlinks-main leaves it un-resolved. Anything unreadable
+// (argv[1] absent under `node -e`, a deleted entry) means "not the entry point".
+export function isMainModule(entry = process.argv[1], self = import.meta.url) {
+	if (!entry) return false;
+	try {
+		return realpathSync(entry) === realpathSync(fileURLToPath(self));
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) {
 	try {
 		process.exitCode = await main(process.argv.slice(2));
 	} catch (err) {

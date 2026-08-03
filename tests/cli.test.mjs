@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { parseArgs, parseViewport } from "../src/cli.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { isMainModule, parseArgs, parseViewport } from "../src/cli.mjs";
 
 test("collects a bare url as a positional", () => {
 	assert.deepEqual(parseArgs(["https://example.com"])._, [
@@ -108,4 +113,76 @@ test("treats --no-readability as a boolean flag", () => {
 	const args = parseArgs(["u", "-f", "md", "--no-readability"]);
 	assert.equal(args["--no-readability"], true);
 	assert.deepEqual(args._, ["u"]);
+});
+
+// Entry-point detection (#14).
+//
+// npm installs `bin` as a symlink and the shebang re-execs as `node <symlink>`,
+// so process.argv[1] is the symlink, not this file. The guard used to match on
+// the "cli.mjs" suffix, which is false for every global install — `trawl
+// --help` printed nothing and exited 0. These tests run the CLI THROUGH A
+// SYMLINK, which is the shape nothing else in the suite covers: every other
+// test imports the module or spawns `node src/cli.mjs`, and both of those pass
+// even with the bug present.
+
+const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
+
+function runCli(entry, args = []) {
+	return new Promise((resolve) => {
+		execFile(process.execPath, [entry, ...args], (err, stdout, stderr) => {
+			resolve({ code: err?.code ?? 0, stdout, stderr });
+		});
+	});
+}
+
+test("isMainModule() resolves a symlinked entry back to this module", () => {
+	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	try {
+		const link = join(dir, "trawl");
+		symlinkSync(CLI_PATH, link);
+		// The exact comparison the shebang path makes for a global install.
+		assert.equal(isMainModule(link, pathToFileURL(CLI_PATH).href), true);
+		// An unrelated entry is still correctly "not main".
+		assert.equal(isMainModule(dir, pathToFileURL(CLI_PATH).href), false);
+		// A missing argv[1] must not throw.
+		assert.equal(isMainModule(undefined, pathToFileURL(CLI_PATH).href), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("runs when invoked through a bin symlink, not just by real path", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	try {
+		const link = join(dir, "trawl");
+		symlinkSync(CLI_PATH, link);
+
+		const viaLink = await runCli(link, ["--help"]);
+		// The bug was silence-with-exit-0, so assert on real output, not the code.
+		assert.ok(
+			viaLink.stdout.length > 0,
+			"CLI produced no stdout when run through a symlink",
+		);
+		assert.match(viaLink.stdout, /curl for the JavaScript web/);
+
+		// And it behaves identically to invoking the real path.
+		const viaReal = await runCli(CLI_PATH, ["--help"]);
+		assert.equal(viaLink.stdout, viaReal.stdout);
+		assert.equal(viaLink.code, viaReal.code);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a symlinked CLI reports the same version as the real path", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	try {
+		const link = join(dir, "trawl");
+		symlinkSync(CLI_PATH, link);
+		const { stdout, code } = await runCli(link, ["--version"]);
+		assert.equal(code, 0);
+		assert.match(stdout.trim(), /^\d+\.\d+\.\d+$/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

@@ -103,3 +103,9 @@ for (const bad of ["0x600", "1280x0", "0x0"]) {
 		);
 	});
 }
+
+test("treats --no-readability as a boolean flag", () => {
+	const args = parseArgs(["u", "-f", "md", "--no-readability"]);
+	assert.equal(args["--no-readability"], true);
+	assert.deepEqual(args._, ["u"]);
+});

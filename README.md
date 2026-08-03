@@ -32,7 +32,9 @@ explicit `--executable-path`, `$TRAWL_EXECUTABLE_PATH`, a cached
 trawl <url> [options]
 trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
 
-  -f, --format <fmt>       text | html | links | title      (default: text)
+  -f, --format <fmt>       text | html | links | title | markdown (md)
+                                                               (default: text)
+      --no-readability     Skip article extraction for -f markdown
   -s, --selector <css>     Extract only this element
   -w, --wait-for <css>     Block until this selector appears
       --settle <ms>        Extra pause after load                (default: 0)
@@ -55,10 +57,20 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
 trawl https://example.com/spa                      # rendered text
 trawl https://example.com -f links                 # href<TAB>text, one per line
 trawl https://example.com -s '#main' -f html       # one subtree, as HTML
+trawl https://example.com -f md                    # article, as Markdown
 trawl https://example.com -w '.loaded' --settle 500
 trawl https://example.com --har trace.har          # + the full network trace
 trawl https://example.com --screenshot page.png --full-page   # text + a PNG
 ```
+
+### Markdown
+
+`-f markdown` (alias `md`) runs Mozilla Readability against the rendered page
+to drop nav/footer chrome, then converts what's left to Markdown, so headings,
+lists, links, and fenced code all survive. Readability is tuned for articles
+and can eat the content on docs sites and single-column apps — pass
+`--no-readability` to convert the page as-is, or use `-f text`, which is never
+filtered.
 
 ### HAR capture
 
@@ -141,9 +153,9 @@ budget. A failed fetch comes back as a tool error — the server keeps serving.
 
 ## Status
 
-Early. v0.1.0 does one thing: render a URL and extract text/HTML/links.
-HAR capture, Markdown output, and an MCP server are the next milestones —
-see the [issues](https://github.com/rjwalters/trawl/issues).
+Early. Renders a URL and extracts text/HTML/links/Markdown. HAR capture and an
+MCP server are the next milestones — see the
+[issues](https://github.com/rjwalters/trawl/issues).
 
 ## Etiquette
 

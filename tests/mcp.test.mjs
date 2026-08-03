@@ -60,7 +60,13 @@ test("both tool schemas require a url", () => {
 
 test("fetch_page advertises the renderer's formats", () => {
 	const schema = TOOLS[0].inputSchema.properties;
-	assert.deepEqual(schema.format.enum, ["text", "html", "links", "title"]);
+	assert.deepEqual(schema.format.enum, [
+		"text",
+		"html",
+		"links",
+		"title",
+		"markdown",
+	]);
 	assert.ok(schema.selector && schema.wait_for);
 });
 

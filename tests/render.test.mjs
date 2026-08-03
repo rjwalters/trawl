@@ -72,6 +72,37 @@ function tmpFile(name) {
 	return path.join(mkdtempSync(path.join(tmpdir(), "trawl-shot-")), name);
 }
 
+// Readability only treats a page as an article once it has a meaningful
+// amount of prose, so the structured fixture below pads itself past that
+// threshold.
+const PROSE =
+	"Readability scores a page on how much prose it carries, so this " +
+	"paragraph exists to push the fixture past that threshold and let the " +
+	"article branch run the way it would on a real post. ";
+
+// Every structure the Markdown round trip is supposed to preserve, plus the
+// nav/footer chrome Readability is supposed to drop.
+const ARTICLE = `<!doctype html>
+<title>Structured Fixture</title>
+<nav><a href="https://example.com/nav">Site navigation</a></nav>
+<article>
+  <h1>Top Heading</h1>
+  <p>${PROSE.repeat(3)}</p>
+  <h2>Second Heading</h2>
+  <ul><li>alpha</li><li>beta</li></ul>
+  <ol><li>first step</li><li>second step</li></ol>
+  <p><a href="https://example.com/deep">Deep link</a> ${PROSE}</p>
+  <pre><code class="language-js">const answer = 42;</code></pre>
+  <p>${PROSE.repeat(2)}</p>
+</article>
+<footer>Footer chrome</footer>`;
+
+// No text at all: Readability's parse() gives up and returns null here, which
+// is the case the "still returns something" acceptance criterion is about.
+const APP_SHELL = `<!doctype html>
+<title>App shell</title>
+<div id="app"><img src="https://example.com/logo.png" alt="Logo"></div>`;
+
 function fixtureUrl(html, name) {
 	const dir = mkdtempSync(path.join(tmpdir(), "trawl-test-"));
 	const file = path.join(dir, name);
@@ -186,6 +217,118 @@ test("ignores fullPage when no screenshot was requested", opts, async () => {
 	});
 	assert.match(body, /Hydrated/);
 	assert.equal(screenshot, null);
+});
+
+test("preserves document structure for --format markdown", opts, async () => {
+	const { body } = await render(fixtureUrl(ARTICLE, "article.html"), {
+		format: "markdown",
+	});
+
+	// Readability promotes the document title to the article title and demotes
+	// the in-body <h1> to <h2>, so the heading hierarchy shifts by one level
+	// but every heading survives as an ATX heading rather than setext.
+	assert.match(body, /^# Structured Fixture$/m);
+	assert.match(body, /^## Top Heading$/m);
+	assert.match(body, /^## Second Heading$/m);
+	assert.match(body, /^-\s+alpha$/m);
+	assert.match(body, /^-\s+beta$/m);
+	assert.match(body, /^1\.\s+first step$/m);
+	assert.match(body, /^2\.\s+second step$/m);
+	assert.match(body, /\[Deep link\]\(https:\/\/example\.com\/deep\)/);
+	// Fenced, not the 4-space-indented default Turndown would otherwise emit.
+	assert.match(body, /```\nconst answer = 42;\n```/);
+	assert.doesNotMatch(body, /^ {4}const answer = 42;$/m);
+	// Readability's whole job: the nav/footer chrome is gone.
+	assert.doesNotMatch(body, /Site navigation/);
+	assert.doesNotMatch(body, /Footer chrome/);
+});
+
+test("treats --format md as an alias for markdown", opts, async () => {
+	const url = fixtureUrl(ARTICLE, "article.html");
+	const alias = await render(url, { format: "md" });
+	const canonical = await render(url, { format: "markdown" });
+	assert.equal(alias.body, canonical.body);
+	assert.match(alias.body, /^## Top Heading$/m);
+});
+
+test("skips Readability when readability: false", opts, async () => {
+	const url = fixtureUrl(ARTICLE, "article.html");
+	const raw = await render(url, { format: "markdown", readability: false });
+	const filtered = await render(url, { format: "markdown" });
+
+	// The escape hatch exists so boilerplate-stripping can be turned off; prove
+	// it actually changes what comes back rather than merely not crashing.
+	assert.notEqual(raw.body, filtered.body);
+	assert.match(raw.body, /Site navigation/);
+	assert.match(raw.body, /Footer chrome/);
+	// Untouched markup also keeps the language hint Readability strips with
+	// the rest of the class attributes.
+	assert.match(raw.body, /```js\nconst answer = 42;\n```/);
+});
+
+test("still returns markdown when there is no article", opts, async () => {
+	const { body } = await render(fixtureUrl(APP_SHELL, "shell.html"), {
+		format: "markdown",
+	});
+	assert.notEqual(body, "");
+	assert.match(body, /!\[Logo\]\(https:\/\/example\.com\/logo\.png\)/);
+});
+
+// Readability is injected as an inline <script>, which a nonce/hash-based
+// `script-src` blocks outright — that killed `-f markdown` on github.com and
+// MDN. `file://` fixtures carry no CSP, so reproducing it needs a real
+// response header; serve one from loopback rather than depending on a
+// third-party site.
+async function serveWithCsp(html, csp) {
+	const server = createServer((req, res) => {
+		if (req.url === "/robots.txt") {
+			res.writeHead(200, { "content-type": "text/plain" });
+			res.end("User-agent: *\nAllow: /\n");
+			return;
+		}
+		res.writeHead(200, {
+			"content-type": "text/html",
+			"content-security-policy": csp,
+		});
+		res.end(html);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	return {
+		url: `http://127.0.0.1:${port}/article.html`,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+test("renders markdown on a page with a strict script-src CSP", opts, async () => {
+	const s = await serveWithCsp(ARTICLE, "script-src 'self'");
+	try {
+		const { body } = await render(s.url, { format: "markdown" });
+
+		// Not just "didn't throw": the boilerplate stripping proves Readability
+		// itself ran, rather than the run silently degrading to the raw-HTML
+		// fallback (which would keep the nav and footer).
+		assert.match(body, /^# Structured Fixture$/m);
+		assert.match(body, /^## Top Heading$/m);
+		assert.match(body, /^-\s+alpha$/m);
+		assert.doesNotMatch(body, /Site navigation/);
+		assert.doesNotMatch(body, /Footer chrome/);
+	} finally {
+		await s.close();
+	}
+});
+
+test("still renders text under a strict CSP without bypassing it", opts, async () => {
+	// The bypass is scoped to the Readability injection; formats that inject
+	// nothing must keep the page's own CSP enforced.
+	const s = await serveWithCsp(ARTICLE, "script-src 'self'");
+	try {
+		const { body } = await render(s.url, { format: "text" });
+		assert.match(body, /Top Heading/);
+		assert.match(body, /Site navigation/);
+	} finally {
+		await s.close();
+	}
 });
 
 test("rejects an unknown format before launching a browser", async () => {

@@ -46,6 +46,7 @@ trawl <url> [options]
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
       --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
+      --ignore-robots      Skip the robots.txt check
   -S, --show-status        Print HTTP status + final URL to stderr
 ```
 
@@ -93,6 +94,12 @@ import { render } from "trawl-cli";
 const { body, status } = await render("https://example.com", { format: "text" });
 ```
 
+`render()` consults `robots.txt` for `http(s)` URLs before it navigates, and
+throws if the path is disallowed — the same default the CLI has. Pass
+`{ ignoreRobots: true }` to skip it. Non-`http(s)` URLs (`file://`, for
+instance) are never checked. It also sends the default trawl `User-Agent`
+unless you pass your own `userAgent`.
+
 ## Why not X?
 
 - **`curl` / `wget`** — no JavaScript engine, so SPAs come back empty.
@@ -113,11 +120,32 @@ see the [issues](https://github.com/rjwalters/trawl/issues).
 
 ## Etiquette
 
-`trawl` is a browser you drive from a script. Use it the way a person would
-use a browser: identify yourself honestly with `--user-agent`, respect
-`robots.txt` and Terms of Service, and don't point it at a site faster than
-you'd click. It ships no proxy rotation, no fingerprint spoofing, and no
-CAPTCHA solving, and it won't.
+`trawl` is a browser you drive from a script, and it behaves like one by
+default rather than asking you to promise you will.
+
+- **`robots.txt` is checked before every `http(s)` fetch.** A disallowed
+  path fails with the rule that blocked it, naming `--ignore-robots`, and no
+  page navigation happens. Matching is the classic baseline: `User-agent`
+  group selection (a group naming `trawl` beats `*`), longest matching path
+  prefix wins, and `Allow` breaks a tie with `Disallow`. Wildcard (`*`) and
+  end-anchor (`$`) patterns are not supported. If `robots.txt` can't be
+  fetched — network error, timeout, 404, any non-2xx — the path is treated
+  as allowed; this is politeness, not a security boundary.
+- **`--ignore-robots` overrides it**, because there are legitimate reasons:
+  your own staging site, a page you are authenticated to, a `robots.txt`
+  that blocks all bots but permits the human reading the same URL.
+- **`Crawl-delay` is honored** as a pause between the `robots.txt` request
+  and the page request. `trawl` fetches one page per run, so that is the
+  only gap there is to space out. It is capped at 60s so a `Crawl-delay:
+  86400` can't hang the tool.
+- **It identifies itself**: the default `User-Agent` is
+  `trawl/<version> (+https://github.com/rjwalters/trawl)`, so an operator
+  reading their logs can see what hit them and block it if they want.
+  `-A`/`--user-agent` still overrides it.
+
+Beyond that: don't point it at a site faster than you'd click, and respect
+Terms of Service. It ships no proxy rotation, no fingerprint spoofing, and
+no CAPTCHA solving, and it won't.
 
 ## License
 

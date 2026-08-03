@@ -23,6 +23,7 @@ Options:
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
       --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
+      --ignore-robots      Skip the robots.txt check
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
   -v, --version            Show version
@@ -90,7 +91,8 @@ export function parseArgs(argv) {
 			arg === "--version" ||
 			arg === "--show-status" ||
 			arg === "--har-omit-content" ||
-			arg === "--full-page"
+			arg === "--full-page" ||
+			arg === "--ignore-robots"
 		) {
 			out[arg] = true;
 			continue;
@@ -165,6 +167,7 @@ export async function main(argv) {
 		harOmitContent: Boolean(args["--har-omit-content"]),
 		screenshot: args["--screenshot"],
 		fullPage: !!args["--full-page"],
+		ignoreRobots: args["--ignore-robots"] === true,
 		// Only override when the flag was actually supplied, so render()'s own
 		// default viewport keeps applying to every other call.
 		...(viewport ? { viewport } : {}),

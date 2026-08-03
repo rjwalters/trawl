@@ -22,6 +22,11 @@ test("treats boolean flags as booleans", () => {
 	assert.equal(parseArgs(["-S", "u"])["--show-status"], true);
 });
 
+test("treats --ignore-robots as a boolean", () => {
+	assert.equal(parseArgs(["--ignore-robots", "u"])["--ignore-robots"], true);
+	assert.equal(parseArgs(["u"])["--ignore-robots"], undefined);
+});
+
 test("keeps the url positional even after valued flags", () => {
 	const args = parseArgs(["--timeout", "5000", "https://example.com"]);
 	assert.deepEqual(args._, ["https://example.com"]);

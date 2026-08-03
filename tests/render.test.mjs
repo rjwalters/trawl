@@ -287,3 +287,184 @@ test("surfaces a HAR that could not be written", opts, async () => {
 
 	assert.ok(!existsSync(file), "no HAR should have been written");
 });
+
+// --- robots.txt ---
+//
+// These serve robots.txt (and, where a test needs a real navigation, a page)
+// from a throwaway loopback server, so nothing here touches a third-party
+// site. Tests that only need the pre-navigation check run unconditionally:
+// like the unknown-format test above, they throw before any browser launch.
+
+// A Chromium path that cannot exist: render() rejects at browser resolution,
+// which is *after* the robots check, so a rejection here still proves what
+// the check did (or didn't) do first.
+const NO_BROWSER = {
+	executablePath: path.join(tmpdir(), "trawl-no-such-chrome"),
+};
+
+// Serve a fixed body per path; anything unlisted is a 404.
+async function serve(routes) {
+	const server = createServer((req, res) => {
+		const url = new URL(req.url, "http://127.0.0.1");
+		const body = routes[url.pathname];
+		if (body === undefined) {
+			res.writeHead(404, { "content-type": "text/plain" });
+			res.end("not found");
+			return;
+		}
+		const type = url.pathname.endsWith(".txt") ? "text/plain" : "text/html";
+		res.writeHead(200, { "content-type": type });
+		res.end(body);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	return {
+		origin: `http://127.0.0.1:${port}`,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+test("refuses a robots.txt-disallowed path before launching a browser", async () => {
+	const s = await serve({
+		"/robots.txt": "User-agent: *\nDisallow: /private/\n",
+	});
+	try {
+		await assert.rejects(
+			() => render(`${s.origin}/private/page.html`),
+			/robots\.txt disallows this path \(Disallow: \/private\/\)\. Use --ignore-robots to override\./,
+		);
+	} finally {
+		await s.close();
+	}
+});
+
+test("ignoreRobots skips the check entirely", async () => {
+	const s = await serve({
+		"/robots.txt": "User-agent: *\nDisallow: /\n",
+	});
+	try {
+		// Reaching the (missing) browser proves the check did not fire.
+		await assert.rejects(
+			() =>
+				render(`${s.origin}/private/page.html`, {
+					...NO_BROWSER,
+					ignoreRobots: true,
+				}),
+			/Chromium binary not found/,
+		);
+	} finally {
+		await s.close();
+	}
+});
+
+test("a missing robots.txt fails open", async () => {
+	const s = await serve({});
+	try {
+		await assert.rejects(
+			() => render(`${s.origin}/anything`, NO_BROWSER),
+			/Chromium binary not found/,
+		);
+	} finally {
+		await s.close();
+	}
+});
+
+test("never fetches robots.txt for a file:// URL", async () => {
+	let calls = 0;
+	const spy = async () => {
+		calls++;
+		throw new Error("robots.txt should not be fetched for file://");
+	};
+
+	await assert.rejects(
+		() => render(fixtureUrl(SPA, "spa.html"), { ...NO_BROWSER, fetch: spy }),
+		/Chromium binary not found/,
+	);
+	assert.equal(calls, 0);
+
+	// Same options against an http(s) URL *do* consult robots.txt — otherwise
+	// the assertion above would pass for the wrong reason.
+	await assert.rejects(
+		() => render("http://127.0.0.1:1/page", { ...NO_BROWSER, fetch: spy }),
+		/Chromium binary not found/,
+	);
+	assert.equal(calls, 1);
+});
+
+test("identifies itself with a default trawl User-Agent on the robots.txt fetch", async () => {
+	const seen = [];
+	const spy = async (url, init) => {
+		seen.push([url, init.headers["User-Agent"]]);
+		return { ok: true, status: 200, text: async () => "" };
+	};
+
+	await assert.rejects(
+		() => render("http://127.0.0.1:1/page", { ...NO_BROWSER, fetch: spy }),
+		/Chromium binary not found/,
+	);
+	assert.deepEqual(seen[0][0], "http://127.0.0.1:1/robots.txt");
+	assert.match(
+		seen[0][1],
+		/^trawl\/\d[\w.-]* \(\+https:\/\/github\.com\/rjwalters\/trawl\)$/,
+	);
+
+	// An explicit userAgent still wins outright.
+	await assert.rejects(
+		() =>
+			render("http://127.0.0.1:1/page", {
+				...NO_BROWSER,
+				fetch: spy,
+				userAgent: "my-own-agent/9",
+			}),
+		/Chromium binary not found/,
+	);
+	assert.equal(seen[1][1], "my-own-agent/9");
+});
+
+test("sleeps for Crawl-delay between the robots.txt fetch and the page fetch", async () => {
+	const s = await serve({ "/robots.txt": "User-agent: *\nCrawl-delay: 1\n" });
+	const started = Date.now();
+	try {
+		await assert.rejects(
+			() => render(`${s.origin}/page`, NO_BROWSER),
+			/Chromium binary not found/,
+		);
+	} finally {
+		await s.close();
+	}
+	assert.ok(
+		Date.now() - started >= 900,
+		`expected a ~1s crawl delay, waited ${Date.now() - started}ms`,
+	);
+});
+
+test("navigates an allowed path and sends the default User-Agent", opts, async () => {
+	const s = await serve({
+		"/robots.txt": "User-agent: *\nDisallow: /private/\n",
+		"/ua.html": `<!doctype html><div id="root"></div>
+<script>document.getElementById("root").textContent = navigator.userAgent;</script>`,
+	});
+	try {
+		const { body, status } = await render(`${s.origin}/ua.html`);
+		assert.equal(status, 200);
+		assert.match(body, /^trawl\/\d/);
+	} finally {
+		await s.close();
+	}
+});
+
+test("ignoreRobots navigates a path robots.txt would block", opts, async () => {
+	const s = await serve({
+		"/robots.txt": "User-agent: *\nDisallow: /\n",
+		"/private/page.html": `<!doctype html><p>secret</p>`,
+	});
+	try {
+		await assert.rejects(() => render(`${s.origin}/private/page.html`));
+		const { body } = await render(`${s.origin}/private/page.html`, {
+			ignoreRobots: true,
+		});
+		assert.match(body, /secret/);
+	} finally {
+		await s.close();
+	}
+});

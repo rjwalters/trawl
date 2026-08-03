@@ -274,6 +274,63 @@ test("still returns markdown when there is no article", opts, async () => {
 	assert.match(body, /!\[Logo\]\(https:\/\/example\.com\/logo\.png\)/);
 });
 
+// Readability is injected as an inline <script>, which a nonce/hash-based
+// `script-src` blocks outright — that killed `-f markdown` on github.com and
+// MDN. `file://` fixtures carry no CSP, so reproducing it needs a real
+// response header; serve one from loopback rather than depending on a
+// third-party site.
+async function serveWithCsp(html, csp) {
+	const server = createServer((req, res) => {
+		if (req.url === "/robots.txt") {
+			res.writeHead(200, { "content-type": "text/plain" });
+			res.end("User-agent: *\nAllow: /\n");
+			return;
+		}
+		res.writeHead(200, {
+			"content-type": "text/html",
+			"content-security-policy": csp,
+		});
+		res.end(html);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	return {
+		url: `http://127.0.0.1:${port}/article.html`,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+test("renders markdown on a page with a strict script-src CSP", opts, async () => {
+	const s = await serveWithCsp(ARTICLE, "script-src 'self'");
+	try {
+		const { body } = await render(s.url, { format: "markdown" });
+
+		// Not just "didn't throw": the boilerplate stripping proves Readability
+		// itself ran, rather than the run silently degrading to the raw-HTML
+		// fallback (which would keep the nav and footer).
+		assert.match(body, /^# Structured Fixture$/m);
+		assert.match(body, /^## Top Heading$/m);
+		assert.match(body, /^-\s+alpha$/m);
+		assert.doesNotMatch(body, /Site navigation/);
+		assert.doesNotMatch(body, /Footer chrome/);
+	} finally {
+		await s.close();
+	}
+});
+
+test("still renders text under a strict CSP without bypassing it", opts, async () => {
+	// The bypass is scoped to the Readability injection; formats that inject
+	// nothing must keep the page's own CSP enforced.
+	const s = await serveWithCsp(ARTICLE, "script-src 'self'");
+	try {
+		const { body } = await render(s.url, { format: "text" });
+		assert.match(body, /Top Heading/);
+		assert.match(body, /Site navigation/);
+	} finally {
+		await s.close();
+	}
+});
+
 test("rejects an unknown format before launching a browser", async () => {
 	await assert.rejects(
 		() => render("https://example.com", { format: "yaml" }),

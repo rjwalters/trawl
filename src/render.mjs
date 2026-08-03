@@ -109,7 +109,18 @@ async function extractMarkdown(page, { selector, readability }) {
 	const turndown = markdownConverter();
 
 	if (readability !== false) {
-		const article = await readArticle(page, selector);
+		// Belt-and-braces: `render()` sets `bypassCSP` for this path so the
+		// injected <script> survives a nonce/hash-based script-src, but an
+		// injection can still fail for reasons we don't control (a page that
+		// navigates away mid-extraction, a sandboxed frame). Degrade to the
+		// raw-HTML conversion below rather than aborting the whole render —
+		// unfiltered Markdown beats a stack trace.
+		let article = null;
+		try {
+			article = await readArticle(page, selector);
+		} catch {
+			article = null;
+		}
 		if (article?.content) {
 			const body = turndown.turndown(article.content).trim();
 			if (!article.title) return body;
@@ -215,6 +226,14 @@ export async function render(url, options = {}) {
 		context = await browser.newContext({
 			viewport: opts.viewport,
 			userAgent,
+			// Readability is injected into the page as an inline <script>, which
+			// a nonce/hash-based `script-src` blocks outright — github.com and
+			// MDN both do this, and the rejection killed the whole render. Scope
+			// the bypass to exactly the path that needs it: every other format
+			// reads the DOM without injecting anything, so they keep the page's
+			// own CSP enforced.
+			...(opts.format === "markdown" &&
+				opts.readability !== false && { bypassCSP: true }),
 			// Bodies are embedded (base64) rather than written as sidecar files
 			// so a single `.har` is self-contained and imports cleanly into
 			// Chrome DevTools. `mode: "full"` keeps timings and request bodies;

@@ -17,6 +17,8 @@ Options:
       --timeout <ms>       Navigation/selector timeout       (default: 30000)
   -o, --output <file>      Write to a file instead of stdout
   -A, --user-agent <ua>    Override the User-Agent
+      --har <file>         Write a HAR 1.2 network trace to this file
+      --har-omit-content   Record HAR metadata only, no response bodies
       --executable-path <p>  Chromium binary to use
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
@@ -50,6 +52,7 @@ const VALUED = new Set([
 	"--output",
 	"--user-agent",
 	"--executable-path",
+	"--har",
 ]);
 
 export function parseArgs(argv) {
@@ -76,7 +79,12 @@ export function parseArgs(argv) {
 			out[arg] = value;
 			continue;
 		}
-		if (arg === "--help" || arg === "--version" || arg === "--show-status") {
+		if (
+			arg === "--help" ||
+			arg === "--version" ||
+			arg === "--show-status" ||
+			arg === "--har-omit-content"
+		) {
 			out[arg] = true;
 			continue;
 		}
@@ -129,6 +137,8 @@ export async function main(argv) {
 			: 30000,
 		userAgent: args["--user-agent"],
 		executablePath: args["--executable-path"],
+		har: args["--har"],
+		harOmitContent: Boolean(args["--har-omit-content"]),
 	});
 
 	if (args["--show-status"]) {

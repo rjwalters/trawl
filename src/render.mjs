@@ -52,10 +52,27 @@ export async function render(url, options = {}) {
 	const executablePath = resolveExecutablePath(opts.executablePath);
 	const browser = await chromium.launch({ executablePath, headless: true });
 
+	// Declared out here so the `finally` can close the context even if
+	// navigation throws — see the teardown comment below.
+	let context;
+	// Set immediately before the successful return, so the teardown can tell
+	// "nothing went wrong" from "an error is already propagating".
+	let ok = false;
 	try {
-		const context = await browser.newContext({
+		context = await browser.newContext({
 			viewport: opts.viewport,
 			userAgent: opts.userAgent,
+			// Bodies are embedded (base64) rather than written as sidecar files
+			// so a single `.har` is self-contained and imports cleanly into
+			// Chrome DevTools. `mode: "full"` keeps timings and request bodies;
+			// "minimal" would drop them.
+			...(opts.har && {
+				recordHar: {
+					path: opts.har,
+					content: opts.harOmitContent ? "omit" : "embed",
+					mode: "full",
+				},
+			}),
 		});
 		const page = await context.newPage();
 
@@ -74,8 +91,29 @@ export async function render(url, options = {}) {
 		if (opts.settle > 0) await page.waitForTimeout(opts.settle);
 
 		const body = await extract(page, opts);
+		ok = true;
 		return { body, status: response?.status() ?? null, url: page.url() };
 	} finally {
+		// A recorded HAR is only flushed to disk when the *context* closes, so
+		// close it explicitly and first — `browser.close()` alone would lose the
+		// trace of exactly the runs worth tracing (a goto that timed out, a host
+		// that never resolved).
+		let closeError;
+		if (context) {
+			try {
+				await context.close();
+			} catch (err) {
+				// Swallow a teardown failure only when an error is already
+				// propagating: it must not mask the error that got us here. On the
+				// success path there is nothing to mask, and closing the context is
+				// where the HAR is written — a HAR that could not be written has to
+				// surface, the same way a `--output` file that cannot be written
+				// does. Rethrow *after* the browser is closed, so a failed HAR
+				// write never leaks the browser process.
+				if (ok) closeError = err;
+			}
+		}
 		await browser.close();
+		if (closeError) throw closeError;
 	}
 }

@@ -40,6 +40,38 @@ const PAGE_WITH_SUBRESOURCE = `<!doctype html>
 <link rel="stylesheet" href="/style.css">
 <h1>Served</h1>`;
 
+// Same idea, but deliberately taller than any viewport we screenshot it at,
+// so --full-page has something to prove.
+const TALL_SPA = `<!doctype html>
+<title>Tall fixture</title>
+<div id="root"></div>
+<script>
+  document.getElementById("root").innerHTML =
+    '<h1>Hydrated</h1><div style="height:1500px;background:#0af"></div>';
+</script>`;
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+// PNG stores width/height as big-endian uint32s in the IHDR chunk, at fixed
+// offsets right after the 8-byte signature — no image library needed.
+function pngSize(file) {
+	const buf = readFileSync(file);
+	assert.deepEqual(
+		buf.subarray(0, 8),
+		PNG_MAGIC,
+		"file does not start with the PNG signature",
+	);
+	assert.ok(
+		buf.length > 500,
+		`expected a non-trivial PNG, got ${buf.length} bytes`,
+	);
+	return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+function tmpFile(name) {
+	return path.join(mkdtempSync(path.join(tmpdir(), "trawl-shot-")), name);
+}
+
 function fixtureUrl(html, name) {
 	const dir = mkdtempSync(path.join(tmpdir(), "trawl-test-"));
 	const file = path.join(dir, name);
@@ -103,6 +135,57 @@ test("scopes extraction to --selector", opts, async () => {
 	);
 	const { body } = await render(url, { selector: "#b" });
 	assert.equal(body.trim(), "beta");
+});
+
+test("returns null for screenshot when none was requested", opts, async () => {
+	const { screenshot } = await render(fixtureUrl(SPA, "spa.html"));
+	assert.equal(screenshot, null);
+});
+
+test("writes a PNG screenshot alongside the normal body", opts, async () => {
+	const shot = tmpFile("out.png");
+	const { body, screenshot } = await render(fixtureUrl(SPA, "spa.html"), {
+		screenshot: shot,
+	});
+	// One page load produced both artifacts.
+	assert.match(body, /Hydrated/);
+	assert.equal(screenshot, shot);
+	const { width, height } = pngSize(shot);
+	// Default viewport, non-full-page: exactly DEFAULTS.viewport.
+	assert.equal(width, 1280);
+	assert.equal(height, 2000);
+});
+
+test("clips a non-full-page screenshot to an explicit viewport", opts, async () => {
+	const shot = tmpFile("small.png");
+	await render(fixtureUrl(TALL_SPA, "tall.html"), {
+		screenshot: shot,
+		viewport: { width: 400, height: 300 },
+	});
+	assert.deepEqual(pngSize(shot), { width: 400, height: 300 });
+});
+
+test("--full-page produces a taller screenshot than the viewport", opts, async () => {
+	const shot = tmpFile("full.png");
+	await render(fixtureUrl(TALL_SPA, "tall.html"), {
+		screenshot: shot,
+		fullPage: true,
+		viewport: { width: 400, height: 300 },
+	});
+	const { width, height } = pngSize(shot);
+	assert.equal(width, 400);
+	assert.ok(
+		height > 300,
+		`expected full-page height > viewport 300, got ${height}`,
+	);
+});
+
+test("ignores fullPage when no screenshot was requested", opts, async () => {
+	const { body, screenshot } = await render(fixtureUrl(SPA, "spa.html"), {
+		fullPage: true,
+	});
+	assert.match(body, /Hydrated/);
+	assert.equal(screenshot, null);
 });
 
 test("rejects an unknown format before launching a browser", async () => {

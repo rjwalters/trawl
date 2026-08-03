@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseArgs } from "../src/cli.mjs";
+import { parseArgs, parseViewport } from "../src/cli.mjs";
 
 test("collects a bare url as a positional", () => {
 	assert.deepEqual(parseArgs(["https://example.com"])._, [
@@ -54,3 +54,47 @@ test("treats --har-omit-content as a boolean", () => {
 test("does not mistake a negative-looking value for a flag", () => {
 	assert.equal(parseArgs(["-A", "-weird-ua", "u"])["--user-agent"], "-weird-ua");
 });
+
+test("takes a path for --screenshot", () => {
+	assert.equal(
+		parseArgs(["u", "--screenshot", "out.png"])["--screenshot"],
+		"out.png",
+	);
+});
+
+test("treats --full-page as a boolean", () => {
+	assert.equal(parseArgs(["u", "--full-page"])["--full-page"], true);
+});
+
+test("takes a WxH value for --viewport", () => {
+	assert.equal(
+		parseArgs(["u", "--viewport", "1280x800"])["--viewport"],
+		"1280x800",
+	);
+});
+
+test("parses a well-formed --viewport into width/height", () => {
+	assert.deepEqual(parseViewport("1280x800"), { width: 1280, height: 800 });
+});
+
+for (const bad of ["1280", "1280x", "x800", "1280X800", "1280x800px", ""]) {
+	test(`rejects malformed --viewport ${JSON.stringify(bad)}`, () => {
+		assert.throws(
+			() => parseViewport(bad),
+			new Error(
+				`--viewport expects <width>x<height>, e.g. 1280x800, got "${bad}"`,
+			),
+		);
+	});
+}
+
+for (const bad of ["0x600", "1280x0", "0x0"]) {
+	test(`rejects a non-positive --viewport dimension ${bad}`, () => {
+		assert.throws(
+			() => parseViewport(bad),
+			new Error(
+				`--viewport expects <width>x<height>, e.g. 1280x800, got "${bad}"`,
+			),
+		);
+	});
+}

@@ -20,6 +20,9 @@ Options:
       --har <file>         Write a HAR 1.2 network trace to this file
       --har-omit-content   Record HAR metadata only, no response bodies
       --executable-path <p>  Chromium binary to use
+      --screenshot <file>  Also write a PNG screenshot to this path
+      --full-page          Screenshot the whole scroll height
+      --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
   -v, --version            Show version
@@ -29,6 +32,7 @@ Examples:
   trawl https://example.com -f links
   trawl https://example.com -s '#main' -f html -o page.html
   trawl https://example.com -w '.results-loaded' --settle 500
+  trawl https://example.com --screenshot page.png --full-page
 `;
 
 const FLAG_ALIASES = {
@@ -53,6 +57,8 @@ const VALUED = new Set([
 	"--user-agent",
 	"--executable-path",
 	"--har",
+	"--screenshot",
+	"--viewport",
 ]);
 
 export function parseArgs(argv) {
@@ -83,7 +89,8 @@ export function parseArgs(argv) {
 			arg === "--help" ||
 			arg === "--version" ||
 			arg === "--show-status" ||
-			arg === "--har-omit-content"
+			arg === "--har-omit-content" ||
+			arg === "--full-page"
 		) {
 			out[arg] = true;
 			continue;
@@ -99,6 +106,18 @@ function toNumber(value, flag) {
 		throw new Error(`${flag} expects a non-negative number, got "${value}"`);
 	}
 	return n;
+}
+
+export function parseViewport(value) {
+	const m = /^(\d+)x(\d+)$/.exec(value ?? "");
+	const width = m ? Number(m[1]) : 0;
+	const height = m ? Number(m[2]) : 0;
+	if (!m || width <= 0 || height <= 0) {
+		throw new Error(
+			`--viewport expects <width>x<height>, e.g. 1280x800, got "${value}"`,
+		);
+	}
+	return { width, height };
 }
 
 export async function main(argv) {
@@ -126,6 +145,11 @@ export async function main(argv) {
 		);
 	}
 
+	// Parsed up front so a malformed value fails before any browser launches.
+	const viewport = args["--viewport"]
+		? parseViewport(args["--viewport"])
+		: undefined;
+
 	const result = await render(args._[0], {
 		format,
 		selector: args["--selector"],
@@ -139,6 +163,11 @@ export async function main(argv) {
 		executablePath: args["--executable-path"],
 		har: args["--har"],
 		harOmitContent: Boolean(args["--har-omit-content"]),
+		screenshot: args["--screenshot"],
+		fullPage: !!args["--full-page"],
+		// Only override when the flag was actually supplied, so render()'s own
+		// default viewport keeps applying to every other call.
+		...(viewport ? { viewport } : {}),
 	});
 
 	if (args["--show-status"]) {

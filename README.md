@@ -40,6 +40,8 @@ trawl <url> [options]
       --timeout <ms>       Navigation/selector timeout       (default: 30000)
   -o, --output <file>      Write to a file instead of stdout
   -A, --user-agent <ua>    Override the User-Agent
+      --har <file>         Write a HAR 1.2 network trace to this file
+      --har-omit-content   Record HAR metadata only, no response bodies
       --executable-path <p>  Chromium binary to use
   -S, --show-status        Print HTTP status + final URL to stderr
 ```
@@ -49,7 +51,25 @@ trawl https://example.com/spa                      # rendered text
 trawl https://example.com -f links                 # href<TAB>text, one per line
 trawl https://example.com -s '#main' -f html       # one subtree, as HTML
 trawl https://example.com -w '.loaded' --settle 500
+trawl https://example.com --har trace.har          # + the full network trace
 ```
+
+### HAR capture
+
+`--har <file>` records every request the page made — URLs, methods, status
+codes, headers, timings and response bodies — as a HAR 1.2 archive, written
+alongside the normal stdout output. Drop the file into Chrome DevTools'
+Network panel (or Firefox, Charles, Fiddler) to inspect it, or parse it as
+JSON to reverse-engineer the API a SPA is talking to.
+
+Response bodies are embedded in the file, so it is self-contained and
+portable. That also makes it large, and means it saves whatever the page
+loaded — `--har-omit-content` keeps the requests and timings but drops the
+bodies.
+
+The trace is flushed when the browser context closes, so a run that fails
+mid-navigation (timeout, DNS failure, connection refused) still leaves a
+valid HAR behind — usually the run you most wanted to see.
 
 Exit codes: `0` success, `22` page returned 4xx/5xx (as `curl --fail`), `1`
 usage or runtime error.

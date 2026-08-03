@@ -39,6 +39,18 @@ test("rejects a valued flag with no value", () => {
 	);
 });
 
+test("takes a file path for --har", () => {
+	const args = parseArgs(["https://example.com", "--har", "out.har"]);
+	assert.equal(args["--har"], "out.har");
+	assert.deepEqual(args._, ["https://example.com"]);
+});
+
+test("treats --har-omit-content as a boolean", () => {
+	const args = parseArgs(["https://example.com", "--har-omit-content"]);
+	assert.equal(args["--har-omit-content"], true);
+	assert.deepEqual(args._, ["https://example.com"]);
+});
+
 test("does not mistake a negative-looking value for a flag", () => {
 	assert.equal(parseArgs(["-A", "-weird-ua", "u"])["--user-agent"], "-weird-ua");
 });

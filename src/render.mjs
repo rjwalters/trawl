@@ -52,10 +52,24 @@ export async function render(url, options = {}) {
 	const executablePath = resolveExecutablePath(opts.executablePath);
 	const browser = await chromium.launch({ executablePath, headless: true });
 
+	// Declared out here so the `finally` can close the context even if
+	// navigation throws — see the teardown comment below.
+	let context;
 	try {
-		const context = await browser.newContext({
+		context = await browser.newContext({
 			viewport: opts.viewport,
 			userAgent: opts.userAgent,
+			// Bodies are embedded (base64) rather than written as sidecar files
+			// so a single `.har` is self-contained and imports cleanly into
+			// Chrome DevTools. `mode: "full"` keeps timings and request bodies;
+			// "minimal" would drop them.
+			...(opts.har && {
+				recordHar: {
+					path: opts.har,
+					content: opts.harOmitContent ? "omit" : "embed",
+					mode: "full",
+				},
+			}),
 		});
 		const page = await context.newPage();
 
@@ -76,6 +90,12 @@ export async function render(url, options = {}) {
 		const body = await extract(page, opts);
 		return { body, status: response?.status() ?? null, url: page.url() };
 	} finally {
+		// A recorded HAR is only flushed to disk when the *context* closes, so
+		// close it explicitly and first — `browser.close()` alone would lose the
+		// trace of exactly the runs worth tracing (a goto that timed out, a host
+		// that never resolved). A failure closing the context must not mask the
+		// error that got us here.
+		if (context) await context.close().catch(() => {});
 		await browser.close();
 	}
 }

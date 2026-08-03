@@ -180,3 +180,27 @@ test("still writes a valid HAR when navigation throws", opts, async () => {
 	assert.ok(existsSync(file), "HAR file was written despite the failure");
 	readHar(file);
 });
+
+test("surfaces a HAR that could not be written", opts, async () => {
+	// The HAR is flushed on context.close(), so an unwritable path only fails
+	// during teardown — after an otherwise-successful render. That failure must
+	// reject rather than be swallowed, or `--har /typo/out.har` would print the
+	// page and exit 0 with no trace on disk and nothing on stderr.
+	const server = await startServer();
+	// A *file* standing where the HAR's parent directory would have to be:
+	// unwritable in a way no amount of directory creation can fix, on every
+	// platform and without depending on privileges.
+	const blocker = harPath("blocker");
+	writeFileSync(blocker, "not a directory");
+	const file = path.join(blocker, "out.har");
+	try {
+		await assert.rejects(
+			() => render(server.url, { har: file }),
+			/ENOTDIR|EEXIST|ENOENT|EACCES|EPERM/,
+		);
+	} finally {
+		await server.close();
+	}
+
+	assert.ok(!existsSync(file), "no HAR should have been written");
+});

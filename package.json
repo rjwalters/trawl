@@ -1,0 +1,44 @@
+{
+  "name": "trawl-cli",
+  "version": "0.1.0",
+  "description": "curl for the JavaScript web — fetch client-rendered pages from the command line",
+  "keywords": [
+    "curl",
+    "spa",
+    "scraping",
+    "headless",
+    "chromium",
+    "playwright",
+    "javascript-rendering",
+    "cli"
+  ],
+  "homepage": "https://github.com/rjwalters/trawl",
+  "bugs": "https://github.com/rjwalters/trawl/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rjwalters/trawl.git"
+  },
+  "license": "MIT",
+  "author": "Robb Walters",
+  "type": "module",
+  "bin": {
+    "trawl": "src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/render.mjs"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

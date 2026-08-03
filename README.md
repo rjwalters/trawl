@@ -30,6 +30,7 @@ explicit `--executable-path`, `$TRAWL_EXECUTABLE_PATH`, a cached
 
 ```
 trawl <url> [options]
+trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
 
   -f, --format <fmt>       text | html | links | title      (default: text)
   -s, --selector <css>     Extract only this element
@@ -99,6 +100,32 @@ throws if the path is disallowed — the same default the CLI has. Pass
 `{ ignoreRobots: true }` to skip it. Non-`http(s)` URLs (`file://`, for
 instance) are never checked. It also sends the default trawl `User-Agent`
 unless you pass your own `userAgent`.
+
+### As an MCP server
+
+`trawl mcp` starts a stdio [MCP](https://modelcontextprotocol.io) server, so
+any agent that speaks MCP gets the same rendering the CLI does instead of the
+empty shell a plain `WebFetch` sees.
+
+```json
+{
+  "mcpServers": {
+    "trawl": { "command": "trawl", "args": ["mcp"] }
+  }
+}
+```
+
+Two tools, and nothing that clicks, types, or navigates a session:
+
+| Tool | Arguments |
+| --- | --- |
+| `fetch_page` | `url`, `format?` (`text`\|`html`\|`links`\|`title`), `selector?`, `wait_for?` |
+| `fetch_links` | `url`, `selector?` |
+
+`fetch_links` exists separately so an agent can crawl without pulling whole
+page bodies into its context. Results longer than 100,000 characters are
+truncated with a notice saying so; set `TRAWL_MCP_MAX_CHARS` to change the
+budget. A failed fetch comes back as a tool error — the server keeps serving.
 
 ## Why not X?
 

@@ -338,6 +338,31 @@ test("refuses a robots.txt-disallowed path before launching a browser", async ()
 	}
 });
 
+// Regression: the robots budget used to be `Math.min(opts.timeout,
+// ROBOTS_TIMEOUT_MS)`. Playwright's convention — which `--timeout` inherits —
+// is that `0` means "no timeout", so `Math.min(0, …)` aborted the robots fetch
+// on the next tick, the check failed open, and `--timeout 0` became a silent
+// synonym for `--ignore-robots`. An implausibly small timeout did the same.
+test("a disallowed path is still refused when timeout is 0 or tiny", async () => {
+	const s = await serve({
+		"/robots.txt": "User-agent: *\nDisallow: /\n",
+	});
+	try {
+		for (const timeout of [0, 1, 5]) {
+			await assert.rejects(
+				// NO_BROWSER makes the failure mode unambiguous: if the robots
+				// check were skipped we would reach browser resolution and see
+				// "Chromium binary not found" instead of this rejection.
+				() => render(`${s.origin}/secret.html`, { ...NO_BROWSER, timeout }),
+				/robots\.txt disallows this path \(Disallow: \/\)\. Use --ignore-robots to override\./,
+				`timeout: ${timeout} should not bypass the robots check`,
+			);
+		}
+	} finally {
+		await s.close();
+	}
+});
+
 test("ignoreRobots skips the check entirely", async () => {
 	const s = await serve({
 		"/robots.txt": "User-agent: *\nDisallow: /\n",

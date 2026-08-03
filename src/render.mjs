@@ -95,7 +95,15 @@ export async function render(url, options = {}) {
 	if (!opts.ignoreRobots && isHttpUrl(url)) {
 		const verdict = await checkRobotsAllowed(url, {
 			userAgent,
-			timeout: Math.min(opts.timeout, ROBOTS_TIMEOUT_MS),
+			// Deliberately NOT coupled to `opts.timeout`. Playwright's convention
+			// — which `--timeout` inherits — is that `0` means "no timeout", and
+			// the fetch fails open, so borrowing the page budget here made
+			// `--timeout 0` (and any implausibly small value) silently skip the
+			// check entirely rather than enforce it. `ROBOTS_TIMEOUT_MS` already
+			// bounds this fetch independently at 10s, so the old `Math.min` could
+			// only ever shorten the budget — and every shortening was a silent
+			// skip. One fixed, sane budget instead.
+			timeout: ROBOTS_TIMEOUT_MS,
 			fetch: opts.fetch,
 		});
 		if (!verdict.allowed) {

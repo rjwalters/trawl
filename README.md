@@ -43,6 +43,9 @@ trawl <url> [options]
       --har <file>         Write a HAR 1.2 network trace to this file
       --har-omit-content   Record HAR metadata only, no response bodies
       --executable-path <p>  Chromium binary to use
+      --screenshot <file>  Also write a PNG screenshot to this path
+      --full-page          Screenshot the whole scroll height
+      --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
   -S, --show-status        Print HTTP status + final URL to stderr
 ```
 
@@ -52,6 +55,7 @@ trawl https://example.com -f links                 # href<TAB>text, one per line
 trawl https://example.com -s '#main' -f html       # one subtree, as HTML
 trawl https://example.com -w '.loaded' --settle 500
 trawl https://example.com --har trace.har          # + the full network trace
+trawl https://example.com --screenshot page.png --full-page   # text + a PNG
 ```
 
 ### HAR capture
@@ -70,6 +74,13 @@ bodies.
 The trace is flushed when the browser context closes, so a run that fails
 mid-navigation (timeout, DNS failure, connection refused) still leaves a
 valid HAR behind — usually the run you most wanted to see.
+
+### Screenshots
+
+`--screenshot` composes with the normal output rather than replacing it: one
+page load yields both the text on stdout and the PNG on disk. `--full-page`
+captures the whole scroll height instead of just the viewport, and
+`--viewport <WxH>` sets the window size the page is rendered at.
 
 Exit codes: `0` success, `22` page returned 4xx/5xx (as `curl --fail`), `1`
 usage or runtime error.

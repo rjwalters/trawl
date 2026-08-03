@@ -91,8 +91,26 @@ export async function render(url, options = {}) {
 		if (opts.settle > 0) await page.waitForTimeout(opts.settle);
 
 		const body = await extract(page, opts);
+
+		// Screenshots ride along on the same navigation as the text output —
+		// one page load, both artifacts. Playwright writes and PNG-encodes the
+		// file itself when given a `path`.
+		let screenshot = null;
+		if (opts.screenshot) {
+			await page.screenshot({
+				path: opts.screenshot,
+				fullPage: !!opts.fullPage,
+			});
+			screenshot = opts.screenshot;
+		}
+
 		ok = true;
-		return { body, status: response?.status() ?? null, url: page.url() };
+		return {
+			body,
+			status: response?.status() ?? null,
+			url: page.url(),
+			screenshot,
+		};
 	} finally {
 		// A recorded HAR is only flushed to disk when the *context* closes, so
 		// close it explicitly and first — `browser.close()` alone would lose the

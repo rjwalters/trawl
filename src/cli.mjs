@@ -6,6 +6,7 @@ const USAGE = `trawl — curl for the JavaScript web
 
 Usage:
   trawl <url> [options]
+  trawl mcp                Serve fetch_page/fetch_links over MCP (stdio)
 
 Options:
   -f, --format <fmt>       text | html | links | title      (default: text)
@@ -123,6 +124,14 @@ export function parseViewport(value) {
 }
 
 export async function main(argv) {
+	// The one subcommand. Checked before parseArgs so the URL path below stays
+	// exactly as it was; a URL can never be the bare string "mcp" because every
+	// URL trawl accepts carries a scheme.
+	if (argv[0] === "mcp") {
+		const { runMcpServer } = await import("./mcp.mjs");
+		return await runMcpServer(argv.slice(1));
+	}
+
 	const args = parseArgs(argv);
 
 	if (args["--help"] || (args._.length === 0 && !args["--version"])) {

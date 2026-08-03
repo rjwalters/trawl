@@ -9,7 +9,9 @@ Usage:
   trawl mcp                Serve fetch_page/fetch_links over MCP (stdio)
 
 Options:
-  -f, --format <fmt>       text | html | links | title      (default: text)
+  -f, --format <fmt>       text | html | links | title | markdown (md)
+                                                               (default: text)
+      --no-readability     Skip article extraction for -f markdown
   -s, --selector <css>     Extract only this element
   -w, --wait-for <css>     Block until this selector appears
       --settle <ms>        Extra pause after load                (default: 0)
@@ -93,7 +95,8 @@ export function parseArgs(argv) {
 			arg === "--show-status" ||
 			arg === "--har-omit-content" ||
 			arg === "--full-page" ||
-			arg === "--ignore-robots"
+			arg === "--ignore-robots" ||
+			arg === "--no-readability"
 		) {
 			out[arg] = true;
 			continue;
@@ -149,7 +152,10 @@ export async function main(argv) {
 		throw new Error(`Expected one URL, got ${args._.length}: ${args._.join(" ")}`);
 	}
 
-	const format = args["--format"] ?? "text";
+	const requested = args["--format"] ?? "text";
+	// Resolve the `md` alias before validating, so the error message below only
+	// ever names canonical formats.
+	const format = requested === "md" ? "markdown" : requested;
 	if (!FORMATS.includes(format)) {
 		throw new Error(
 			`Unknown format "${format}" (expected one of: ${FORMATS.join(", ")})`,
@@ -163,6 +169,7 @@ export async function main(argv) {
 
 	const result = await render(args._[0], {
 		format,
+		readability: !args["--no-readability"],
 		selector: args["--selector"],
 		waitForSelector: args["--wait-for"],
 		settle: args["--settle"] ? toNumber(args["--settle"], "--settle") : 0,

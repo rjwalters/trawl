@@ -1,6 +1,8 @@
 // Render a URL in headless Chromium and extract it in a requested shape.
 
+import { createRequire } from "node:module";
 import { chromium } from "playwright-core";
+import TurndownService from "turndown";
 import { resolveExecutablePath } from "./browser.mjs";
 import {
 	ROBOTS_TIMEOUT_MS,
@@ -8,7 +10,7 @@ import {
 	crawlDelayMs,
 } from "./robots.mjs";
 
-export const FORMATS = ["text", "html", "links", "title"];
+export const FORMATS = ["text", "html", "links", "title", "markdown"];
 
 const DEFAULTS = {
 	format: "text",
@@ -16,6 +18,7 @@ const DEFAULTS = {
 	settle: 0,
 	timeout: 30000,
 	viewport: { width: 1280, height: 2000 },
+	readability: true,
 };
 
 // Identify ourselves honestly by default, and link somewhere an operator can
@@ -51,10 +54,89 @@ function isHttpUrl(url) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function extract(page, { format, selector }) {
+// Readability ships a browser-ready build alongside its Node entry point; we
+// inject that file into the page rather than pulling a second DOM
+// implementation (jsdom) into Node just to re-parse markup Chromium already
+// parsed correctly.
+const require = createRequire(import.meta.url);
+const READABILITY_PATH = require.resolve("@mozilla/readability/Readability.js");
+
+function markdownConverter() {
+	// Turndown's defaults are setext headings and 4-space-indented code; both
+	// lose information the moment output is re-parsed, so pin the ATX/fenced
+	// forms every Markdown consumer expects.
+	return new TurndownService({
+		headingStyle: "atx",
+		codeBlockStyle: "fenced",
+		bulletListMarker: "-",
+	});
+}
+
+// Readability's own README documents running it against a live `document`, so
+// hand it the DOM the browser already built (cloned — `parse()` mutates it).
+// Returns null when the page has no article-like content.
+async function readArticle(page, selector) {
+	await page.addScriptTag({ path: READABILITY_PATH });
+	return await page.evaluate((sel) => {
+		const doc = document.cloneNode(true);
+		if (sel) {
+			const el = doc.querySelector(sel);
+			if (!el) return null;
+			// Narrow the clone to the requested scope so --selector still means
+			// something; skip when the selector already names the root.
+			if (el !== doc.body && el !== doc.documentElement) {
+				doc.body.replaceChildren(el);
+			}
+		}
+		// `Readability` is a global declared by the script injected above.
+		const article = new Readability(doc).parse();
+		if (!article) return null;
+		return { title: article.title ?? "", content: article.content ?? "" };
+	}, selector ?? null);
+}
+
+async function scopedHtml(page, scope) {
+	const locator = page.locator(scope);
+	const count = await locator.count();
+	const parts = [];
+	for (let i = 0; i < count; i++) {
+		parts.push(await locator.nth(i).innerHTML());
+	}
+	return parts.join("\n");
+}
+
+async function extractMarkdown(page, { selector, readability }) {
+	const turndown = markdownConverter();
+
+	if (readability !== false) {
+		const article = await readArticle(page, selector);
+		if (article?.content) {
+			const body = turndown.turndown(article.content).trim();
+			if (!article.title) return body;
+			// Readability strips the title heading out of `content` when it
+			// duplicates the document title; put it back so the output leads
+			// with a heading.
+			const heading = `# ${article.title}`;
+			return body.split("\n", 1)[0] === heading
+				? body
+				: `${heading}\n\n${body}`.trim();
+		}
+	}
+
+	// Either --no-readability, or Readability found nothing article-like and
+	// returned null. Convert the scoped markup verbatim — this is the
+	// no-heuristics path, and it keeps sparse pages from rendering as "".
+	return turndown.turndown(await scopedHtml(page, selector ?? "body")).trim();
+}
+
+async function extract(page, { format, selector, readability }) {
 	const scope = selector ?? "body";
 
 	if (format === "title") return await page.title();
+
+	if (format === "markdown") {
+		return await extractMarkdown(page, { selector, readability });
+	}
 
 	if (format === "links") {
 		const links = await page.$$eval(`${scope} a[href]`, (as) =>
@@ -81,6 +163,9 @@ async function extract(page, { format, selector }) {
 
 export async function render(url, options = {}) {
 	const opts = { ...DEFAULTS, ...options };
+	// `md` is an alias, not a format: normalize here so library callers get the
+	// same spelling latitude the CLI gives, and FORMATS stays canonical.
+	if (opts.format === "md") opts.format = "markdown";
 	if (!FORMATS.includes(opts.format)) {
 		throw new Error(
 			`Unknown format "${opts.format}" (expected one of: ${FORMATS.join(", ")})`,

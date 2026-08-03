@@ -2,6 +2,11 @@
 
 import { chromium } from "playwright-core";
 import { resolveExecutablePath } from "./browser.mjs";
+import {
+	ROBOTS_TIMEOUT_MS,
+	checkRobotsAllowed,
+	crawlDelayMs,
+} from "./robots.mjs";
 
 export const FORMATS = ["text", "html", "links", "title"];
 
@@ -12,6 +17,39 @@ const DEFAULTS = {
 	timeout: 30000,
 	viewport: { width: 1280, height: 2000 },
 };
+
+// Identify ourselves honestly by default, and link somewhere an operator can
+// read what this is and block it if they want. Only a fallback: an explicit
+// `userAgent` option (or the CLI's -A/--user-agent) still wins outright.
+let cachedUserAgent = null;
+export async function defaultUserAgent() {
+	if (cachedUserAgent) return cachedUserAgent;
+	let version = "0";
+	try {
+		const { default: pkg } = await import("../package.json", {
+			with: { type: "json" },
+		});
+		version = pkg.version;
+	} catch {
+		// Packaged oddly or read-restricted — the link matters more than the
+		// exact version.
+	}
+	cachedUserAgent = `trawl/${version} (+https://github.com/rjwalters/trawl)`;
+	return cachedUserAgent;
+}
+
+// robots.txt only means something over http(s). `file:` (and anything else)
+// has no origin to fetch a robots.txt from, so the check is skipped entirely.
+function isHttpUrl(url) {
+	try {
+		const { protocol } = new URL(url);
+		return protocol === "http:" || protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function extract(page, { format, selector }) {
 	const scope = selector ?? "body";
@@ -49,6 +87,36 @@ export async function render(url, options = {}) {
 		);
 	}
 
+	const userAgent = opts.userAgent ?? (await defaultUserAgent());
+
+	// Etiquette, enforced rather than promised: consult robots.txt before we
+	// touch the page at all. Skipped for non-http(s) URLs and when the caller
+	// opts out with `ignoreRobots`.
+	if (!opts.ignoreRobots && isHttpUrl(url)) {
+		const verdict = await checkRobotsAllowed(url, {
+			userAgent,
+			// Deliberately NOT coupled to `opts.timeout`. Playwright's convention
+			// — which `--timeout` inherits — is that `0` means "no timeout", and
+			// the fetch fails open, so borrowing the page budget here made
+			// `--timeout 0` (and any implausibly small value) silently skip the
+			// check entirely rather than enforce it. `ROBOTS_TIMEOUT_MS` already
+			// bounds this fetch independently at 10s, so the old `Math.min` could
+			// only ever shorten the budget — and every shortening was a silent
+			// skip. One fixed, sane budget instead.
+			timeout: ROBOTS_TIMEOUT_MS,
+			fetch: opts.fetch,
+		});
+		if (!verdict.allowed) {
+			throw new Error(
+				`robots.txt disallows this path (${verdict.rule}). Use --ignore-robots to override.`,
+			);
+		}
+		// One invocation fetches one page, so honoring `Crawl-delay` means
+		// spacing the two requests we do make — robots.txt, then the page.
+		const delay = crawlDelayMs(verdict.crawlDelay);
+		if (delay > 0) await sleep(delay);
+	}
+
 	const executablePath = resolveExecutablePath(opts.executablePath);
 	const browser = await chromium.launch({ executablePath, headless: true });
 
@@ -61,7 +129,7 @@ export async function render(url, options = {}) {
 	try {
 		context = await browser.newContext({
 			viewport: opts.viewport,
-			userAgent: opts.userAgent,
+			userAgent,
 			// Bodies are embedded (base64) rather than written as sidecar files
 			// so a single `.har` is self-contained and imports cleanly into
 			// Chrome DevTools. `mode: "full"` keeps timings and request bodies;

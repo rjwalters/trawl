@@ -1,5 +1,5 @@
 {
-  "name": "trawl-cli",
+  "name": "@rjwalters/trawl",
   "version": "0.1.0",
   "description": "curl for the JavaScript web — fetch client-rendered pages from the command line",
   "keywords": [

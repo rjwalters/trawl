@@ -38,7 +38,7 @@ instead of an empty `<div id="root">`.
   than replacing it, with `--full-page` for the whole scroll height and
   `--viewport <WxH>` to set the render size. (#5)
 - `-o/--output`, `-A/--user-agent`, `--executable-path`, and `-S/--show-status`.
-- Usable as a library: `import { render } from "trawl-cli"`.
+- Usable as a library: `import { render } from "@rjwalters/trawl"`.
 
 ### Fixed
 
@@ -59,5 +59,9 @@ instead of an empty `<div id="root">`.
   Chrome/Chromium.
 - Exit codes follow `curl --fail`: `0` success, `22` on a 4xx/5xx page
   response, `1` for usage or runtime errors.
+- Published as `@rjwalters/trawl`. The unscoped `trawl` was already taken, and
+  npm's typosquatting guard rejects `trawl-cli` as too close to `trash-cli`.
+  The installed command is `trawl` either way — the scope affects the package
+  name, not the binary.
 
 [0.1.0]: https://github.com/rjwalters/trawl/releases/tag/v0.1.0

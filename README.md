@@ -17,7 +17,7 @@ $ trawl 'https://qwen.ai/blog?id=qwen3.8' | wc -w
 ## Install
 
 ```sh
-npm install -g trawl-cli
+npm install -g @rjwalters/trawl
 npx --yes playwright install chromium --only-shell   # one-time browser fetch
 ```
 
@@ -102,7 +102,7 @@ usage or runtime error.
 ### As a library
 
 ```js
-import { render } from "trawl-cli";
+import { render } from "@rjwalters/trawl";
 
 const { body, status } = await render("https://example.com", { format: "text" });
 ```

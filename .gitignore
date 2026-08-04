@@ -1,6 +1,9 @@
 node_modules
 *.log
 .DS_Store
+
+# Repo Skills machine-local install metadata (absolute source path + timestamp)
+.claude/skills/repo/.install-local.json
 # >>> loom-managed (do not edit) >>>
 # Loom runtime state (don't commit these)
 .loom-in-use
@@ -42,6 +45,8 @@ node_modules
 .loom/claude-config/
 .loom/tokens/
 .loom/accounts.env
+.loom/account-health.json
+.loom/account-health.lock
 .loom/CANARY
 .loom/*.log
 .loom/*.sock
@@ -49,6 +54,3 @@ node_modules
 .loom/*.bak
 .loom/logs/
 # <<< loom-managed <<<
-
-# Repo Skills machine-local install metadata (absolute source path + timestamp)
-.claude/skills/repo/.install-local.json

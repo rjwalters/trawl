@@ -28,15 +28,19 @@ symlinked launcher, which is exactly how npm installs a `bin`. The result is
 the worst failure shape available: the CLI loads, matches nothing, and exits 0
 having done nothing. Compare resolved real paths instead.
 
-**`src/cli.mjs` must stay mode `100755`.** It is the `bin.trawl` target and has
-a shebang. A registry install would chmod it, but the dev install here is an
-`npm link` into the working tree, so the bin inherits the repo's mode — at
-`100644` the command dies with `permission denied` before Node starts. If git
-reports it mode-dirty, `100755` is the correct resolution.
+**`src/cli.mjs` must stay mode `100755`.** It is the `bin` target and has a
+shebang. A registry install chmods it for you, which is exactly why the bug
+hides — but `npm link` symlinks into the working tree and inherits the repo's
+mode, where `100644` means `permission denied` before Node ever starts. If git
+reports the file mode-dirty, `100755` is the correct resolution.
 
 **Verify runtime changes through the `PATH` binary**, not `node src/cli.mjs`.
 The direct-node invocation is precisely the shape that hid both bugs above: it
-bypasses the bin symlink and never consults the exec bit.
+bypasses the bin symlink and never consults the exec bit. Note the published
+package is `@rjwalters/trawl` (npm rejects `trawl-cli` as too close to
+`trash-cli`; bare `trawl` is taken), and the global install is a registry copy
+— so `npm i -g @rjwalters/trawl` is required before the `PATH` binary reflects
+anything merged here.
 
 **Tests are `node --test`, no framework.** `npm test` runs `tests/*.test.mjs`.
 Tests that need a browser skip cleanly when none is present, so a green local

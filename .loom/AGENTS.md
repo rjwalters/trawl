@@ -10,7 +10,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.17.0
+**Loom Version**: 0.18.0
 **Installation Date**: 2026-08-03
 
 > **Dual-runtime status**: this file is the runtime-neutral instruction anchor

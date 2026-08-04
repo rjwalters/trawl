@@ -30,6 +30,11 @@ If a number is provided (e.g., `/curator 42`):
 
 **CRITICAL**: You MUST run the `gh issue edit` command above BEFORE doing any other work. The `loom:curating` label signals that you have claimed the issue and prevents duplicate work.
 
+**If the named issue already carries `loom:curating`** (someone else's — or a
+dead — claim), do not add the label blindly on top of it: run the "Stale
+`loom:curating` Claim Check" (under "Claiming Work" below) first to decide
+stand-down vs. reclaim.
+
 If no argument is provided, use the normal "Finding Work" workflow below.
 
 ## Label Workflow
@@ -194,9 +199,9 @@ gh issue list --label="loom:triage" --state=open --limit 500 --json number,title
 ```
 
 If nothing carries `loom:triage`, fall back to any issue that is not already
-in-flight, a proposal awaiting Champion evaluation, approved, or blocked. The
-exclusion set must match CLAUDE.md's own curator discovery query so an autonomous
-Curator never "curates" an issue being built or awaiting evaluation:
+in-flight, a proposal awaiting Champion evaluation, approved, blocked, or
+reserved for a human operator, so an autonomous Curator never "curates" an
+issue being built, awaiting evaluation, or outside its authority entirely:
 
 ```bash
 gh issue list --state=open --limit 500 --json number,title,labels \
@@ -210,9 +215,16 @@ gh issue list --state=open --limit 500 --json number,title,labels \
     ([.labels[].name] | contains(["loom:auditor"]) | not) and
     ([.labels[].name] | contains(["loom:epic"]) | not) and
     ([.labels[].name] | contains(["loom:blocked"]) | not) and
+    ([.labels[].name] | contains(["loom:operator-only"]) | not) and
     ([.labels[].name] | contains(["external"]) | not)
   ) | "#\(.number) \(.title)"'
 ```
+
+Note: `loom:blocked` stays excluded here but is *not* dropped entirely from
+Curator's purview — the "Checking Dependencies" section below handles
+`loom:blocked` issues separately (dependency re-checks, unblock-on-resolve).
+`loom:operator-only` (host/cert/secret provisioning meant for a human, not a
+Builder) has no such re-check workflow, so it is excluded outright.
 
 **Workflow**:
 1. Try Priority 1 search first
@@ -230,6 +242,135 @@ gh issue edit <number> --add-label "loom:curating"
 ```
 
 This signals to other Curators that you're working on this issue. The search command above already filters out claimed issues, so you won't see issues other Curators are enhancing.
+
+**If the issue you selected already carries `loom:curating`** (a point-in-time
+race with the Finding Work query above, or a claim surfaced some other way —
+e.g. an explicit user instruction naming an already-claimed issue), do **not**
+add the label a second time and do **not** silently skip it forever — run the
+"Stale `loom:curating` Claim Check" below first. A dead Curator's claim (parent
+sweep crashed mid-enhancement) is otherwise invisible to every later pass, the
+same livelock shape already fixed for `loom:reviewing` (Judge) and
+`loom:treating` (Doctor) — see #5123.
+
+### Stale `loom:curating` Claim Check
+
+Run this whenever the issue you are about to claim **already carries**
+`loom:curating` — from Priority 1/2 discovery, an explicit `/curator <number>`
+invocation, or the re-curation playbook above. Without this check a dead claim
+(the claiming Curator's parent sweep died mid-enhancement) blocks the issue
+from ever being curated again, exactly the `loom:reviewing`/`loom:treating`
+failure mode `judge.md`/`doctor.md` already guard against — this section
+mirrors "Stale `loom:reviewing` Claim Check" in `judge.md` structurally, with
+`gh issue` in place of `gh pr` (issues and PRs share the same underlying
+`/issues/{n}` REST resource, so the same timeline/comments endpoints apply).
+
+**If the issue does NOT carry `loom:curating`:** proceed to claim as today —
+no behavior change: `gh issue edit <number> --add-label "loom:curating"`.
+
+**If the issue DOES carry `loom:curating`:** determine the claim's age and
+whether anyone has *genuinely* commented since the claim was made — see
+"Stand-down marker convention" below for why the comment count excludes
+stand-down comments:
+
+```bash
+N=<issue-number>
+# All reads in this block must be live `gh`/`gh api` calls — this is claim
+# arbitration, and a stale cache read would reintroduce the double-claim this
+# check exists to prevent. `--paginate` re-invokes `--jq` once per response
+# page and concatenates the per-page results rather than applying the filter
+# across the combined timeline (#4637) — `sort | tail -n 1` collapses the
+# resulting per-page timestamps to the single latest one; RFC3339 UTC
+# timestamps sort correctly as plain strings.
+CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:curating")] | last | .created_at // empty' \
+  | sort | tail -n 1)
+MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
+# printf, not echo: zsh's echo interprets \n escapes inside the JSON, corrupting it
+COMMENTS_AFTER=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_CURATING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — mirrors the age-floor join `judge.md`/`doctor.md` already apply (#4790): the streak alone is never enough, it also requires the claim to have aged past the normal staleness threshold. |
+| Claim age < `LOOM_STALE_CURATING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Curator is actively enhancing this issue | **Do not stomp the claim.** Post a marked stand-down comment **unless the latest comment already carries an identical marker for this exact `$CLAIMED_AT`** (see "Duplicate stand-down suppression" below — then skip silently instead), then skip this issue and continue to the next candidate. |
+| Claim age ≥ `LOOM_STALE_CURATING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Curator's process almost certainly died mid-enhancement | Reclaim (see below), then proceed with normal curation. |
+| Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
+
+**Stand-down marker convention (mirrors #4618)**: a "standing down, not
+stomping" comment is evidence of **no activity**, not activity — it means a
+*later* Curator pass declined to touch the claim, not that the *original*
+claimant is still working. Every stand-down comment you post in the "Fresh"
+row above MUST end with the `<!-- loom:standdown claim=$CLAIMED_AT -->` marker
+so it is excluded from `COMMENTS_AFTER` on every subsequent pass, and counted
+in `STANDDOWN_COUNT` instead. **Duplicate stand-down suppression (#5123)**:
+re-verification of staleness still runs on every pass — only the redundant
+*comment* is skipped, by checking whether the *latest* comment already carries
+the identical marker (`COMMENTS_JSON` was already fetched above — no extra API
+call needed):
+
+```bash
+LATEST_COMMENT_BODY=$(printf '%s\n' "$COMMENTS_JSON" | jq -r 'sort_by(.created_at) | last | .body // empty')
+if printf '%s' "$LATEST_COMMENT_BODY" | grep -qF -- "$MARKER"; then
+  echo "Latest comment already carries the stand-down marker for claim $CLAIMED_AT — skipping duplicate comment (still standing down, not reclaiming)."
+else
+  gh issue comment $N --body "Curator pass: issue still carries a fresh \`loom:curating\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+fi
+```
+
+**Bounded fallback** (mirrors AC3, #4618; age-floor join added by #4798):
+`STANDDOWN_COUNT` is a hard cap independent of the marker-exclusion logic
+working correctly — it counts how many stand-down comments have accumulated
+against *this exact* `$CLAIMED_AT` (the marker embeds it, so a genuine
+reclaim — which changes `CLAIMED_AT` — resets the count to zero
+automatically). The fallback fires only once **both** hold:
+`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
+claim with no reclaim, **and** the claim's own age is ≥
+`LOOM_STALE_CURATING_MINUTES` — reusing the same age floor the ordinary
+staleness row above already applies. Use this reclaim comment:
+
+```bash
+gh issue edit $N --remove-label "loom:curating"
+gh issue comment $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_CURATING_MINUTES:-30}m) with no actual curation progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh issue edit $N --add-label "loom:curating"
+# Continue with normal curation
+```
+
+**Reclaiming a stale claim** (the ordinary claim-age path):
+
+```bash
+gh issue edit $N --remove-label "loom:curating"
+gh issue comment $N --body "Reclaiming stale loom:curating claim (age > ${LOOM_STALE_CURATING_MINUTES:-30}m, no follow-up comment) — a prior Curator's parent sweep likely died mid-enhancement."
+gh issue edit $N --add-label "loom:curating"
+# Continue with normal curation
+```
+
+**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**) — named to mirror
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` (`judge.md` /
+`doctor.md`), on the same minutes-scale grace period: a typical Curator pass
+(read issue + comments, research the codebase, write an enhancement) runs
+closer in duration to a Judge's review pass than to a Doctor's fix-build-test
+cycle, so it reuses the Judge's 30-minute default rather than the Doctor's 60
+— a repo whose Curator passes routinely run longer (e.g. heavy use of the
+"Running Measurement / Board-Pipeline Reproductions" playbook above) should
+raise this. `LOOM_MAX_STANDDOWN_STREAK` (default **3**) — the same
+bounded-fallback cap shared with `judge.md`/`doctor.md`.
+
+**No daemon-side backstop today**: unlike `loom:reviewing`/`loom:treating`,
+`loom-daemon`'s `claim_reconciliation` pass does **not** reconcile
+`loom:curating` — this check is agent-side-only (it fires when another
+Curator pass happens to revisit the same issue). See
+`defaults/docs/daemon-reference.md` § "Stale-claim reconciliation & the sweep
+journal" for the current daemon-side coverage matrix.
+
+**Applies everywhere a Curator claims an issue** — Priority 1/2 discovery
+above, the re-curation playbook, and an explicit `/curator <number>`
+invocation naming an issue that turns out to already carry `loom:curating`.
 
 ## Before Starting Curation
 
@@ -318,6 +459,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
+7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts — while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST POST that applies labels **atomically with creation**. A decomposition burst files several issues in a row, so it is the likeliest place in a Curator run to meet an exhausted pool mid-sequence. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
 
 ### Why this matters
 
@@ -335,10 +477,10 @@ When skipped, the Builder hits these issues at implementation time — usually a
 
 ```bash
 # WRONG: decomposer-curates in one pass
-gh issue create --title "Sub-issue A" --label "loom:curated"  # FORBIDDEN
+./.loom/scripts/create-issue.sh --title "Sub-issue A" --label "loom:curated"  # FORBIDDEN
 
 # RIGHT: decomposer creates at triage, leaves for separate curator pass
-gh issue create --title "Sub-issue A" --label "loom:triage"
+./.loom/scripts/create-issue.sh --title "Sub-issue A" --label "loom:triage"
 ```
 
 ### Related: Builder decomposition
@@ -397,6 +539,63 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 > - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
 > - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
+
+### Running Measurement / Board-Pipeline Reproductions (worktree-or-restore, #4991)
+
+**The Curator runs in the main checkout, not a fresh worktree** (unlike the
+Builder — see "Verify against build base" above). That makes it tempting to
+"reproduce the measurement yourself" while re-baselining or enriching an
+issue — e.g. running a board's measurement/generation pipeline (`boards/*/
+generate_design.py`, a benchmark script, a fixture regenerator) to confirm a
+claim in the issue body. Many of these pipelines write their output straight
+into **tracked** paths (`boards/*/output/*.kicad_pcb`, `net_class_map.json`,
+committed fixtures, snapshot files) — a legitimate run leaves regenerated-artifact
+churn sitting uncommitted in the main checkout, which a downstream Builder or
+Champion then either carries forward or misattributes as "pre-existing drift."
+Edit/Write worktree confinement does not catch this: the writes come from a
+Bash-launched subprocess into already-tracked paths, not a novel path the
+guard hooks would flag.
+
+**Before finishing your curation pass, if you ran any measurement/board
+pipeline command in the main checkout, you MUST do one of the two:**
+
+1. **Prefer a disposable worktree.** Run the pipeline inside a scratch
+   worktree (e.g. `./.loom/scripts/worktree.sh <issue-number>`, or any
+   throwaway `git worktree`-free scratch checkout) instead of the main
+   checkout, so nothing in the primary tree ever gets dirtied. This is the
+   default choice whenever the pipeline's runtime is short enough to make a
+   worktree spin-up cheap relative to the run.
+2. **Otherwise, restore before you exit.** If you ran it directly in the main
+   checkout (e.g. because the run needed state only present there), verify
+   `git status --porcelain` is clean for every path the pipeline could have
+   touched immediately afterward, and `git checkout -- <path>` (or `git clean
+   -fd -- <path>` for untracked byproducts) any regenerated tracked-artifact
+   drift **before** you finish your session — do not leave it for the next
+   agent to notice.
+
+This mirrors the convention Judge subagents already follow unprompted:
+stating explicitly in the final report that "regenerated artifacts restored"
+(or running the whole review from an isolated worktree in the first place).
+Curators must make the same statement — do not silently exit leaving
+`git status` dirty in the main checkout.
+
+**Verification method** (so this reads as a requirement, not a suggestion): a
+Curator's final report/comment for any pass that ran a measurement/board
+pipeline must explicitly state one of:
+- `"ran in worktree <path>"`, or
+- `"confirmed git status clean after restoring <paths>"`.
+
+The absence of either statement in a future such report, alongside a dirty
+`boards/*/output/`-style diff surfacing in the next Judge/Builder session, is
+the regression signal — not a vague sense that "the docs should have covered
+this."
+
+> Note: `./.loom/scripts/check-main-clean.sh` (the sweep orchestrator's own
+> backstop for exactly this contamination) only runs between orchestrator
+> wave-dispatch steps inside `/loom:sweep` — it does **not** run for a bare
+> Champion cron tick or an interactive Curator session outside `/loom:sweep`.
+> Do not rely on it catching a contaminated main checkout; the rule above is
+> the only protection in those paths.
 
 ### Process-Improvement Issues
 
@@ -808,7 +1007,11 @@ _sha256() {
 # One "<pr#>:<state>:<sorted block labels>" line per current blocker, sorted so
 # ordering churn from the API never looks like a changed conclusion. Prefix with
 # the verdict so blocked→clear can never collide with clear→blocked.
-BLOCKERS=$(for PR in $(echo "$ISSUE_JSON" | jq -r '.closedByPullRequestsReferences[].number'); do
+# NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
+# builtin reinterprets `\n`/`\t` escapes by default, corrupting captured
+# `gh --json` output (a literal `\n` inside a body/comment string becomes a
+# raw newline) before jq ever parses it (#5094).
+BLOCKERS=$(for PR in $(printf '%s\n' "$ISSUE_JSON" | jq -r '.closedByPullRequestsReferences[].number'); do
   gh pr view "$PR" --json number,state,labels --jq \
     '"\(.number):\(.state):\([.labels[].name | select(startswith("loom:"))] | sort | join(","))"'
 done | sort)
@@ -823,10 +1026,10 @@ CONCLUSION_HASH=$(printf '%s\n%s\n%s' "$VERDICT" "$BLOCKERS" "$BLOCK_REASON" \
 RECHECK_MARKER="<!-- curator:dep-recheck:$CONCLUSION_HASH -->"
 
 # Most recent prior Curator re-check comment, of ANY conclusion.
-PRIOR=$(echo "$ISSUE_JSON" | jq -c '[.comments[] | select(.body | test("<!-- curator:dep-recheck:"))] | last // {}')
-PRIOR_HASH=$(echo "$PRIOR" | jq -r '.body // ""' \
+PRIOR=$(printf '%s\n' "$ISSUE_JSON" | jq -c '[.comments[] | select(.body | test("<!-- curator:dep-recheck:"))] | last // {}')
+PRIOR_HASH=$(printf '%s\n' "$PRIOR" | jq -r '.body // ""' \
   | sed -n 's|.*<!-- curator:dep-recheck:\([0-9a-f]\{1,\}\) -->.*|\1|p' | tail -n 1)
-PRIOR_AT=$(echo "$PRIOR" | jq -r '.createdAt // empty')
+PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.createdAt // empty')
 
 # Age in hours (portable: BSD `date -j -f` on macOS, GNU `date -d` elsewhere).
 _epoch() { date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }

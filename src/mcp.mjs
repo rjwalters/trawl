@@ -57,8 +57,9 @@ export const TOOLS = [
 				format: {
 					type: "string",
 					enum: [...FORMATS],
-					description:
-						"Shape of the result: text (default), html, links, or title.",
+					// Derived from FORMATS like the enum above: a hand-written list
+					// here silently went stale when `markdown` was added.
+					description: `Shape of the result: ${FORMATS.join(", ")}. Defaults to text.`,
 				},
 				selector: {
 					type: "string",

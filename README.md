@@ -131,7 +131,7 @@ Two tools, and nothing that clicks, types, or navigates a session:
 
 | Tool | Arguments |
 | --- | --- |
-| `fetch_page` | `url`, `format?` (`text`\|`html`\|`links`\|`title`), `selector?`, `wait_for?` |
+| `fetch_page` | `url`, `format?` (`text`\|`html`\|`links`\|`title`\|`markdown`), `selector?`, `wait_for?` |
 | `fetch_links` | `url`, `selector?` |
 
 `fetch_links` exists separately so an agent can crawl without pulling whole
@@ -153,9 +153,10 @@ budget. A failed fetch comes back as a tool error — the server keeps serving.
 
 ## Status
 
-Early. Renders a URL and extracts text/HTML/links/Markdown. HAR capture and an
-MCP server are the next milestones — see the
-[issues](https://github.com/rjwalters/trawl/issues).
+Early, but the first milestone set has landed: text/HTML/links/title/Markdown
+extraction, HAR capture, screenshots, `robots.txt` enforcement, and an MCP
+server. See the [issues](https://github.com/rjwalters/trawl/issues) for what's
+next.
 
 ## Etiquette
 

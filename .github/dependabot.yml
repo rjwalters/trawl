@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  # GitHub Actions. Currently pinned at actions/checkout@v4 and
+  # actions/setup-node@v4, both of which GitHub now warns are Node-20-based and
+  # are being force-run on Node 24 — this is what keeps that from rotting.
+  # Grouped into a single PR: action bumps are low-risk and reviewing them
+  # one-by-one is pure noise.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "tier:maintenance"
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Runtime dependencies. Minor and patch bumps are grouped into one PR;
+  # majors deliberately are NOT, so a breaking change to playwright-core
+  # (which is coupled to the browser binary and carries the most rendering
+  # risk here) arrives as its own reviewable PR rather than buried in a batch.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "tier:maintenance"
+    commit-message:
+      prefix: "chore(deps)"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"

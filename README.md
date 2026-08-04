@@ -155,8 +155,8 @@ budget. A failed fetch comes back as a tool error — the server keeps serving.
 
 Early, but the first milestone set has landed: text/HTML/links/title/Markdown
 extraction, HAR capture, screenshots, `robots.txt` enforcement, and an MCP
-server. Not yet published to npm — install from source for now. See the
-[issues](https://github.com/rjwalters/trawl/issues) for what's next.
+server. See the [issues](https://github.com/rjwalters/trawl/issues) for what's
+next.
 
 ## Etiquette
 

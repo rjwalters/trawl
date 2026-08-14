@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-14
+
+Auth-gated pages now fail loudly instead of masquerading as content, and a
+persistent-profile login path lets a human hand trawl an authenticated
+session once instead of dead-ending an agent every run.
+
+### Added
+
+- Login-wall detection: when a rendered page looks like an auth gate — tiny
+  extracted text with sign-in vocabulary, a form with a password field, or a
+  final URL on a known login path/provider — `render()` throws
+  `AuthWallError` and the CLI exits with code `3` plus a hint pointing at
+  `trawl login`. `--no-auth-check` opts out. (#22)
+- `--profile <dir>` / `$TRAWL_PROFILE_DIR` renders through a persistent
+  browser context, so cookies and localStorage survive across runs. (#22)
+- `trawl login <origin>` opens a headed browser against the profile
+  directory so a user can sign in once; later runs with the same profile
+  reuse the session. (#22)
+- Navigation-timeout fallback: when the default `--wait-until networkidle`
+  never fires (sites holding sockets open), the render retries once with
+  `domcontentloaded` + a settle grace period and reports the downgrade. (#22)
+
+### Fixed
+
+- `package-lock.json` still carried the unscoped package name; synced with
+  `@rjwalters/trawl`. (#21)
+
 ## [0.1.0] - 2026-08-03
 
 First release. `trawl` renders a page in headless Chromium and prints what a
@@ -64,4 +91,5 @@ instead of an empty `<div id="root">`.
   The installed command is `trawl` either way — the scope affects the package
   name, not the binary.
 
+[0.2.0]: https://github.com/rjwalters/trawl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rjwalters/trawl/releases/tag/v0.1.0

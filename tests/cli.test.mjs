@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { isMainModule, parseArgs, parseViewport } from "../src/cli.mjs";
+import { resolveExecutablePath } from "../src/browser.mjs";
+import { isMainModule, main, parseArgs, parseViewport, runLogin } from "../src/cli.mjs";
+
+let haveBrowser = true;
+try {
+	resolveExecutablePath();
+} catch {
+	haveBrowser = false;
+}
+const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
 
 test("collects a bare url as a positional", () => {
 	assert.deepEqual(parseArgs(["https://example.com"])._, [
@@ -115,6 +124,129 @@ test("treats --no-readability as a boolean flag", () => {
 	assert.deepEqual(args._, ["u"]);
 });
 
+test("takes a directory for --profile", () => {
+	const args = parseArgs(["u", "--profile", "/tmp/my-profile"]);
+	assert.equal(args["--profile"], "/tmp/my-profile");
+	assert.deepEqual(args._, ["u"]);
+});
+
+test("treats --no-auth-check as a boolean flag", () => {
+	const args = parseArgs(["u", "--no-auth-check"]);
+	assert.equal(args["--no-auth-check"], true);
+	assert.equal(parseArgs(["u"])["--no-auth-check"], undefined);
+});
+
+// --- `trawl login` (#22) ---
+//
+// The browser lifecycle is injected via `deps`, so these exercise the real
+// argument-validation and orchestration logic without launching a (headed)
+// Chromium — which this environment usually can't do anyway (no display, and
+// the cached `chrome-headless-shell` binary can't run headed at all).
+
+test("login requires a URL", async () => {
+	await assert.rejects(
+		() => runLogin([], { env: { TRAWL_PROFILE_DIR: "/tmp/whatever" } }),
+		/trawl login requires a URL/,
+	);
+});
+
+test("login rejects more than one positional", async () => {
+	await assert.rejects(
+		() => runLogin(["https://a.example", "https://b.example"], { env: {} }),
+		/Expected one URL, got 2/,
+	);
+});
+
+test("login requires a profile directory from --profile or TRAWL_PROFILE_DIR", async () => {
+	await assert.rejects(
+		() => runLogin(["https://example.com"], { env: {} }),
+		/requires a profile directory.*--profile.*TRAWL_PROFILE_DIR/s,
+	);
+});
+
+function fakeLoginDeps({ profileDir } = {}) {
+	const mkdirCalls = [];
+	const stderrLines = [];
+	const page = { goto: async () => {} };
+	const gotoCalls = [];
+	page.goto = async (url) => gotoCalls.push(url);
+	const context = {
+		newPage: async () => page,
+		closed: false,
+		close: async function () {
+			this.closed = true;
+		},
+	};
+	return {
+		deps: {
+			env: profileDir ? {} : { TRAWL_PROFILE_DIR: "/tmp/env-profile" },
+			mkdirSync: (dir, options) => mkdirCalls.push([dir, options]),
+			launchPersistentContext: async (dir, launchOptions) => {
+				mkdirCalls.push(["launch", dir, launchOptions]);
+				return context;
+			},
+			waitForUser: async () => {},
+			stderr: (s) => stderrLines.push(s),
+		},
+		mkdirCalls,
+		stderrLines,
+		gotoCalls,
+		context,
+	};
+}
+
+test("login navigates to the given origin and closes the context on completion", async () => {
+	const { deps, gotoCalls, context, stderrLines } = fakeLoginDeps({
+		profileDir: "/tmp/explicit-profile",
+	});
+
+	const code = await runLogin(
+		["https://example.com", "--profile", "/tmp/explicit-profile"],
+		deps,
+	);
+
+	assert.equal(code, 0);
+	assert.deepEqual(gotoCalls, ["https://example.com"]);
+	assert.equal(context.closed, true);
+	assert.match(stderrLines.join(""), /A browser window has opened at https:\/\/example\.com/);
+	assert.match(stderrLines.join(""), /Session saved to \/tmp\/explicit-profile/);
+});
+
+test("login falls back to TRAWL_PROFILE_DIR when --profile is not given", async () => {
+	const { deps, mkdirCalls } = fakeLoginDeps();
+
+	await runLogin(["https://example.com"], deps);
+
+	// The mkdirSync call (not the launchPersistentContext call) proves which
+	// directory was actually used.
+	const mkdirCall = mkdirCalls.find((c) => c[0] !== "launch");
+	assert.equal(mkdirCall[0], "/tmp/env-profile");
+});
+
+test("login tolerates the user already having closed the browser window", async () => {
+	const { deps, context } = fakeLoginDeps({ profileDir: "/tmp/explicit-profile" });
+	// Simulate the window already being gone by the time we try to close it.
+	context.close = async () => {
+		throw new Error("Target page, context or browser has been closed");
+	};
+
+	const code = await runLogin(
+		["https://example.com", "--profile", "/tmp/explicit-profile"],
+		deps,
+	);
+	assert.equal(code, 0);
+});
+
+test("main() dispatches `trawl login <origin>` to runLogin", async () => {
+	// Not a real render: proves `main()` special-cases "login" the same way it
+	// special-cases "mcp", by observing runLogin's own validation error rather
+	// than trying to fetch a URL.
+	await assert.rejects(
+		() => main(["login"]),
+		/trawl login requires a URL/,
+	);
+});
+
 // Entry-point detection (#14).
 //
 // npm installs `bin` as a symlink and the shebang re-execs as `node <symlink>`,
@@ -185,4 +317,35 @@ test("a symlinked CLI reports the same version as the real path", async () => {
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+// --- auth-wall exit code, end-to-end through the real CLI process (#22) ---
+
+function fixtureUrl(html, name) {
+	const dir = mkdtempSync(join(tmpdir(), "trawl-cli-fixture-"));
+	const file = join(dir, name);
+	writeFileSync(file, html);
+	return pathToFileURL(file).href;
+}
+
+test("exits 3 and reports a login wall for a tiny sign-in page", opts, async () => {
+	const url = fixtureUrl(
+		`<!doctype html><title>Gated</title><body>Sign in</body>`,
+		"wall.html",
+	);
+	const { code, stdout, stderr } = await runCli(CLI_PATH, [url]);
+	assert.equal(code, 3);
+	assert.equal(stdout, "");
+	assert.match(stderr, /login wall/);
+	assert.match(stderr, /"sign in"/);
+});
+
+test("--no-auth-check exits 0 for the same login-wall page", opts, async () => {
+	const url = fixtureUrl(
+		`<!doctype html><title>Gated</title><body>Sign in</body>`,
+		"wall2.html",
+	);
+	const { code, stdout } = await runCli(CLI_PATH, [url, "--no-auth-check"]);
+	assert.equal(code, 0);
+	assert.match(stdout, /Sign in/);
 });

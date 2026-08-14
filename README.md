@@ -30,6 +30,8 @@ explicit `--executable-path`, `$TRAWL_EXECUTABLE_PATH`, a cached
 
 ```
 trawl <url> [options]
+trawl login <origin>       Open a headed browser to sign in; saves the
+                            session to --profile <dir> / $TRAWL_PROFILE_DIR
 trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
 
   -f, --format <fmt>       text | html | links | title | markdown (md)
@@ -50,6 +52,9 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --full-page          Screenshot the whole scroll height
       --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
       --ignore-robots      Skip the robots.txt check
+      --profile <dir>      Persistent browser profile (cookies/localStorage
+                            survive across runs); also $TRAWL_PROFILE_DIR
+      --no-auth-check      Skip login-wall detection (see "Auth walls" below)
   -S, --show-status        Print HTTP status + final URL to stderr
 ```
 
@@ -61,6 +66,8 @@ trawl https://example.com -f md                    # article, as Markdown
 trawl https://example.com -w '.loaded' --settle 500
 trawl https://example.com --har trace.har          # + the full network trace
 trawl https://example.com --screenshot page.png --full-page   # text + a PNG
+trawl login https://example.com --profile ~/.trawl/example    # sign in once
+trawl https://example.com --profile ~/.trawl/example           # reuse the session
 ```
 
 ### Markdown
@@ -71,6 +78,24 @@ lists, links, and fenced code all survive. Readability is tuned for articles
 and can eat the content on docs sites and single-column apps — pass
 `--no-readability` to convert the page as-is, or use `-f text`, which is never
 filtered.
+
+### Pages that never go idle
+
+The default `--wait-until networkidle` waits for the page to stop making
+network requests — but a SPA that holds a websocket, SSE stream, or
+long-poll open (common on chat/dashboard apps) never goes idle, so the
+default times out even though the page rendered ages ago. On a
+`networkidle` timeout specifically, `trawl` retries once with
+`domcontentloaded` instead of failing outright, and says so on stderr:
+
+```
+trawl: networkidle timed out; retried with domcontentloaded. Pass
+       --wait-until domcontentloaded --settle <ms> to skip the wait next time.
+```
+
+If you already know a site does this, skip straight to it:
+`--wait-until domcontentloaded --settle 2000` (or whatever grace period the
+page needs to finish painting).
 
 ### HAR capture
 
@@ -96,8 +121,55 @@ page load yields both the text on stdout and the PNG on disk. `--full-page`
 captures the whole scroll height instead of just the viewport, and
 `--viewport <WxH>` sets the window size the page is rendered at.
 
-Exit codes: `0` success, `22` page returned 4xx/5xx (as `curl --fail`), `1`
-usage or runtime error.
+Exit codes: `0` success, `22` page returned 4xx/5xx (as `curl --fail`), `3`
+page appears to be behind a login wall (see "Auth walls" below), `1` usage or
+runtime error.
+
+### Auth walls & signed-in sessions
+
+A client-rendered page that requires sign-in usually still returns `200 OK`
+and *some* body — just not the content you asked for. Rather than hand that
+back indistinguishably from a real page, `trawl` checks the rendered result
+for the shape of a login wall and, if it matches, fails with **exit code 3**
+and a one-line explanation on stderr instead of printing the login page as if
+it were the answer:
+
+```console
+$ trawl https://example.com/gated
+trawl: page appears to be behind a login wall (matched: tiny text (66 chars)
+       contains "sign in"). This page needs an authenticated browser
+       session — ask your user to sign in with `trawl login <origin>
+       --profile <dir>`, then retry with --profile <dir> (or pass
+       --no-auth-check if this isn't actually a login wall).
+```
+
+The check is heuristic and deliberately biased toward false positives —
+missing a real login wall (and quietly returning its HTML as "content") is
+worse than occasionally flagging a genuinely tiny page. It looks at three
+signals: the *extracted* text is short (under ~200 characters) and contains
+sign-in vocabulary ("sign in", "log in", "authenticate", …); the rendered
+page has a `<form>` with a password field; or the final URL matches a known
+login path (`/login`, `/signin`, `/oauth2/…`) or auth provider
+(`accounts.google.com`, and similar). Pass `--no-auth-check` /
+`{ authCheck: false }` for a page you know isn't actually gated.
+
+To give `trawl` a session to reuse, hand it a **persistent browser profile**
+with `--profile <dir>` (or `$TRAWL_PROFILE_DIR`) — cookies and `localStorage`
+written under that directory survive across separate `trawl` invocations,
+the same way a real browser profile does. Populate one interactively with
+`trawl login`, which opens a *headed* browser at the given origin and waits
+for you to sign in (close the window, or press Enter in the terminal, when
+you're done):
+
+```sh
+trawl login https://example.com --profile ~/.trawl/example
+trawl https://example.com --profile ~/.trawl/example   # now sees the session
+```
+
+`trawl login` needs a real, headed-capable Chrome/Chromium —
+`chrome-headless-shell` (the default cached binary) cannot open a window, so
+point `--executable-path` at a system browser if that's all you have
+installed.
 
 ### As a library
 
@@ -112,6 +184,13 @@ throws if the path is disallowed — the same default the CLI has. Pass
 `{ ignoreRobots: true }` to skip it. Non-`http(s)` URLs (`file://`, for
 instance) are never checked. It also sends the default trawl `User-Agent`
 unless you pass your own `userAgent`.
+
+`render()` also rejects with an `AuthWallError` (`err.name ===
+"AuthWallError"`, `err.reasons` is the list of matched signals) when the
+rendered page looks like a login wall — pass `{ authCheck: false }` to skip
+the check. Pass `{ profileDir: "<dir>" }` to render through a persistent
+browser profile instead of a fresh one each call, the library equivalent of
+`--profile`.
 
 ### As an MCP server
 

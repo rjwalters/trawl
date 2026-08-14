@@ -10,7 +10,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { resolveExecutablePath } from "../src/browser.mjs";
-import { render } from "../src/render.mjs";
+import { AuthWallError, detectAuthWall, render } from "../src/render.mjs";
 
 let haveBrowser = true;
 try {
@@ -338,6 +338,71 @@ test("rejects an unknown format before launching a browser", async () => {
 	);
 });
 
+// --- auth-wall detection (#22) ---
+//
+// `detectAuthWall` is pure and browser-free, so its decision logic is fully
+// covered here without Chromium; the browser-gated tests further down only
+// need to prove `render()` actually wires the probe up.
+
+test("detectAuthWall: no signals means not a wall", () => {
+	assert.deepEqual(
+		detectAuthWall({ text: "A perfectly normal page.", url: "https://example.com/" }),
+		[],
+	);
+});
+
+test("detectAuthWall: tiny text with sign-in vocabulary is a wall", () => {
+	const reasons = detectAuthWall({ text: "  Sign in  ", url: "https://example.com/" });
+	assert.equal(reasons.length, 1);
+	assert.match(reasons[0], /tiny text \(7 chars\) contains "sign in"/);
+});
+
+test("detectAuthWall: long text mentioning login vocabulary is not flagged", () => {
+	// The length gate exists so a real page that merely *mentions* "log in"
+	// somewhere in a large body (a help article, a nav link) isn't flagged —
+	// only pages that are *almost nothing but* the sign-in prompt are.
+	const long = "Welcome to the site. ".repeat(20) + "Log in to see more.";
+	assert.deepEqual(detectAuthWall({ text: long, url: "https://example.com/" }), []);
+});
+
+test("detectAuthWall: a password field is a wall regardless of text length", () => {
+	const long = "Manage your account settings below. ".repeat(10);
+	const reasons = detectAuthWall({ text: long, hasPasswordField: true });
+	assert.deepEqual(reasons, ["page has a form with a password field"]);
+});
+
+test("detectAuthWall: a known auth-provider host is a wall", () => {
+	const reasons = detectAuthWall({
+		text: "loading…",
+		url: "https://accounts.google.com/signin/v2/identifier",
+	});
+	assert.match(reasons.join(), /known auth provider \(accounts\.google\.com\)/);
+});
+
+test("detectAuthWall: a /login-shaped path is a wall", () => {
+	for (const path of ["/login", "/login/", "/log-in", "/signin", "/oauth2/authorize"]) {
+		const reasons = detectAuthWall({ url: `https://example.com${path}` });
+		assert.equal(reasons.length, 1, `expected a match for ${path}`);
+		assert.match(reasons[0], /looks like a login page/);
+	}
+});
+
+test("detectAuthWall: a path merely containing 'login' as a substring is not flagged", () => {
+	assert.deepEqual(
+		detectAuthWall({ url: "https://example.com/blog/login-tips" }),
+		[],
+	);
+});
+
+test("detectAuthWall: multiple signals all get reported", () => {
+	const reasons = detectAuthWall({
+		text: "Please sign in",
+		hasPasswordField: true,
+		url: "https://example.com/login",
+	});
+	assert.equal(reasons.length, 3);
+});
+
 test("records the page's subresource requests in a HAR", opts, async () => {
 	const server = await startServer();
 	const file = harPath();
@@ -635,4 +700,205 @@ test("ignoreRobots navigates a path robots.txt would block", opts, async () => {
 	} finally {
 		await s.close();
 	}
+});
+
+// --- auth-wall detection, end-to-end (#22) ---
+
+const LOGIN_WALL = `<!doctype html><title>Gated</title><body>Sign in</body>`;
+
+const PASSWORD_FORM_PAGE = `<!doctype html><title>Account</title>
+<body>
+  <p>${"Manage your account settings below. ".repeat(10)}</p>
+  <form><input type="password" name="p"></form>
+</body>`;
+
+test("render() rejects with AuthWallError for a tiny sign-in page", opts, async () => {
+	await assert.rejects(
+		() => render(fixtureUrl(LOGIN_WALL, "wall.html")),
+		(err) => {
+			assert.ok(err instanceof AuthWallError, `expected AuthWallError, got ${err}`);
+			assert.match(err.message, /login wall/);
+			assert.match(err.message, /"sign in"/);
+			return true;
+		},
+	);
+});
+
+test("render() rejects with AuthWallError for a page with a password field", opts, async () => {
+	await assert.rejects(
+		() => render(fixtureUrl(PASSWORD_FORM_PAGE, "password.html")),
+		(err) => {
+			assert.ok(err instanceof AuthWallError);
+			assert.match(err.message, /password field/);
+			return true;
+		},
+	);
+});
+
+test("authCheck: false bypasses login-wall detection", opts, async () => {
+	const { body } = await render(fixtureUrl(LOGIN_WALL, "wall2.html"), {
+		authCheck: false,
+	});
+	assert.match(body, /Sign in/);
+});
+
+test("a redirect to a known login path is reported as an auth wall", opts, async () => {
+	// `serve()`'s fixed-body routing can't express a redirect, so this test
+	// drives its own tiny server instead.
+	const server = createServer((req, res) => {
+		if (req.url === "/app") {
+			res.writeHead(302, { location: "/login" });
+			res.end();
+			return;
+		}
+		res.writeHead(200, { "content-type": "text/html" });
+		res.end(`<!doctype html><title>Log in</title><body>please wait…</body>`);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	try {
+		await assert.rejects(
+			() => render(`http://127.0.0.1:${port}/app`, { ignoreRobots: true }),
+			(err) => {
+				assert.ok(err instanceof AuthWallError);
+				assert.match(err.message, /login page \(\/login\)/);
+				return true;
+			},
+		);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+});
+
+// --- persistent profiles (#22) ---
+
+function tmpProfileDir() {
+	return mkdtempSync(path.join(tmpdir(), "trawl-profile-"));
+}
+
+// A page whose body reflects whether *this* request carried the cookie the
+// *previous* request's response set — the simplest possible "did the browser
+// remember something across two separate render() calls" probe.
+function serveCookieProbe() {
+	const server = createServer((req, res) => {
+		if (req.headers.cookie?.includes("seen=1")) {
+			res.writeHead(200, { "content-type": "text/html" });
+			res.end(`<!doctype html><body>cookie: yes</body>`);
+			return;
+		}
+		res.writeHead(200, {
+			"content-type": "text/html",
+			// Max-Age matters: a session cookie (no Max-Age/Expires) is correctly
+			// discarded when the browser context closes, in a *real* browser too —
+			// only a persistent cookie is expected to survive into the next
+			// render() call.
+			"set-cookie": "seen=1; Path=/; Max-Age=3600",
+		});
+		res.end(`<!doctype html><body>cookie: no</body>`);
+	});
+	return server;
+}
+
+test("--profile persists cookies across separate render() calls", opts, async () => {
+	const server = serveCookieProbe();
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	const url = `http://127.0.0.1:${port}/`;
+	const profileDir = tmpProfileDir();
+	try {
+		const first = await render(url, { profileDir, ignoreRobots: true });
+		assert.match(first.body, /cookie: no/);
+
+		const second = await render(url, { profileDir, ignoreRobots: true });
+		assert.match(
+			second.body,
+			/cookie: yes/,
+			"a second render() against the same --profile dir should reuse the cookie jar",
+		);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+});
+
+test("without --profile, cookies do not survive across render() calls", opts, async () => {
+	const server = serveCookieProbe();
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	const url = `http://127.0.0.1:${port}/`;
+	try {
+		const first = await render(url, { ignoreRobots: true });
+		assert.match(first.body, /cookie: no/);
+
+		const second = await render(url, { ignoreRobots: true });
+		assert.match(
+			second.body,
+			/cookie: no/,
+			"an ephemeral (no --profile) context must not carry state between calls",
+		);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+});
+
+// --- softening the networkidle footgun (#22) ---
+
+// A page that kicks off a `fetch()` whose response never arrives — the
+// connection stays open indefinitely, so `networkidle` (the default
+// `--wait-until`) never fires against it. This is the same shape as the
+// websocket/SSE connections real SPAs (claude.ai among them) hold open.
+function serveHangingStream() {
+	const server = createServer((req, res) => {
+		if (req.url === "/stream") {
+			res.writeHead(200, { "content-type": "text/plain" });
+			// Deliberately never write or end the response — the open connection
+			// is the whole point of the fixture.
+			return;
+		}
+		res.writeHead(200, { "content-type": "text/html" });
+		res.end(
+			`<!doctype html><title>Hang</title><body><h1>Loaded</h1>` +
+				`<script>fetch('/stream');</script></body>`,
+		);
+	});
+	return server;
+}
+
+test("a networkidle timeout retries once with domcontentloaded instead of failing", opts, async () => {
+	const server = serveHangingStream();
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	try {
+		const result = await render(`http://127.0.0.1:${port}/`, {
+			ignoreRobots: true,
+			timeout: 2000,
+		});
+		assert.match(result.body, /Loaded/);
+		assert.deepEqual(result.waitUntilFallback, {
+			from: "networkidle",
+			to: "domcontentloaded",
+		});
+	} finally {
+		// The open /stream connection would otherwise keep the server (and the
+		// test process) alive indefinitely.
+		server.closeAllConnections();
+		await new Promise((resolve) => server.close(resolve));
+	}
+});
+
+test("an explicit non-networkidle wait condition still fails on timeout, unretried", opts, async () => {
+	// Bind then immediately release a port: connections to it are refused, so
+	// `page.goto` rejects for a reason that is not "networkidle timed out" —
+	// the fallback must not fire, and the original error must surface.
+	const server = createServer((_, res) => res.end());
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	await new Promise((resolve) => server.close(resolve));
+
+	await assert.rejects(() =>
+		render(`http://127.0.0.1:${port}/`, {
+			ignoreRobots: true,
+			waitUntil: "load",
+			timeout: 2000,
+		}),
+	);
 });

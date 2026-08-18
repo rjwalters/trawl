@@ -32,6 +32,7 @@ explicit `--executable-path`, `$TRAWL_EXECUTABLE_PATH`, a cached
 trawl <url> [options]
 trawl login <origin>       Open a headed browser to sign in; saves the
                             session to --profile <dir> / $TRAWL_PROFILE_DIR
+                            (defaults to ~/.trawl/profile)
 trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
 
   -f, --format <fmt>       text | html | links | title | markdown (md)
@@ -53,7 +54,13 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
       --ignore-robots      Skip the robots.txt check
       --profile <dir>      Persistent browser profile (cookies/localStorage
-                            survive across runs); also $TRAWL_PROFILE_DIR
+                            survive across runs); also $TRAWL_PROFILE_DIR.
+                            Populate one with "trawl login" (which defaults
+                            this to ~/.trawl/profile, shared across every
+                            origin, if you don't pass --profile/
+                            $TRAWL_PROFILE_DIR there either). A plain fetch
+                            stays isolated (no persistence) unless you pass
+                            --profile/$TRAWL_PROFILE_DIR here too.
       --no-auth-check      Skip login-wall detection (see "Auth walls" below)
   -S, --show-status        Print HTTP status + final URL to stderr
 ```
@@ -96,6 +103,15 @@ trawl: networkidle timed out; retried with domcontentloaded. Pass
 If you already know a site does this, skip straight to it:
 `--wait-until domcontentloaded --settle 2000` (or whatever grace period the
 page needs to finish painting).
+
+The same recipe also works around **anti-bot interstitials** — a "checking
+your browser" / "this website uses a security service" page that some sites
+(HathiTrust's full-view search among them) serve behind a socket that never
+goes idle, so the default `networkidle` wait hangs on the interstitial
+itself rather than the real page. `trawl` does not detect or auto-retry past
+these (they vary too much by vendor to do reliably); pass
+`--wait-until domcontentloaded --settle 15000` (give the interstitial's own
+JS challenge time to resolve and redirect) to get through it.
 
 ### HAR capture
 
@@ -165,6 +181,15 @@ you're done):
 trawl login https://example.com --profile ~/.trawl/example
 trawl https://example.com --profile ~/.trawl/example   # now sees the session
 ```
+
+If you don't pass `--profile`/`$TRAWL_PROFILE_DIR` to `trawl login`, it
+defaults to a single shared directory, `~/.trawl/profile` (created on first
+use), so you don't have to invent a path before you know what it's for —
+the tradeoff is that every origin logged into this way shares one cookie
+jar, same as a real browser's default profile. A plain `trawl <url>` fetch,
+by contrast, stays isolated (no persistence) unless you pass
+`--profile <dir>` yourself — pass the same `~/.trawl/profile` path to reuse
+the default session, or a dedicated directory to isolate one site's session.
 
 `trawl login` needs a real, headed-capable Chrome/Chromium —
 `chrome-headless-shell` (the default cached binary) cannot open a window, so

@@ -6,7 +6,14 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveExecutablePath } from "../src/browser.mjs";
-import { isMainModule, main, parseArgs, parseViewport, runLogin } from "../src/cli.mjs";
+import {
+	defaultProfileDir,
+	isMainModule,
+	main,
+	parseArgs,
+	parseViewport,
+	runLogin,
+} from "../src/cli.mjs";
 
 let haveBrowser = true;
 try {
@@ -157,11 +164,45 @@ test("login rejects more than one positional", async () => {
 	);
 });
 
-test("login requires a profile directory from --profile or TRAWL_PROFILE_DIR", async () => {
-	await assert.rejects(
-		() => runLogin(["https://example.com"], { env: {} }),
-		/requires a profile directory.*--profile.*TRAWL_PROFILE_DIR/s,
+// #24: `trawl login` used to require --profile/TRAWL_PROFILE_DIR and throw
+// otherwise, forcing the operator to invent a path before they understood
+// what it was for. It now defaults to a fixed directory under homedir() —
+// this is an intentional behavior change from the old "throws" contract.
+test("login with no --profile/TRAWL_PROFILE_DIR defaults to defaultProfileDir()", async () => {
+	const mkdirCalls = [];
+	const stderrLines = [];
+	const context = {
+		newPage: async () => ({ goto: async () => {} }),
+		closed: false,
+		close: async function () {
+			this.closed = true;
+		},
+	};
+	const deps = {
+		env: {},
+		mkdirSync: (dir, options) => mkdirCalls.push([dir, options]),
+		launchPersistentContext: async (dir, launchOptions) => {
+			mkdirCalls.push(["launch", dir, launchOptions]);
+			return context;
+		},
+		waitForUser: async () => {},
+		stderr: (s) => stderrLines.push(s),
+	};
+
+	const code = await runLogin(["https://example.com"], deps);
+
+	assert.equal(code, 0);
+	// The mkdirSync call (not the launchPersistentContext call) proves which
+	// directory was actually used — mirrors the TRAWL_PROFILE_DIR-fallback
+	// assertion pattern below.
+	const mkdirCall = mkdirCalls.find((c) => c[0] !== "launch");
+	assert.equal(mkdirCall[0], defaultProfileDir());
+	const stderrText = stderrLines.join("");
+	assert.ok(
+		stderrText.includes(`session to:\n  ${defaultProfileDir()}`),
+		`expected stderr to mention ${defaultProfileDir()}, got: ${stderrText}`,
 	);
+	assert.match(stderrText, /no --profile\/TRAWL_PROFILE_DIR given/);
 });
 
 function fakeLoginDeps({ profileDir } = {}) {

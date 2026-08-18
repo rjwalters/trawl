@@ -1,7 +1,27 @@
 #!/usr/bin/env node
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AuthWallError, FORMATS, render } from "./render.mjs";
+
+// The profile directory `trawl login` writes to when neither --profile nor
+// $TRAWL_PROFILE_DIR is supplied. A single shared directory (rather than one
+// per origin) mirrors how a real browser profile works — one cookie jar,
+// many logged-in origins — which is also exactly how `launchPersistentContext`
+// already behaves per-directory; this just gives that a default name so
+// `trawl login <origin>` doesn't force the operator to invent a path before
+// they understand what it's for (#24). An explicit `--profile <dir>` /
+// `$TRAWL_PROFILE_DIR` still takes precedence, and remains the way to
+// isolate sessions per site.
+//
+// Deliberately NOT applied as a default for ordinary `trawl <url>` fetches —
+// those stay ephemeral-by-default (see the comment above the `--profile`
+// branch in render.mjs); pass `--profile <this same path>` there to reuse a
+// session `trawl login` saved.
+export function defaultProfileDir() {
+	return path.join(homedir(), ".trawl", "profile");
+}
 
 const USAGE = `trawl — curl for the JavaScript web
 
@@ -9,6 +29,7 @@ Usage:
   trawl <url> [options]
   trawl login <origin>     Open a headed browser to sign in; saves the
                             session to --profile <dir> / TRAWL_PROFILE_DIR
+                            (defaults to ~/.trawl/profile)
   trawl mcp                Serve fetch_page/fetch_links over MCP (stdio)
 
 Options:
@@ -24,7 +45,10 @@ Options:
                             socket open (websockets, SSE); trawl retries once
                             with domcontentloaded on a networkidle timeout, or
                             pass --wait-until domcontentloaded --settle <ms>
-                            yourself to skip straight to it.
+                            yourself to skip straight to it. The same recipe
+                            (--wait-until domcontentloaded --settle 15000)
+                            also works around anti-bot interstitials (e.g.
+                            HathiTrust's) that hold networkidle open forever.
       --timeout <ms>       Navigation/selector timeout       (default: 30000)
   -o, --output <file>      Write to a file instead of stdout
   -A, --user-agent <ua>    Override the User-Agent
@@ -37,7 +61,12 @@ Options:
       --ignore-robots      Skip the robots.txt check
       --profile <dir>      Persistent browser profile dir (cookies/
                             localStorage survive across runs); also read from
-                            $TRAWL_PROFILE_DIR. Populate one with "trawl login".
+                            $TRAWL_PROFILE_DIR. Populate one with "trawl login"
+                            (which defaults this to ~/.trawl/profile, shared
+                            across every origin, if you don't pass --profile/
+                            $TRAWL_PROFILE_DIR there either). A plain fetch
+                            stays isolated (no persistence) unless you pass
+                            --profile/$TRAWL_PROFILE_DIR here too.
       --no-auth-check      Skip login-wall detection (see exit code 3 below)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
@@ -207,6 +236,12 @@ export async function main(argv) {
 		screenshot: args["--screenshot"],
 		fullPage: !!args["--full-page"],
 		ignoreRobots: args["--ignore-robots"] === true,
+		// Deliberately NOT defaulted the way `trawl login`'s profile dir is
+		// (#24): a plain fetch stays ephemeral-by-default (render.mjs's own
+		// documented isolation guarantee — nothing one run does is visible to
+		// the next) unless the caller opts in with --profile/$TRAWL_PROFILE_DIR.
+		// Pass --profile ~/.trawl/profile (the same default `trawl login`
+		// used) to pick the saved session back up.
 		profileDir: args["--profile"] ?? process.env.TRAWL_PROFILE_DIR,
 		authCheck: !args["--no-auth-check"],
 		// Only override when the flag was actually supplied, so render()'s own
@@ -256,12 +291,9 @@ export async function runLogin(argv, deps = {}) {
 	if (args._.length > 1) {
 		throw new Error(`Expected one URL, got ${args._.length}: ${args._.join(" ")}`);
 	}
-	const profileDir = args["--profile"] ?? env.TRAWL_PROFILE_DIR;
-	if (!profileDir) {
-		throw new Error(
-			"trawl login requires a profile directory: pass --profile <dir> or set TRAWL_PROFILE_DIR",
-		);
-	}
+	const explicitProfileDir = args["--profile"] ?? env.TRAWL_PROFILE_DIR;
+	const usedDefaultProfileDir = !explicitProfileDir;
+	const profileDir = explicitProfileDir ?? defaultProfileDir();
 
 	const mkdir = deps.mkdirSync ?? mkdirSync;
 	mkdir(profileDir, { recursive: true });
@@ -280,7 +312,12 @@ export async function runLogin(argv, deps = {}) {
 	stderr(
 		`A browser window has opened at ${origin}.\n` +
 			"Sign in, then close the browser window (or press Enter here) to save " +
-			`the session to:\n  ${profileDir}\n`,
+			`the session to:\n  ${profileDir}\n` +
+			(usedDefaultProfileDir
+				? "(no --profile/TRAWL_PROFILE_DIR given; defaulted to the above " +
+					"directory, shared across every origin unless you pass " +
+					"--profile/TRAWL_PROFILE_DIR to isolate a session per site)\n"
+				: ""),
 	);
 
 	await waitForUser(context);

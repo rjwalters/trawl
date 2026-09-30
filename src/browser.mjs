@@ -7,38 +7,46 @@ import { existsSync, readdirSync } from "node:fs";
 import { arch, homedir, platform } from "node:os";
 import path from "node:path";
 
-export function cacheRoot() {
-	const home = homedir();
-	switch (platform()) {
+// `env` lets tests inject platform/arch/home/LOCALAPPDATA; callers pass
+// nothing and get the real host values.
+export function cacheRoot(env = {}) {
+	const home = env.home ?? homedir();
+	switch (env.platform ?? platform()) {
 		case "darwin":
 			return path.join(home, "Library/Caches/ms-playwright");
 		case "win32":
-			return path.join(process.env.LOCALAPPDATA ?? home, "ms-playwright");
+			return path.join(
+				env.localAppData ?? process.env.LOCALAPPDATA ?? home,
+				"ms-playwright",
+			);
 		default:
 			return path.join(home, ".cache/ms-playwright");
 	}
 }
 
-function archDirCandidates() {
-	const a = arch();
-	switch (platform()) {
+// Playwright's Chrome-for-Testing headless shell lives in
+// `chrome-headless-shell-<archDir>`. Current names come first; older
+// Playwright releases used `linux` for x64 Linux, kept for old caches.
+function archDirCandidates(env = {}) {
+	const a = env.arch ?? arch();
+	switch (env.platform ?? platform()) {
 		case "darwin":
 			return a === "arm64" ? ["mac-arm64"] : ["mac-x64", "mac"];
 		case "win32":
 			return ["win64", "win32"];
 		default:
-			return a === "arm64" ? ["linux-arm64"] : ["linux"];
+			return a === "arm64" ? ["linux-arm64"] : ["linux64", "linux"];
 	}
 }
 
 // Cached headless-shell builds are named `chromium_headless_shell-<rev>`;
 // several can coexist, so take the highest revision.
-function findCachedShell() {
-	const root = cacheRoot();
+export function findCachedShell(env = {}) {
+	const root = cacheRoot(env);
 	if (!existsSync(root)) return null;
 
 	const bin =
-		platform() === "win32"
+		(env.platform ?? platform()) === "win32"
 			? "chrome-headless-shell.exe"
 			: "chrome-headless-shell";
 	const builds = readdirSync(root)
@@ -49,7 +57,7 @@ function findCachedShell() {
 		});
 
 	for (const build of builds) {
-		for (const archDir of archDirCandidates()) {
+		for (const archDir of archDirCandidates(env)) {
 			const candidate = path.join(
 				root,
 				build,

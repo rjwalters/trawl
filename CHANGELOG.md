@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-30
+
+`trawl` now finds the browser that Playwright's own installer downloads on x64
+Linux, and `trawl login` no longer needs a profile path chosen up front.
+
+### Added
+
+- `trawl login <origin>` defaults to a shared `~/.trawl/profile` (created on
+  first use, announced on stderr) when neither `--profile` nor
+  `$TRAWL_PROFILE_DIR` is set. Explicit values still win. Plain `trawl <url>`
+  fetches stay ephemeral. (#25)
+- `--help` and the README document `--wait-until domcontentloaded --settle
+  15000` as the workaround for anti-bot interstitials that hold `networkidle`
+  open. (#25)
+
+### Fixed
+
+- On x64 Linux, the cached `chrome-headless-shell` lookup missed the binary
+  that `npx playwright install chromium --only-shell` installs: current
+  Playwright names that directory `chrome-headless-shell-linux64`, and only
+  `-linux` was searched, so `trawl` threw `NoBrowserError` right after
+  following its own install advice. `linux64` is now checked first, with the
+  legacy name kept as a fallback. (#33)
+
 ## [0.2.0] - 2026-08-14
 
 Auth-gated pages now fail loudly instead of masquerading as content, and a

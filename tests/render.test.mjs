@@ -466,7 +466,12 @@ test("still writes a valid HAR when navigation throws", opts, async () => {
 	await server.close();
 
 	const file = harPath();
-	await assert.rejects(() => render(url, { har: file, timeout: 5000 }));
+	// ignoreRobots: the refused robots.txt fetch would otherwise be a full
+	// disallow (RFC 9309 §2.3.1.4) and stop us before navigation even starts.
+	await assert.rejects(
+		() => render(url, { har: file, timeout: 5000, ignoreRobots: true }),
+		/ERR_CONNECTION_REFUSED|net::/,
+	);
 
 	assert.ok(existsSync(file), "HAR file was written despite the failure");
 	readHar(file);
@@ -590,13 +595,134 @@ test("ignoreRobots skips the check entirely", async () => {
 	}
 });
 
-test("a missing robots.txt fails open", async () => {
+test("a missing (404) robots.txt allows the page", async () => {
 	const s = await serve({});
 	try {
 		await assert.rejects(
 			() => render(`${s.origin}/anything`, NO_BROWSER),
 			/Chromium binary not found/,
 		);
+	} finally {
+		await s.close();
+	}
+});
+
+// A loopback server whose robots.txt answers with `robots(req, res)`; every
+// other request is counted as a page request and served a tiny page.
+async function serveRobots(robots) {
+	const hits = { robots: 0, page: 0 };
+	const server = createServer((req, res) => {
+		const { pathname } = new URL(req.url, "http://127.0.0.1");
+		if (pathname === "/robots.txt" || pathname.startsWith("/robots-")) {
+			hits.robots++;
+			robots(req, res, pathname);
+			return;
+		}
+		hits.page++;
+		res.writeHead(200, { "content-type": "text/html" });
+		res.end("<!doctype html><title>Page</title><p>reached the page</p>");
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	return {
+		origin: `http://127.0.0.1:${port}`,
+		hits,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+const status = (code) => (_req, res) => {
+	res.writeHead(code, { "content-type": "text/plain" });
+	res.end("User-agent: *\nDisallow:\n");
+};
+
+const UNREACHABLE_503 =
+	/robots\.txt is unreachable: http:\/\/127\.0\.0\.1:\d+\/robots\.txt returned HTTP 503 \(server error\)\. .*no browser-profile cookies.*Use --ignore-robots to override\./;
+
+test("a 503 robots.txt refuses the page before launching a browser", async () => {
+	const s = await serveRobots(status(503));
+	try {
+		// NO_BROWSER: had the check passed we would see "Chromium binary not
+		// found" instead.
+		await assert.rejects(
+			() => render(`${s.origin}/page`, NO_BROWSER),
+			UNREACHABLE_503,
+		);
+		assert.equal(s.hits.robots, 1);
+		assert.equal(s.hits.page, 0);
+	} finally {
+		await s.close();
+	}
+});
+
+test("a 500 robots.txt refuses the page too", async () => {
+	const s = await serveRobots(status(500));
+	try {
+		await assert.rejects(
+			() => render(`${s.origin}/page`, NO_BROWSER),
+			/robots\.txt is unreachable: .* returned HTTP 500/,
+		);
+		assert.equal(s.hits.page, 0);
+	} finally {
+		await s.close();
+	}
+});
+
+test("a robots.txt redirect that ends in a 503 refuses the page", async () => {
+	const s = await serveRobots((_req, res, pathname) => {
+		if (pathname === "/robots.txt") {
+			res.writeHead(302, { location: "/robots-down" });
+			res.end();
+			return;
+		}
+		status(503)(_req, res);
+	});
+	try {
+		await assert.rejects(
+			() => render(`${s.origin}/page`, NO_BROWSER),
+			/robots\.txt is unreachable: .* returned HTTP 503/,
+		);
+		assert.equal(s.hits.robots, 2, "the redirect should have been followed");
+		assert.equal(s.hits.page, 0);
+	} finally {
+		await s.close();
+	}
+});
+
+for (const code of [404, 410, 429]) {
+	test(`a ${code} robots.txt still allows the page`, async () => {
+		const s = await serveRobots(status(code));
+		try {
+			await assert.rejects(
+				() => render(`${s.origin}/page`, NO_BROWSER),
+				/Chromium binary not found/,
+			);
+		} finally {
+			await s.close();
+		}
+	});
+}
+
+test("an unreachable robots.txt host refuses with a network-error message", async () => {
+	// Bind then close, so the port is (almost certainly) refusing connections.
+	const s = await serveRobots(status(200));
+	const { origin } = s;
+	await s.close();
+	await assert.rejects(
+		() => render(`${origin}/page`, NO_BROWSER),
+		/robots\.txt is unreachable: .*could not be fetched \(network error: .+\)\. .*Use --ignore-robots to override\./,
+	);
+});
+
+test("ignoreRobots never requests an unreachable robots.txt", async () => {
+	const s = await serveRobots(status(503));
+	try {
+		await assert.rejects(
+			() =>
+				render(`${s.origin}/page`, { ...NO_BROWSER, ignoreRobots: true }),
+			/Chromium binary not found/,
+		);
+		assert.equal(s.hits.robots, 0);
 	} finally {
 		await s.close();
 	}
@@ -616,10 +742,11 @@ test("never fetches robots.txt for a file:// URL", async () => {
 	assert.equal(calls, 0);
 
 	// Same options against an http(s) URL *do* consult robots.txt — otherwise
-	// the assertion above would pass for the wrong reason.
+	// the assertion above would pass for the wrong reason. The spy throws, so
+	// that consultation is now a network-error denial (RFC 9309 §2.3.1.4).
 	await assert.rejects(
 		() => render("http://127.0.0.1:1/page", { ...NO_BROWSER, fetch: spy }),
-		/Chromium binary not found/,
+		/robots\.txt is unreachable: .*network error/,
 	);
 	assert.equal(calls, 1);
 });
@@ -697,6 +824,20 @@ test("ignoreRobots navigates a path robots.txt would block", opts, async () => {
 			ignoreRobots: true,
 		});
 		assert.match(body, /secret/);
+	} finally {
+		await s.close();
+	}
+});
+
+test("ignoreRobots reaches the page past a 503 robots.txt", opts, async () => {
+	const s = await serveRobots(status(503));
+	try {
+		await assert.rejects(() => render(`${s.origin}/page`), UNREACHABLE_503);
+		assert.equal(s.hits.page, 0);
+		const { body } = await render(`${s.origin}/page`, { ignoreRobots: true });
+		assert.match(body, /reached the page/);
+		assert.equal(s.hits.robots, 1, "only the guarded run requested robots.txt");
+		assert.ok(s.hits.page >= 1);
 	} finally {
 		await s.close();
 	}

@@ -9,6 +9,7 @@ import {
 	ROBOTS_TIMEOUT_MS,
 	checkRobotsAllowed,
 	crawlDelayMs,
+	robotsDenialMessage,
 } from "./robots.mjs";
 
 export const FORMATS = ["text", "html", "links", "title", "markdown"];
@@ -281,26 +282,25 @@ export async function render(url, options = {}) {
 
 	// Etiquette, enforced rather than promised: consult robots.txt before we
 	// touch the page at all. Skipped for non-http(s) URLs and when the caller
-	// opts out with `ignoreRobots`.
+	// opts out with `ignoreRobots` (which skips the robots request itself, so
+	// an unreachable robots.txt cannot block an explicit override either). A
+	// 5xx, network error, or timeout is a full disallow (RFC 9309 §2.3.1.4)
+	// and is reported as such rather than as a matched rule.
 	if (!opts.ignoreRobots && isHttpUrl(url)) {
 		const verdict = await checkRobotsAllowed(url, {
 			userAgent,
 			// Deliberately NOT coupled to `opts.timeout`. Playwright's convention
-			// — which `--timeout` inherits — is that `0` means "no timeout", and
-			// the fetch fails open, so borrowing the page budget here made
+			// — which `--timeout` inherits — is that `0` means "no timeout". While
+			// a robots timeout failed open, borrowing the page budget here made
 			// `--timeout 0` (and any implausibly small value) silently skip the
-			// check entirely rather than enforce it. `ROBOTS_TIMEOUT_MS` already
-			// bounds this fetch independently at 10s, so the old `Math.min` could
-			// only ever shorten the budget — and every shortening was a silent
-			// skip. One fixed, sane budget instead.
+			// check; now that a timeout is a full disallow (RFC 9309 §2.3.1.4),
+			// the same coupling would instead refuse every such run.
+			// `ROBOTS_TIMEOUT_MS` bounds this fetch independently at 10s — one
+			// fixed, sane budget.
 			timeout: ROBOTS_TIMEOUT_MS,
 			fetch: opts.fetch,
 		});
-		if (!verdict.allowed) {
-			throw new Error(
-				`robots.txt disallows this path (${verdict.rule}). Use --ignore-robots to override.`,
-			);
-		}
+		if (!verdict.allowed) throw new Error(robotsDenialMessage(verdict));
 		// One invocation fetches one page, so honoring `Crawl-delay` means
 		// spacing the two requests we do make — robots.txt, then the page.
 		const delay = crawlDelayMs(verdict.crawlDelay);

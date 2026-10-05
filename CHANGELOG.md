@@ -5,6 +5,29 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Behavior change:** an unreachable `robots.txt` is now a full disallow, per
+  RFC 9309 §2.3.1.4, instead of failing open. A 5xx response (including at the
+  end of a redirect chain), a network error, a timeout, or a body that fails
+  mid-read refuses the run before any browser launches, with an error naming
+  `robots.txt`, the cause (`returned HTTP 503 (server error)`, `network error:
+  ENOTFOUND`, `timed out after 10000ms`, …) and `--ignore-robots` — not a
+  made-up `Disallow` rule. 4xx responses, 404/410/429 included, still mean "no
+  restrictions". Network errors and timeouts deny too, deliberately: the RFC
+  calls them unreachable, and an allow-on-error check is skipped by exactly the
+  outages and interstitials it exists for. The cost is that a transient DNS
+  blip or a slow `robots.txt` now fails the run where it used to proceed;
+  retry, or pass `--ignore-robots` (which skips the request entirely). The
+  `robots.txt` request carries no browser-profile cookies, so a site that 503s
+  cookie-less clients blocks `trawl` until you pass `--ignore-robots`. Library
+  `render()` callers get the same rejection. (#37)
+- The `robots.txt` request is built from the page's origin, so credentials in
+  a `user:pass@host` URL are never sent to (or reported for) `robots.txt`;
+  Node's `fetch` would otherwise reject such a URL, which is now a denial. (#37)
+
 ## [0.3.0] - 2026-09-30
 
 `trawl` now finds the browser that Playwright's own installer downloads on x64

@@ -6,9 +6,11 @@
 // (`$`) path extensions are explicitly out of scope — a path is matched by
 // literal prefix comparison only.
 //
-// This is a politeness mechanism, not a security boundary: anything that
-// goes wrong while fetching or parsing robots.txt is treated as "no
-// restrictions apply" (RFC 9309 §2.3.1.3).
+// This is a politeness mechanism, not a security boundary. Retrieval
+// failures follow RFC 9309 §2.3.1.3–4: a 4xx ("unavailable") means no
+// restrictions apply, while a 5xx, network error, or timeout ("unreachable")
+// means a complete disallow. A robots.txt that *was* retrieved but does not
+// parse is treated as allowing everything.
 
 // Cap for the robots.txt fetch itself, so a hanging robots.txt cannot
 // dominate an invocation that has a much larger page timeout.
@@ -140,10 +142,45 @@ export function crawlDelayMs(seconds) {
 	return Math.min(seconds * 1000, MAX_CRAWL_DELAY_MS);
 }
 
+// A denied verdict for a robots.txt that could not be retrieved. There is no
+// matched rule — `failure` carries the cause instead, so a caller can say
+// "unreachable", not "disallowed by Disallow: /".
+//   kind: "server-error" (with `status`), "network-error", "read-error"
+//         (body failed after headers arrived), or "timeout".
+function unreachable(robotsUrl, failure) {
+	return {
+		allowed: false,
+		rule: null,
+		crawlDelay: null,
+		failure: { url: robotsUrl, ...failure },
+	};
+}
+
+// A short, header- and cookie-free description of a thrown fetch error.
+// Node's fetch wraps the useful part (ECONNREFUSED, ENOTFOUND, …) in `cause`.
+function describeError(err) {
+	const cause = err?.cause;
+	return (
+		cause?.code ??
+		cause?.message ??
+		err?.code ??
+		err?.message ??
+		String(err ?? "unknown error")
+	);
+}
+
 // Fetch `<origin>/robots.txt` and evaluate it for `url`.
 //
-// Fails open: a network error, a timeout, or any non-2xx status (404
-// included) means "no restrictions apply".
+// Per RFC 9309 §2.3.1.3–4:
+//   - 2xx: the body is parsed and evaluated.
+//   - 4xx (404, 410, 429, …) and any other non-5xx status: no restrictions.
+//   - 5xx, a network error, a timeout (headers or body), or a failed body
+//     read: complete disallow, reported via `failure` with no matched rule.
+// Redirects are followed (Node fetch's default); the final response decides.
+//
+// The request carries the User-Agent but no browser-profile cookies, so a
+// robots.txt behind a cookie-gated interstitial is "unreachable" here even
+// when a navigation with that profile would get through.
 export async function checkRobotsAllowed(url, options = {}) {
 	const {
 		userAgent,
@@ -159,21 +196,54 @@ export async function checkRobotsAllowed(url, options = {}) {
 	}
 	if (typeof fetchImpl !== "function") return ALLOWED;
 
-	const robotsUrl = new URL("/robots.txt", target).href;
+	// Built from the origin, so userinfo in the page URL (which Node's fetch
+	// refuses outright) is neither sent nor echoed into a diagnostic.
+	const robotsUrl = `${target.origin}/robots.txt`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeout);
+	const timedOut = () => unreachable(robotsUrl, { kind: "timeout", timeout });
 
 	let text;
 	try {
-		const response = await fetchImpl(robotsUrl, {
-			headers: userAgent ? { "User-Agent": userAgent } : {},
-			redirect: "follow",
-			signal: controller.signal,
-		});
-		if (!response?.ok) return ALLOWED;
-		text = await response.text();
-	} catch {
-		return ALLOWED;
+		let response;
+		try {
+			response = await fetchImpl(robotsUrl, {
+				headers: userAgent ? { "User-Agent": userAgent } : {},
+				redirect: "follow",
+				signal: controller.signal,
+			});
+		} catch (err) {
+			if (controller.signal.aborted) return timedOut();
+			return unreachable(robotsUrl, {
+				kind: "network-error",
+				detail: describeError(err),
+			});
+		}
+		if (!response) {
+			return unreachable(robotsUrl, {
+				kind: "network-error",
+				detail: "no response",
+			});
+		}
+
+		const status = Number(response.status);
+		if (!response.ok) {
+			if (status >= 500 && status <= 599) {
+				return unreachable(robotsUrl, { kind: "server-error", status });
+			}
+			return ALLOWED;
+		}
+
+		try {
+			text = await response.text();
+		} catch (err) {
+			if (controller.signal.aborted) return timedOut();
+			return unreachable(robotsUrl, {
+				kind: "read-error",
+				status,
+				detail: describeError(err),
+			});
+		}
 	} finally {
 		clearTimeout(timer);
 	}
@@ -182,4 +252,38 @@ export async function checkRobotsAllowed(url, options = {}) {
 		userAgent,
 		path: `${target.pathname}${target.search}`,
 	});
+}
+
+// Turn a denied robots verdict into an error message. A matched rule and a
+// robots.txt that could not be retrieved are different situations and say
+// so: the latter names the cause, says why it is a full disallow, and notes
+// that the robots request carries no browser-profile cookies — the usual
+// reason a site that loads fine in a browser still fails here.
+export function robotsDenialMessage(verdict) {
+	const override = "Use --ignore-robots to override.";
+	const failure = verdict?.failure;
+	if (!failure) {
+		return `robots.txt disallows this path (${verdict?.rule}). ${override}`;
+	}
+	const where = failure.url ?? "robots.txt";
+	let cause;
+	switch (failure.kind) {
+		case "server-error":
+			cause = `${where} returned HTTP ${failure.status} (server error)`;
+			break;
+		case "timeout":
+			cause = `${where} timed out after ${failure.timeout}ms`;
+			break;
+		case "read-error":
+			cause = `reading the body of ${where} failed (${failure.detail})`;
+			break;
+		default:
+			cause = `${where} could not be fetched (network error: ${failure.detail})`;
+	}
+	return (
+		`robots.txt is unreachable: ${cause}. RFC 9309 treats an unreachable ` +
+		"robots.txt as disallowing the whole site. The robots.txt request " +
+		"sends no browser-profile cookies, so a cookie-gated robots.txt can " +
+		`fail here even when the page itself would load. ${override}`
+	);
 }

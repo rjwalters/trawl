@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-run request pacing.** Requests to an origin are now spaced across
+  separate `trawl` invocations (and concurrent ones), not just within one run:
+  before the `robots.txt` request, the page navigation, and the
+  `networkidle`-fallback navigation, `trawl` waits until
+  `max(--min-interval, Crawl-delay)` has elapsed since the last request any
+  `trawl` process made to that origin. The minimum defaults to 1000 ms
+  (`--min-interval <ms>`, 0–60000; library `minIntervalMs`); `--no-pacing`
+  (library `pacing: false`) opts out and keeps the old in-run `Crawl-delay`
+  sleep. State lives in `$TRAWL_STATE_DIR`, else
+  `${XDG_CACHE_HOME:-~/.cache}/trawl` (library `pacingStateDir`), guarded by a
+  per-origin lock with stale-lock recovery; an unusable state directory warns
+  and falls back to in-run pacing. A plain `trawl <url>` now waits up to 1s
+  between its `robots.txt` request and the page request (browser startup
+  usually absorbs most of it). (#38)
+
 ### Changed
 
 - **Behavior change:** an unreachable `robots.txt` is now a full disallow, per

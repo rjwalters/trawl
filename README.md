@@ -52,7 +52,15 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
       --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
-      --ignore-robots      Skip the robots.txt check
+      --ignore-robots      Skip the robots.txt check (not --min-interval)
+      --min-interval <ms>  Minimum gap between requests to one origin,
+                            across separate runs; Crawl-delay still wins if
+                            larger. 0 drops the floor only. Max 60000.
+                                                             (default: 1000)
+      --no-pacing          Don't pace requests across runs (Crawl-delay is
+                            still honored within a run). Pacing state lives
+                            in $TRAWL_STATE_DIR, else
+                            ${XDG_CACHE_HOME:-~/.cache}/trawl
       --profile <dir>      Persistent browser profile (cookies/localStorage
                             survive across runs); also $TRAWL_PROFILE_DIR.
                             Populate one with "trawl login" (which defaults
@@ -218,6 +226,12 @@ the check. Pass `{ profileDir: "<dir>" }` to render through a persistent
 browser profile instead of a fresh one each call, the library equivalent of
 `--profile`.
 
+`render()` paces its `http(s)` requests across calls and processes the same
+way the CLI does (see [Etiquette](#etiquette)): `{ minIntervalMs }` sets the
+per-origin floor (default 1000, 0–60000), `{ pacing: false }` turns
+cross-run pacing off, and `{ pacingStateDir }` overrides where the state is
+kept (default `$TRAWL_STATE_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/trawl`).
+
 ### As an MCP server
 
 `trawl mcp` starts a stdio [MCP](https://modelcontextprotocol.io) server, so
@@ -243,6 +257,8 @@ Two tools, and nothing that clicks, types, or navigates a session:
 page bodies into its context. Results longer than 100,000 characters are
 truncated with a notice saying so; set `TRAWL_MCP_MAX_CHARS` to change the
 budget. A failed fetch comes back as a tool error — the server keeps serving.
+Tool calls are paced per origin with the default 1000 ms floor, shared with
+any CLI runs through the same state directory (`$TRAWL_STATE_DIR`).
 
 ## Why not X?
 
@@ -288,10 +304,38 @@ default rather than asking you to promise you will.
   your own staging site, a page you are authenticated to, a `robots.txt`
   that blocks all bots but permits the human reading the same URL, or one
   that is down. It skips the `robots.txt` request entirely.
-- **`Crawl-delay` is honored** as a pause between the `robots.txt` request
-  and the page request. `trawl` fetches one page per run, so that is the
-  only gap there is to space out. It is capped at 60s so a `Crawl-delay:
-  86400` can't hang the tool.
+- **Requests are paced per origin, across runs.** A shell loop of separate
+  `trawl` calls is spaced out, not just the requests inside one call. Before
+  each request it makes to an origin, `trawl` waits until
+  `max(--min-interval, Crawl-delay)` has passed since the last request *any*
+  `trawl` process made to that origin (scheme + host + port; paths don't
+  matter, and different origins never wait on each other). The minimum
+  defaults to **1000 ms**; `--min-interval 0` drops the floor but still
+  honors `Crawl-delay`, which is capped at 60s so a `Crawl-delay: 86400`
+  can't hang the tool. The last-known `Crawl-delay` is remembered, so the
+  next run's `robots.txt` request is paced before the policy is re-read.
+  - *What is paced:* the `robots.txt` request, the page navigation, and the
+    `domcontentloaded` retry after a `networkidle` timeout. Not paced: the
+    page's own subresources (scripts, images, XHR), redirects the browser
+    follows, and `trawl login`.
+  - *Where state lives:* `$TRAWL_STATE_DIR`, else
+    `${XDG_CACHE_HOME:-~/.cache}/trawl/pacing/` — one small JSON file per
+    origin (named by a hash of the origin) holding only the last request
+    time and `Crawl-delay`. No URLs, cookies, credentials, or page content.
+    A missing or corrupt file just means "no prior request".
+  - *Concurrency:* a per-origin lock file serializes concurrent `trawl`
+    processes, so parallel runs against one site queue up rather than
+    stampede. A lock left by a crashed process is recovered automatically;
+    if another run holds the lock for more than 120s, `trawl` fails with a
+    pacing error rather than sending an unpaced request.
+  - *If the state directory is unusable* (read-only, not a directory),
+    `trawl` warns on stderr and keeps rendering, pacing only within the
+    run — spacing across separate processes is not guaranteed then.
+  - *Opting out:* `--no-pacing` (library: `pacing: false`) turns cross-run
+    pacing off; `Crawl-delay` is then still honored as a pause between the
+    `robots.txt` request and the page request within the one run.
+    `--ignore-robots` skips `robots.txt` and its `Crawl-delay`, but not the
+    `--min-interval` floor.
 - **It identifies itself**: the default `User-Agent` is
   `trawl/<version> (+https://github.com/rjwalters/trawl)`, so an operator
   reading their logs can see what hit them and block it if they want.

@@ -3,7 +3,13 @@
 // rather than fail, so `npm test` is always runnable.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,6 +25,11 @@ try {
 	haveBrowser = false;
 }
 const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+
+// render() paces http(s) requests through a persistent per-origin state dir
+// (src/pacing.mjs). Point it at a throwaway directory so no test here ever
+// reads or writes the real ~/.cache/trawl.
+process.env.TRAWL_STATE_DIR = mkdtempSync(path.join(tmpdir(), "trawl-state-"));
 
 // A page whose content only exists after scripts run — the whole point of
 // the tool. Static fetchers see the empty root div.
@@ -781,12 +792,15 @@ test("identifies itself with a default trawl User-Agent on the robots.txt fetch"
 	assert.equal(seen[1][1], "my-own-agent/9");
 });
 
-test("sleeps for Crawl-delay between the robots.txt fetch and the page fetch", async () => {
+// With pacing on, the Crawl-delay wait moves to the gate in front of the page
+// navigation (after browser launch) — covered by the pacing tests below. With
+// pacing off, the original in-run sleep must still happen.
+test("with pacing: false, still sleeps for Crawl-delay between the robots.txt fetch and the page fetch", async () => {
 	const s = await serve({ "/robots.txt": "User-agent: *\nCrawl-delay: 1\n" });
 	const started = Date.now();
 	try {
 		await assert.rejects(
-			() => render(`${s.origin}/page`, NO_BROWSER),
+			() => render(`${s.origin}/page`, { ...NO_BROWSER, pacing: false }),
 			/Chromium binary not found/,
 		);
 	} finally {
@@ -1041,5 +1055,287 @@ test("an explicit non-networkidle wait condition still fails on timeout, unretri
 			waitUntil: "load",
 			timeout: 2000,
 		}),
+	);
+});
+
+// --- cross-run pacing (#38) ---
+//
+// render() gates every explicit request — robots.txt, the page navigation,
+// and the networkidle-fallback navigation — behind the last request made to
+// the same origin, persisted in a state dir. Each test uses its own temporary
+// state dir.
+//
+// What the spacing assertions measure: the gate paces on the *recorded start*
+// of each request (the `lastRequestAt` it writes just before initiating it),
+// as #38 specifies. Server arrival is not a reliable proxy for that — the
+// first fetch() in a Node process spends 100-200ms (more under load) between
+// the call and the request reaching the server, so a cold request followed
+// by a warm one can arrive closer together than the interval even though
+// the gate spaced them correctly. Any tolerance on arrival gaps is a guess
+// about that latency.
+//
+// So the server snapshots the state file as each request arrives. The gate
+// writes `lastRequestAt` before sending, and the next request cannot record
+// until the interval has passed, so the snapshot is exactly that request's
+// recorded start (as long as it arrives within one interval of being sent).
+// Spacing is then asserted on recorded starts with no tolerance, plus the
+// causal check that each request arrived no earlier than its recorded start.
+
+// The recorded start of the last gated request, or null if none yet. One
+// origin per test, so the pacing dir holds at most one state file (`.tmp`
+// files are in-flight writes, which are renamed atomically into place).
+function recordedStart(stateDir) {
+	const dir = path.join(stateDir, "pacing");
+	let files;
+	try {
+		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+	} catch {
+		return null;
+	}
+	if (files.length !== 1) return null;
+	try {
+		return JSON.parse(readFileSync(path.join(dir, files[0]), "utf8")).lastRequestAt ?? null;
+	} catch {
+		return null;
+	}
+}
+
+// Serves fixed bodies like `serve()` above, but logs when each path was hit
+// and, given `stateDir`, the recorded start of the request that hit it.
+async function serveLogged(routes, { stateDir } = {}) {
+	const hits = [];
+	const server = createServer((req, res) => {
+		const url = new URL(req.url, "http://127.0.0.1");
+		hits.push({
+			path: url.pathname,
+			at: Date.now(),
+			recorded: stateDir ? recordedStart(stateDir) : null,
+		});
+		const body = routes[url.pathname];
+		if (body === undefined) {
+			res.writeHead(404, { "content-type": "text/plain" });
+			res.end("not found");
+			return;
+		}
+		const type = url.pathname.endsWith(".txt") ? "text/plain" : "text/html";
+		res.writeHead(200, { "content-type": type });
+		res.end(body);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	return {
+		origin: `http://127.0.0.1:${port}`,
+		hits,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+function freshStateDir() {
+	return mkdtempSync(path.join(tmpdir(), "trawl-pacing-state-"));
+}
+
+// Every consecutive pair of gated requests started at least `minGapMs` apart
+// (by recorded start, exact), and none reached the server before it was
+// recorded. See the section comment above for why not arrival gaps.
+function assertSpaced(hits, minGapMs) {
+	for (const h of hits) {
+		assert.equal(typeof h.recorded, "number", `${h.path} arrived with no recorded start`);
+		assert.ok(h.at >= h.recorded, `${h.path} arrived before its recorded start`);
+	}
+	for (let i = 1; i < hits.length; i++) {
+		const gap = hits[i].recorded - hits[i - 1].recorded;
+		assert.ok(
+			gap >= minGapMs,
+			`${hits[i - 1].path} -> ${hits[i].path} started only ${gap}ms apart ` +
+				`(want >= ${minGapMs})` +
+				(gap === 0 ? "; the earlier request arrived after the later one was recorded" : ""),
+		);
+	}
+}
+
+// Capture what render() writes to stderr (the degraded-mode warning).
+async function captureStderr(fn) {
+	const original = process.stderr.write;
+	let captured = "";
+	process.stderr.write = (chunk, ...rest) => {
+		captured += chunk;
+		return original.call(process.stderr, chunk, ...rest);
+	};
+	try {
+		return { result: await fn(), stderr: () => captured };
+	} finally {
+		process.stderr.write = original;
+	}
+}
+
+for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, 60001, "abc"]) {
+	test(`rejects minIntervalMs ${String(bad)} before any request`, async () => {
+		let fetched = false;
+		await assert.rejects(
+			() =>
+				render("http://127.0.0.1:1/page", {
+					...NO_BROWSER,
+					minIntervalMs: bad,
+					fetch: async () => {
+						fetched = true;
+						return new Response("");
+					},
+				}),
+			/minIntervalMs expects/,
+		);
+		assert.equal(fetched, false);
+	});
+}
+
+test("a non-http(s) URL never touches the pacing state dir", async () => {
+	const dir = freshStateDir();
+	await assert.rejects(
+		() => render(fixtureUrl(SPA, "spa.html"), { ...NO_BROWSER, pacingStateDir: dir }),
+		/Chromium binary not found/,
+	);
+	assert.deepEqual(readdirSync(dir), []);
+});
+
+test("robots.txt fetches from separate render() calls are paced on the minimum interval", async () => {
+	const pacingStateDir = freshStateDir();
+	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" }, { stateDir: pacingStateDir });
+	try {
+		for (let i = 0; i < 2; i++) {
+			await assert.rejects(
+				() => render(`${s.origin}/page`, { ...NO_BROWSER, pacingStateDir, minIntervalMs: 700 }),
+				/Chromium binary not found/,
+			);
+		}
+	} finally {
+		await s.close();
+	}
+	assert.equal(s.hits.length, 2);
+	assertSpaced(s.hits, 700);
+	assert.equal(readdirSync(path.join(pacingStateDir, "pacing")).length, 1);
+});
+
+test("pacing: false neither waits across calls nor writes state", async () => {
+	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" });
+	const pacingStateDir = freshStateDir();
+	try {
+		for (let i = 0; i < 2; i++) {
+			await assert.rejects(
+				() =>
+					render(`${s.origin}/page`, {
+						...NO_BROWSER,
+						pacing: false,
+						pacingStateDir,
+						minIntervalMs: 5000,
+					}),
+				/Chromium binary not found/,
+			);
+		}
+	} finally {
+		await s.close();
+	}
+	assert.equal(s.hits.length, 2);
+	assert.ok(s.hits[1].at - s.hits[0].at < 5000, "pacing: false still waited");
+	assert.deepEqual(readdirSync(pacingStateDir), []);
+});
+
+test("Crawl-delay paces robots and page requests across two render() calls", opts, async () => {
+	const pacingStateDir = freshStateDir();
+	const s = await serveLogged({
+		"/robots.txt": "User-agent: *\nCrawl-delay: 0.8\n",
+		"/page.html": "<!doctype html><title>P</title><h1>Paced</h1>",
+	}, { stateDir: pacingStateDir });
+	try {
+		for (let i = 0; i < 2; i++) {
+			// A zero minimum: every gap below comes from Crawl-delay alone —
+			// including the second robots.txt fetch, paced on the stored delay.
+			const { body } = await render(`${s.origin}/page.html`, { pacingStateDir, minIntervalMs: 0 });
+			assert.match(body, /Paced/);
+		}
+	} finally {
+		await s.close();
+	}
+	const explicit = s.hits.filter((h) => h.path === "/robots.txt" || h.path === "/page.html");
+	assert.deepEqual(
+		explicit.map((h) => h.path),
+		["/robots.txt", "/page.html", "/robots.txt", "/page.html"],
+	);
+	assertSpaced(explicit, 800);
+});
+
+test("ignoreRobots skips Crawl-delay but still paces on the minimum interval", opts, async () => {
+	const pacingStateDir = freshStateDir();
+	const s = await serveLogged({
+		"/robots.txt": "User-agent: *\nCrawl-delay: 30\n",
+		"/page.html": "<!doctype html><title>P</title><h1>Paced</h1>",
+	}, { stateDir: pacingStateDir });
+	try {
+		for (let i = 0; i < 2; i++) {
+			await render(`${s.origin}/page.html`, { pacingStateDir, ignoreRobots: true, minIntervalMs: 900 });
+		}
+	} finally {
+		await s.close();
+	}
+	const pages = s.hits.filter((h) => h.path === "/page.html");
+	assert.equal(s.hits.filter((h) => h.path === "/robots.txt").length, 0);
+	assert.equal(pages.length, 2);
+	assertSpaced(pages, 900);
+	assert.ok(pages[1].at - pages[0].at < 30_000, "ignoreRobots honoured Crawl-delay");
+});
+
+test("the networkidle-fallback navigation passes through the same gate", opts, async () => {
+	const hits = [];
+	const pacingStateDir = freshStateDir();
+	const server = serveHangingStream();
+	server.on("request", (req) => {
+		if (req.url === "/") {
+			hits.push({ path: "/", at: Date.now(), recorded: recordedStart(pacingStateDir) });
+		}
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	try {
+		const result = await render(`http://127.0.0.1:${port}/`, {
+			ignoreRobots: true,
+			timeout: 1000,
+			// Longer than the navigation timeout, so only the gate can explain
+			// the retry waiting this long after the first navigation.
+			minIntervalMs: 2500,
+			pacingStateDir,
+		});
+		assert.ok(result.waitUntilFallback);
+	} finally {
+		server.closeAllConnections();
+		await new Promise((resolve) => server.close(resolve));
+	}
+	assert.equal(hits.length, 2);
+	assertSpaced(hits, 2500);
+});
+
+test("an unwritable state dir warns on stderr and still renders", opts, async () => {
+	const s = await serveLogged({
+		"/robots.txt": "User-agent: *\nAllow: /\n",
+		"/page.html": "<!doctype html><title>P</title><h1>Still here</h1>",
+	});
+	const parent = freshStateDir();
+	const notADir = path.join(parent, "occupied");
+	writeFileSync(notADir, "a file, not a directory");
+	try {
+		const { result, stderr } = await captureStderr(() =>
+			render(`${s.origin}/page.html`, { pacingStateDir: notADir, minIntervalMs: 300 }),
+		);
+		assert.match(result.body, /Still here/);
+		assert.match(stderr(), /pacing state directory .* is unusable/);
+		assert.equal(stderr().match(/is unusable/g).length, 1, "warned more than once");
+	} finally {
+		await s.close();
+	}
+	// Both requests still went out, robots.txt first. With no state file there
+	// is no recorded start to observe here, and server arrival gaps cannot
+	// prove spacing (see the section comment); the degraded in-run wait itself
+	// is asserted deterministically, on a fake clock, in tests/pacing.test.mjs
+	// ("an unwritable state dir warns once and falls back to in-run pacing").
+	assert.deepEqual(
+		s.hits.filter((h) => h.path === "/robots.txt" || h.path === "/page.html").map((h) => h.path),
+		["/robots.txt", "/page.html"],
 	);
 });

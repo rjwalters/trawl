@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -22,6 +30,10 @@ try {
 	haveBrowser = false;
 }
 const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+
+// Spawned CLIs inherit this, so cross-run pacing state (src/pacing.mjs) never
+// lands in the real ~/.cache/trawl.
+process.env.TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
 
 test("collects a bare url as a positional", () => {
 	assert.deepEqual(parseArgs(["https://example.com"])._, [
@@ -389,4 +401,204 @@ test("--no-auth-check exits 0 for the same login-wall page", opts, async () => {
 	const { code, stdout } = await runCli(CLI_PATH, [url, "--no-auth-check"]);
 	assert.equal(code, 0);
 	assert.match(stdout, /Sign in/);
+});
+
+// --- cross-run pacing flags (#38) ---
+
+test("takes a millisecond value for --min-interval", () => {
+	assert.equal(parseArgs(["u", "--min-interval", "250"])["--min-interval"], "250");
+	assert.equal(parseArgs(["u", "--min-interval=0"])["--min-interval"], "0");
+});
+
+test("treats --no-pacing as a boolean flag", () => {
+	const args = parseArgs(["--no-pacing", "u"]);
+	assert.equal(args["--no-pacing"], true);
+	assert.deepEqual(args._, ["u"]);
+});
+
+test("--help documents the pacing flags and the state dir", async () => {
+	const { stdout } = await runCli(CLI_PATH, ["--help"]);
+	assert.match(stdout, /--min-interval <ms>/);
+	assert.match(stdout, /--no-pacing/);
+	assert.match(stdout, /TRAWL_STATE_DIR/);
+});
+
+// Logs when each path was requested; anything unlisted is a 404.
+// The recorded start of the last gated request (`lastRequestAt` in the one
+// state file under `stateDir`), or null. The gate writes it just before
+// sending, so a server-side snapshot taken as a request arrives is that
+// request's recorded start. Spacing is asserted on these rather than on
+// arrival gaps: a fresh Node process's first fetch() takes 100-200ms (more
+// under load) to reach the server, so arrival gaps between a cold and a warm
+// request can be shorter than the interval the gate correctly enforced. See
+// the matching section comment in tests/render.test.mjs.
+function recordedStart(stateDir) {
+	const dir = join(stateDir, "pacing");
+	let files;
+	try {
+		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+	} catch {
+		return null;
+	}
+	if (files.length !== 1) return null;
+	try {
+		return JSON.parse(readFileSync(join(dir, files[0]), "utf8")).lastRequestAt ?? null;
+	} catch {
+		return null;
+	}
+}
+
+// Consecutive gated requests started >= minGapMs apart (exact, by recorded
+// start), and none arrived before its recorded start.
+function assertSpaced(hits, minGapMs) {
+	for (const h of hits) {
+		assert.equal(typeof h.recorded, "number", `${h.path} arrived with no recorded start`);
+		assert.ok(h.at >= h.recorded, `${h.path} arrived before its recorded start`);
+	}
+	for (let i = 1; i < hits.length; i++) {
+		const gap = hits[i].recorded - hits[i - 1].recorded;
+		assert.ok(
+			gap >= minGapMs,
+			`${hits[i - 1].path} -> ${hits[i].path} started only ${gap}ms apart ` +
+				`(want >= ${minGapMs})` +
+				(gap === 0 ? "; the earlier request arrived after the later one was recorded" : ""),
+		);
+	}
+}
+
+async function serveLogged(routes, { stateDir } = {}) {
+	const hits = [];
+	const server = createServer((req, res) => {
+		const { pathname } = new URL(req.url, "http://127.0.0.1");
+		hits.push({
+			path: pathname,
+			at: Date.now(),
+			recorded: stateDir ? recordedStart(stateDir) : null,
+		});
+		const body = routes[pathname];
+		if (body === undefined) {
+			res.writeHead(404);
+			res.end();
+			return;
+		}
+		res.writeHead(200, {
+			"content-type": pathname.endsWith(".txt") ? "text/plain" : "text/html",
+		});
+		res.end(body);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	return {
+		origin: `http://127.0.0.1:${server.address().port}`,
+		hits,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+// Execute the bin symlink *directly* — shebang plus exec bit, the way a PATH
+// lookup runs an npm-installed `trawl` — rather than `node src/cli.mjs`.
+function runBin(link, args, env) {
+	return new Promise((resolve) => {
+		execFile(link, args, { env: { ...process.env, ...env } }, (err, stdout, stderr) => {
+			resolve({ code: err?.code ?? 0, stdout, stderr });
+		});
+	});
+}
+
+function binLink() {
+	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	const link = join(dir, "trawl");
+	symlinkSync(CLI_PATH, link);
+	return { link, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+const NO_SUCH_CHROME = join(tmpdir(), "trawl-no-such-chrome");
+
+test("rejects a bad --min-interval before making any request", async () => {
+	const s = await serveLogged({ "/robots.txt": "" });
+	try {
+		for (const bad of ["-1", "abc", "", "60001", "Infinity"]) {
+			const { code, stderr } = await runCli(CLI_PATH, [`${s.origin}/`, "--min-interval", bad]);
+			assert.equal(code, 1);
+			assert.match(stderr, /--min-interval expects/);
+		}
+	} finally {
+		await s.close();
+	}
+	assert.equal(s.hits.length, 0);
+});
+
+test("two separate trawl processes are spaced by --min-interval (via the bin symlink)", async () => {
+	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" }, { stateDir: TRAWL_STATE_DIR });
+	const { link, cleanup } = binLink();
+	try {
+		for (let i = 0; i < 2; i++) {
+			// Each run fetches robots.txt (paced), then fails at browser
+			// resolution — so this needs no Chromium, and the robots.txt
+			// requests' recorded starts are the cross-process evidence.
+			const { code, stderr } = await runBin(
+				link,
+				[`${s.origin}/page`, "--min-interval", "1500", "--executable-path", NO_SUCH_CHROME],
+				{ TRAWL_STATE_DIR },
+			);
+			assert.equal(code, 1);
+			assert.match(stderr, /Chromium binary not found/);
+		}
+	} finally {
+		cleanup();
+		await s.close();
+	}
+	assert.equal(s.hits.length, 2);
+	assertSpaced(s.hits, 1500);
+	assert.equal(readdirSync(join(TRAWL_STATE_DIR, "pacing")).length, 1);
+});
+
+test("--no-pacing opts out: no cross-run wait and no state written", async () => {
+	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" });
+	const { link, cleanup } = binLink();
+	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	try {
+		for (let i = 0; i < 2; i++) {
+			await runBin(
+				link,
+				[`${s.origin}/page`, "--no-pacing", "--min-interval", "10000", "--executable-path", NO_SUCH_CHROME],
+				{ TRAWL_STATE_DIR },
+			);
+		}
+	} finally {
+		cleanup();
+		await s.close();
+	}
+	assert.equal(s.hits.length, 2);
+	assert.ok(s.hits[1].at - s.hits[0].at < 10000, "--no-pacing still waited");
+	assert.deepEqual(readdirSync(TRAWL_STATE_DIR), []);
+});
+
+test("two CLI renders space every robots.txt and page request", opts, async () => {
+	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	const s = await serveLogged({
+		"/robots.txt": "User-agent: *\nAllow: /\n",
+		"/page.html": "<!doctype html><title>P</title><h1>Paced page</h1>",
+	}, { stateDir: TRAWL_STATE_DIR });
+	const { link, cleanup } = binLink();
+	try {
+		for (let i = 0; i < 2; i++) {
+			const { code, stdout } = await runBin(
+				link,
+				[`${s.origin}/page.html`, "--min-interval", "1200"],
+				{ TRAWL_STATE_DIR },
+			);
+			assert.equal(code, 0);
+			assert.match(stdout, /Paced page/);
+		}
+	} finally {
+		cleanup();
+		await s.close();
+	}
+	const explicit = s.hits.filter((h) => h.path === "/robots.txt" || h.path === "/page.html");
+	assert.deepEqual(
+		explicit.map((h) => h.path),
+		["/robots.txt", "/page.html", "/robots.txt", "/page.html"],
+	);
+	assertSpaced(explicit, 1200);
 });

@@ -6,6 +6,13 @@ import { chromium } from "playwright-core";
 import TurndownService from "turndown";
 import { resolveExecutablePath } from "./browser.mjs";
 import {
+	DEFAULT_MIN_INTERVAL_MS,
+	createPacer,
+	defaultStateDir,
+	pacingOrigin,
+	validateMinInterval,
+} from "./pacing.mjs";
+import {
 	ROBOTS_TIMEOUT_MS,
 	checkRobotsAllowed,
 	crawlDelayMs,
@@ -278,7 +285,34 @@ export async function render(url, options = {}) {
 		);
 	}
 
+	// Validated up front, before any network or browser work — even when
+	// pacing is off, a nonsensical value is a caller bug worth surfacing.
+	const minIntervalMs =
+		opts.minIntervalMs === undefined
+			? DEFAULT_MIN_INTERVAL_MS
+			: validateMinInterval(opts.minIntervalMs, "minIntervalMs");
+
 	const userAgent = opts.userAgent ?? (await defaultUserAgent());
+
+	// Cross-run pacing (src/pacing.mjs): every explicit request this call
+	// makes to an http(s) origin — the robots.txt fetch, the page navigation,
+	// and the networkidle-fallback navigation — waits its turn behind the last
+	// request any trawl process made to the same origin. Browser subresources
+	// and redirects are not gated. Non-http(s) URLs never touch the state dir.
+	// `pacing: false` turns this off and keeps only the in-run Crawl-delay
+	// sleep below.
+	const origin = pacingOrigin(url);
+	const pacer =
+		opts.pacing !== false && origin
+			? createPacer({
+					origin,
+					stateDir: opts.pacingStateDir ?? defaultStateDir(),
+					minIntervalMs,
+				})
+			: null;
+	// The Crawl-delay that applies to the page navigation, as learned from
+	// this run's robots.txt. `undefined` until (unless) robots.txt is fetched.
+	let navCrawlDelayMs;
 
 	// Etiquette, enforced rather than promised: consult robots.txt before we
 	// touch the page at all. Skipped for non-http(s) URLs and when the caller
@@ -299,13 +333,29 @@ export async function render(url, options = {}) {
 			// fixed, sane budget.
 			timeout: ROBOTS_TIMEOUT_MS,
 			fetch: opts.fetch,
+			// Paced on the Crawl-delay stored by an earlier run (if any), since
+			// this run hasn't learned the current policy yet. A failed fetch
+			// records the attempt but keeps the stored delay.
+			...(pacer && { gate: (start) => pacer.gate(start) }),
 		});
 		if (!verdict.allowed) throw new Error(robotsDenialMessage(verdict));
-		// One invocation fetches one page, so honoring `Crawl-delay` means
-		// spacing the two requests we do make — robots.txt, then the page.
-		const delay = crawlDelayMs(verdict.crawlDelay);
-		if (delay > 0) await sleep(delay);
+		navCrawlDelayMs = crawlDelayMs(verdict.crawlDelay);
+		// Without pacing, honoring `Crawl-delay` means spacing the two requests
+		// this run makes — robots.txt, then the page. With pacing, the gate in
+		// front of the navigation enforces the same gap (and more).
+		if (!pacer && navCrawlDelayMs > 0) await sleep(navCrawlDelayMs);
 	}
+
+	// Under --ignore-robots there is no policy to honour, stored or fresh —
+	// only the minimum interval.
+	const navPolicy =
+		navCrawlDelayMs !== undefined
+			? { crawlDelayMs: navCrawlDelayMs }
+			: { useStoredDelay: !opts.ignoreRobots };
+	const navigate = (page, waitUntil) => {
+		const start = () => page.goto(url, { waitUntil, timeout: opts.timeout });
+		return pacer ? pacer.gate(start, navPolicy) : start();
+	};
 
 	const executablePath = resolveExecutablePath(opts.executablePath);
 
@@ -375,18 +425,12 @@ export async function render(url, options = {}) {
 		let response;
 		let waitUntilFallback = null;
 		try {
-			response = await page.goto(url, {
-				waitUntil: opts.waitUntil,
-				timeout: opts.timeout,
-			});
+			response = await navigate(page, opts.waitUntil);
 		} catch (err) {
 			if (opts.waitUntil !== "networkidle" || !/Timeout .*exceeded/.test(err.message)) {
 				throw err;
 			}
-			response = await page.goto(url, {
-				waitUntil: "domcontentloaded",
-				timeout: opts.timeout,
-			});
+			response = await navigate(page, "domcontentloaded");
 			waitUntilFallback = { from: "networkidle", to: "domcontentloaded" };
 		}
 

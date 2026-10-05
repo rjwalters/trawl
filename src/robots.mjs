@@ -181,11 +181,20 @@ function describeError(err) {
 // The request carries the User-Agent but no browser-profile cookies, so a
 // robots.txt behind a cookie-gated interstitial is "unreachable" here even
 // when a navigation with that profile would get through.
+//
+// `gate`, if given, wraps the moment the request is sent: it is called with a
+// `start` function and must call it (once) and return its result. This is how
+// cross-run pacing (src/pacing.mjs) waits *before* the fetch. The timeout
+// clock only starts when `start` is called, so time spent waiting for a turn
+// is never mistaken for an unreachable robots.txt; an error the gate throws
+// before starting (e.g. pacing lock contention) propagates as-is rather than
+// being reported as a network failure.
 export async function checkRobotsAllowed(url, options = {}) {
 	const {
 		userAgent,
 		timeout = ROBOTS_TIMEOUT_MS,
 		fetch: fetchImpl = globalThis.fetch,
+		gate = (start) => start(),
 	} = options;
 
 	let target;
@@ -200,19 +209,26 @@ export async function checkRobotsAllowed(url, options = {}) {
 	// refuses outright) is neither sent nor echoed into a diagnostic.
 	const robotsUrl = `${target.origin}/robots.txt`;
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), timeout);
+	let timer;
+	let started = false;
 	const timedOut = () => unreachable(robotsUrl, { kind: "timeout", timeout });
+	const start = () => {
+		started = true;
+		timer = setTimeout(() => controller.abort(), timeout);
+		return fetchImpl(robotsUrl, {
+			headers: userAgent ? { "User-Agent": userAgent } : {},
+			redirect: "follow",
+			signal: controller.signal,
+		});
+	};
 
 	let text;
 	try {
 		let response;
 		try {
-			response = await fetchImpl(robotsUrl, {
-				headers: userAgent ? { "User-Agent": userAgent } : {},
-				redirect: "follow",
-				signal: controller.signal,
-			});
+			response = await gate(start);
 		} catch (err) {
+			if (!started) throw err;
 			if (controller.signal.aborted) return timedOut();
 			return unreachable(robotsUrl, {
 				kind: "network-error",

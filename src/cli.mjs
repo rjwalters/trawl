@@ -3,6 +3,11 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	DEFAULT_MIN_INTERVAL_MS,
+	MAX_MIN_INTERVAL_MS,
+	validateMinInterval,
+} from "./pacing.mjs";
 import { AuthWallError, FORMATS, render } from "./render.mjs";
 
 // The profile directory `trawl login` writes to when neither --profile nor
@@ -58,7 +63,15 @@ Options:
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
       --viewport <WxH>     Viewport size, e.g. 1280x800     (default: 1280x2000)
-      --ignore-robots      Skip the robots.txt check
+      --ignore-robots      Skip the robots.txt check (not --min-interval)
+      --min-interval <ms>  Minimum gap between requests to one origin,
+                            across separate runs; Crawl-delay still wins if
+                            larger. 0 drops the floor only. Max ${MAX_MIN_INTERVAL_MS}.
+                                                             (default: ${DEFAULT_MIN_INTERVAL_MS})
+      --no-pacing          Don't pace requests across runs (Crawl-delay is
+                            still honored within a run). Pacing state lives
+                            in $TRAWL_STATE_DIR, else
+                            \${XDG_CACHE_HOME:-~/.cache}/trawl
       --profile <dir>      Persistent browser profile dir (cookies/
                             localStorage survive across runs); also read from
                             $TRAWL_PROFILE_DIR. Populate one with "trawl login"
@@ -111,6 +124,7 @@ const VALUED = new Set([
 	"--screenshot",
 	"--viewport",
 	"--profile",
+	"--min-interval",
 ]);
 
 export function parseArgs(argv) {
@@ -145,7 +159,8 @@ export function parseArgs(argv) {
 			arg === "--full-page" ||
 			arg === "--ignore-robots" ||
 			arg === "--no-readability" ||
-			arg === "--no-auth-check"
+			arg === "--no-auth-check" ||
+			arg === "--no-pacing"
 		) {
 			out[arg] = true;
 			continue;
@@ -218,6 +233,10 @@ export async function main(argv) {
 	const viewport = args["--viewport"]
 		? parseViewport(args["--viewport"])
 		: undefined;
+	const minIntervalMs =
+		args["--min-interval"] === undefined
+			? undefined
+			: validateMinInterval(args["--min-interval"], "--min-interval");
 
 	const result = await render(args._[0], {
 		format,
@@ -244,6 +263,9 @@ export async function main(argv) {
 		// used) to pick the saved session back up.
 		profileDir: args["--profile"] ?? process.env.TRAWL_PROFILE_DIR,
 		authCheck: !args["--no-auth-check"],
+		pacing: !args["--no-pacing"],
+		...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
+		// pacingStateDir is left to render(), which reads $TRAWL_STATE_DIR.
 		// Only override when the flag was actually supplied, so render()'s own
 		// default viewport keeps applying to every other call.
 		...(viewport ? { viewport } : {}),

@@ -205,7 +205,8 @@ const { body, status } = await render("https://example.com", { format: "text" })
 ```
 
 `render()` consults `robots.txt` for `http(s)` URLs before it navigates, and
-throws if the path is disallowed — the same default the CLI has. Pass
+throws if the path is disallowed or `robots.txt` is unreachable (5xx, network
+error, timeout) — the same default the CLI has. Pass
 `{ ignoreRobots: true }` to skip it. Non-`http(s)` URLs (`file://`, for
 instance) are never checked. It also sends the default trawl `User-Agent`
 unless you pass your own `userAgent`.
@@ -272,12 +273,21 @@ default rather than asking you to promise you will.
   page navigation happens. Matching is the classic baseline: `User-agent`
   group selection (a group naming `trawl` beats `*`), longest matching path
   prefix wins, and `Allow` breaks a tie with `Disallow`. Wildcard (`*`) and
-  end-anchor (`$`) patterns are not supported. If `robots.txt` can't be
-  fetched — network error, timeout, 404, any non-2xx — the path is treated
-  as allowed; this is politeness, not a security boundary.
+  end-anchor (`$`) patterns are not supported.
+- **An unreachable `robots.txt` blocks the run** (RFC 9309 §2.3.1.4). A 5xx,
+  a network error (DNS failure, refused connection), a timeout (10s), or a
+  response body that fails mid-read is treated as a full disallow, and the
+  error says which — e.g. `robots.txt is unreachable: …/robots.txt returned
+  HTTP 503 (server error)` — rather than naming a rule. A 4xx (404, 410, 429,
+  …) means there is no `robots.txt` to obey, so the path is allowed.
+  Redirects are followed and the final response decides. The `robots.txt`
+  request sends trawl's `User-Agent` but no browser-profile cookies, so a
+  site that serves an interstitial to cookie-less clients can block `trawl`
+  here even when `--profile` would get the page itself through.
 - **`--ignore-robots` overrides it**, because there are legitimate reasons:
   your own staging site, a page you are authenticated to, a `robots.txt`
-  that blocks all bots but permits the human reading the same URL.
+  that blocks all bots but permits the human reading the same URL, or one
+  that is down. It skips the `robots.txt` request entirely.
 - **`Crawl-delay` is honored** as a pause between the `robots.txt` request
   and the page request. `trawl` fetches one page per run, so that is the
   only gap there is to space out. It is capped at 60s so a `Crawl-delay:

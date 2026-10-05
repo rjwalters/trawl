@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import {
 	mkdtempSync,
 	readdirSync,
+	readFileSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -423,11 +424,57 @@ test("--help documents the pacing flags and the state dir", async () => {
 });
 
 // Logs when each path was requested; anything unlisted is a 404.
-async function serveLogged(routes) {
+// The recorded start of the last gated request (`lastRequestAt` in the one
+// state file under `stateDir`), or null. The gate writes it just before
+// sending, so a server-side snapshot taken as a request arrives is that
+// request's recorded start. Spacing is asserted on these rather than on
+// arrival gaps: a fresh Node process's first fetch() takes 100-200ms (more
+// under load) to reach the server, so arrival gaps between a cold and a warm
+// request can be shorter than the interval the gate correctly enforced. See
+// the matching section comment in tests/render.test.mjs.
+function recordedStart(stateDir) {
+	const dir = join(stateDir, "pacing");
+	let files;
+	try {
+		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+	} catch {
+		return null;
+	}
+	if (files.length !== 1) return null;
+	try {
+		return JSON.parse(readFileSync(join(dir, files[0]), "utf8")).lastRequestAt ?? null;
+	} catch {
+		return null;
+	}
+}
+
+// Consecutive gated requests started >= minGapMs apart (exact, by recorded
+// start), and none arrived before its recorded start.
+function assertSpaced(hits, minGapMs) {
+	for (const h of hits) {
+		assert.equal(typeof h.recorded, "number", `${h.path} arrived with no recorded start`);
+		assert.ok(h.at >= h.recorded, `${h.path} arrived before its recorded start`);
+	}
+	for (let i = 1; i < hits.length; i++) {
+		const gap = hits[i].recorded - hits[i - 1].recorded;
+		assert.ok(
+			gap >= minGapMs,
+			`${hits[i - 1].path} -> ${hits[i].path} started only ${gap}ms apart ` +
+				`(want >= ${minGapMs})` +
+				(gap === 0 ? "; the earlier request arrived after the later one was recorded" : ""),
+		);
+	}
+}
+
+async function serveLogged(routes, { stateDir } = {}) {
 	const hits = [];
 	const server = createServer((req, res) => {
 		const { pathname } = new URL(req.url, "http://127.0.0.1");
-		hits.push({ path: pathname, at: Date.now() });
+		hits.push({
+			path: pathname,
+			at: Date.now(),
+			recorded: stateDir ? recordedStart(stateDir) : null,
+		});
 		const body = routes[pathname];
 		if (body === undefined) {
 			res.writeHead(404);
@@ -481,14 +528,14 @@ test("rejects a bad --min-interval before making any request", async () => {
 });
 
 test("two separate trawl processes are spaced by --min-interval (via the bin symlink)", async () => {
-	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" });
-	const { link, cleanup } = binLink();
 	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" }, { stateDir: TRAWL_STATE_DIR });
+	const { link, cleanup } = binLink();
 	try {
 		for (let i = 0; i < 2; i++) {
 			// Each run fetches robots.txt (paced), then fails at browser
 			// resolution — so this needs no Chromium, and the robots.txt
-			// arrivals are the cross-process evidence.
+			// requests' recorded starts are the cross-process evidence.
 			const { code, stderr } = await runBin(
 				link,
 				[`${s.origin}/page`, "--min-interval", "1500", "--executable-path", NO_SUCH_CHROME],
@@ -502,8 +549,7 @@ test("two separate trawl processes are spaced by --min-interval (via the bin sym
 		await s.close();
 	}
 	assert.equal(s.hits.length, 2);
-	const gap = s.hits[1].at - s.hits[0].at;
-	assert.ok(gap >= 1470, `robots.txt requests only ${gap}ms apart`);
+	assertSpaced(s.hits, 1500);
 	assert.equal(readdirSync(join(TRAWL_STATE_DIR, "pacing")).length, 1);
 });
 
@@ -529,12 +575,12 @@ test("--no-pacing opts out: no cross-run wait and no state written", async () =>
 });
 
 test("two CLI renders space every robots.txt and page request", opts, async () => {
+	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
 	const s = await serveLogged({
 		"/robots.txt": "User-agent: *\nAllow: /\n",
 		"/page.html": "<!doctype html><title>P</title><h1>Paced page</h1>",
-	});
+	}, { stateDir: TRAWL_STATE_DIR });
 	const { link, cleanup } = binLink();
-	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
 	try {
 		for (let i = 0; i < 2; i++) {
 			const { code, stdout } = await runBin(
@@ -554,8 +600,5 @@ test("two CLI renders space every robots.txt and page request", opts, async () =
 		explicit.map((h) => h.path),
 		["/robots.txt", "/page.html", "/robots.txt", "/page.html"],
 	);
-	for (let i = 1; i < explicit.length; i++) {
-		const gap = explicit[i].at - explicit[i - 1].at;
-		assert.ok(gap >= 1170, `${explicit[i - 1].path} -> ${explicit[i].path} only ${gap}ms apart`);
-	}
+	assertSpaced(explicit, 1200);
 });

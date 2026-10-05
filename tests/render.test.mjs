@@ -1062,16 +1062,55 @@ test("an explicit non-networkidle wait condition still fails on timeout, unretri
 //
 // render() gates every explicit request — robots.txt, the page navigation,
 // and the networkidle-fallback navigation — behind the last request made to
-// the same origin, persisted in a state dir. These observe *server-side*
-// request arrival times rather than total call duration (which includes
-// browser startup). Each test uses its own temporary state dir.
+// the same origin, persisted in a state dir. Each test uses its own temporary
+// state dir.
+//
+// What the spacing assertions measure: the gate paces on the *recorded start*
+// of each request (the `lastRequestAt` it writes just before initiating it),
+// as #38 specifies. Server arrival is not a reliable proxy for that — the
+// first fetch() in a Node process spends 100-200ms (more under load) between
+// the call and the request reaching the server, so a cold request followed
+// by a warm one can arrive closer together than the interval even though
+// the gate spaced them correctly. Any tolerance on arrival gaps is a guess
+// about that latency.
+//
+// So the server snapshots the state file as each request arrives. The gate
+// writes `lastRequestAt` before sending, and the next request cannot record
+// until the interval has passed, so the snapshot is exactly that request's
+// recorded start (as long as it arrives within one interval of being sent).
+// Spacing is then asserted on recorded starts with no tolerance, plus the
+// causal check that each request arrived no earlier than its recorded start.
 
-// Serves fixed bodies like `serve()` above, but logs when each path was hit.
-async function serveLogged(routes) {
+// The recorded start of the last gated request, or null if none yet. One
+// origin per test, so the pacing dir holds at most one state file (`.tmp`
+// files are in-flight writes, which are renamed atomically into place).
+function recordedStart(stateDir) {
+	const dir = path.join(stateDir, "pacing");
+	let files;
+	try {
+		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+	} catch {
+		return null;
+	}
+	if (files.length !== 1) return null;
+	try {
+		return JSON.parse(readFileSync(path.join(dir, files[0]), "utf8")).lastRequestAt ?? null;
+	} catch {
+		return null;
+	}
+}
+
+// Serves fixed bodies like `serve()` above, but logs when each path was hit
+// and, given `stateDir`, the recorded start of the request that hit it.
+async function serveLogged(routes, { stateDir } = {}) {
 	const hits = [];
 	const server = createServer((req, res) => {
 		const url = new URL(req.url, "http://127.0.0.1");
-		hits.push({ path: url.pathname, at: Date.now() });
+		hits.push({
+			path: url.pathname,
+			at: Date.now(),
+			recorded: stateDir ? recordedStart(stateDir) : null,
+		});
 		const body = routes[url.pathname];
 		if (body === undefined) {
 			res.writeHead(404, { "content-type": "text/plain" });
@@ -1095,15 +1134,21 @@ function freshStateDir() {
 	return mkdtempSync(path.join(tmpdir(), "trawl-pacing-state-"));
 }
 
-// Server-side arrival can lag client-side send by a few ms; allow for it.
-const JITTER_MS = 30;
-
+// Every consecutive pair of gated requests started at least `minGapMs` apart
+// (by recorded start, exact), and none reached the server before it was
+// recorded. See the section comment above for why not arrival gaps.
 function assertSpaced(hits, minGapMs) {
+	for (const h of hits) {
+		assert.equal(typeof h.recorded, "number", `${h.path} arrived with no recorded start`);
+		assert.ok(h.at >= h.recorded, `${h.path} arrived before its recorded start`);
+	}
 	for (let i = 1; i < hits.length; i++) {
-		const gap = hits[i].at - hits[i - 1].at;
+		const gap = hits[i].recorded - hits[i - 1].recorded;
 		assert.ok(
-			gap >= minGapMs - JITTER_MS,
-			`${hits[i - 1].path} -> ${hits[i].path} only ${gap}ms apart (want >= ${minGapMs})`,
+			gap >= minGapMs,
+			`${hits[i - 1].path} -> ${hits[i].path} started only ${gap}ms apart ` +
+				`(want >= ${minGapMs})` +
+				(gap === 0 ? "; the earlier request arrived after the later one was recorded" : ""),
 		);
 	}
 }
@@ -1152,8 +1197,8 @@ test("a non-http(s) URL never touches the pacing state dir", async () => {
 });
 
 test("robots.txt fetches from separate render() calls are paced on the minimum interval", async () => {
-	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" });
 	const pacingStateDir = freshStateDir();
+	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" }, { stateDir: pacingStateDir });
 	try {
 		for (let i = 0; i < 2; i++) {
 			await assert.rejects(
@@ -1194,11 +1239,11 @@ test("pacing: false neither waits across calls nor writes state", async () => {
 });
 
 test("Crawl-delay paces robots and page requests across two render() calls", opts, async () => {
+	const pacingStateDir = freshStateDir();
 	const s = await serveLogged({
 		"/robots.txt": "User-agent: *\nCrawl-delay: 0.8\n",
 		"/page.html": "<!doctype html><title>P</title><h1>Paced</h1>",
-	});
-	const pacingStateDir = freshStateDir();
+	}, { stateDir: pacingStateDir });
 	try {
 		for (let i = 0; i < 2; i++) {
 			// A zero minimum: every gap below comes from Crawl-delay alone —
@@ -1218,11 +1263,11 @@ test("Crawl-delay paces robots and page requests across two render() calls", opt
 });
 
 test("ignoreRobots skips Crawl-delay but still paces on the minimum interval", opts, async () => {
+	const pacingStateDir = freshStateDir();
 	const s = await serveLogged({
 		"/robots.txt": "User-agent: *\nCrawl-delay: 30\n",
 		"/page.html": "<!doctype html><title>P</title><h1>Paced</h1>",
-	});
-	const pacingStateDir = freshStateDir();
+	}, { stateDir: pacingStateDir });
 	try {
 		for (let i = 0; i < 2; i++) {
 			await render(`${s.origin}/page.html`, { pacingStateDir, ignoreRobots: true, minIntervalMs: 900 });
@@ -1239,9 +1284,12 @@ test("ignoreRobots skips Crawl-delay but still paces on the minimum interval", o
 
 test("the networkidle-fallback navigation passes through the same gate", opts, async () => {
 	const hits = [];
+	const pacingStateDir = freshStateDir();
 	const server = serveHangingStream();
 	server.on("request", (req) => {
-		if (req.url === "/") hits.push({ path: "/", at: Date.now() });
+		if (req.url === "/") {
+			hits.push({ path: "/", at: Date.now(), recorded: recordedStart(pacingStateDir) });
+		}
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const { port } = server.address();
@@ -1252,7 +1300,7 @@ test("the networkidle-fallback navigation passes through the same gate", opts, a
 			// Longer than the navigation timeout, so only the gate can explain
 			// the retry waiting this long after the first navigation.
 			minIntervalMs: 2500,
-			pacingStateDir: freshStateDir(),
+			pacingStateDir,
 		});
 		assert.ok(result.waitUntilFallback);
 	} finally {
@@ -1281,9 +1329,13 @@ test("an unwritable state dir warns on stderr and still renders", opts, async ()
 	} finally {
 		await s.close();
 	}
-	// In-run pacing still spaced robots.txt and the page.
-	assertSpaced(
-		s.hits.filter((h) => h.path === "/robots.txt" || h.path === "/page.html"),
-		300,
+	// Both requests still went out, robots.txt first. With no state file there
+	// is no recorded start to observe here, and server arrival gaps cannot
+	// prove spacing (see the section comment); the degraded in-run wait itself
+	// is asserted deterministically, on a fake clock, in tests/pacing.test.mjs
+	// ("an unwritable state dir warns once and falls back to in-run pacing").
+	assert.deepEqual(
+		s.hits.filter((h) => h.path === "/robots.txt" || h.path === "/page.html").map((h) => h.path),
+		["/robots.txt", "/page.html"],
 	);
 });

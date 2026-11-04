@@ -3,7 +3,10 @@
 // Two tools, deliberately: `fetch_page` (the CLI's core) and `fetch_links`
 // (link extraction, kept separate so an agent can crawl without pulling whole
 // page bodies into its context). Nothing here clicks, types, or navigates a
-// session — trawl fetches.
+// session — trawl fetches. That is on purpose even though the CLI and
+// library can `--click`: a person choosing a selector to press is one thing,
+// an agent pressing whatever a page it is reading tells it to is another, so
+// the agent-facing surface stays read-only.
 //
 // Browser lifecycle is per call: every handler goes through `render()`, which
 // owns its own launch/close, exactly like the CLI does. No pooling, no shared

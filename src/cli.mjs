@@ -8,7 +8,12 @@ import {
 	MAX_MIN_INTERVAL_MS,
 	validateMinInterval,
 } from "./pacing.mjs";
-import { AuthWallError, FORMATS, render } from "./render.mjs";
+import {
+	AuthWallError,
+	FORMATS,
+	normalizeClickSteps,
+	render,
+} from "./render.mjs";
 
 // The profile directory `trawl login` writes to when neither --profile nor
 // $TRAWL_PROFILE_DIR is supplied. A single shared directory (rather than one
@@ -43,6 +48,13 @@ Options:
       --no-readability     Skip article extraction for -f markdown
   -s, --selector <css>     Extract only this element
   -w, --wait-for <css>     Block until this selector appears
+      --click <css>        Click the first match after load, before
+                            extracting. Repeatable; runs in the order given.
+                            Each waits until visible (up to --timeout), then
+                            --settle. Fails (exit 1) if it never appears,
+                            or if the click would load another page.
+      --then-wait <css>    After the preceding --click, block until this
+                            selector appears
       --settle <ms>        Extra pause after load                (default: 0)
       --wait-until <ev>    load | domcontentloaded | networkidle
                                                         (default: networkidle)
@@ -90,6 +102,8 @@ Examples:
   trawl https://example.com -f links
   trawl https://example.com -s '#main' -f html -o page.html
   trawl https://example.com -w '.results-loaded' --settle 500
+  trawl https://example.com --click '#show-details' --then-wait '#details' \\
+        -s '#details'
   trawl https://example.com --screenshot page.png --full-page
   trawl login https://example.com --profile ~/.trawl/example
   trawl https://example.com --profile ~/.trawl/example
@@ -125,7 +139,28 @@ const VALUED = new Set([
 	"--viewport",
 	"--profile",
 	"--min-interval",
+	"--click",
+	"--then-wait",
 ]);
+
+// `--click` repeats, and each `--then-wait` belongs to the `--click` right
+// before it, so both are folded into one ordered list as they are parsed
+// rather than stored as a last-one-wins value.
+function addClickArg(out, key, value) {
+	out.clicks ??= [];
+	if (key === "--click") {
+		out.clicks.push({ selector: value });
+		return;
+	}
+	const last = out.clicks.at(-1);
+	if (!last) throw new Error("--then-wait must follow a --click");
+	if (last.waitFor !== undefined) {
+		throw new Error(
+			`--then-wait given twice for --click "${last.selector}"; add another --click first`,
+		);
+	}
+	last.waitFor = value;
+}
 
 export function parseArgs(argv) {
 	const out = { _: [] };
@@ -142,13 +177,21 @@ export function parseArgs(argv) {
 		if (eq > -1) {
 			const key = arg.slice(0, eq);
 			if (!VALUED.has(key)) throw new Error(`Unknown option: ${key}`);
-			out[key] = arg.slice(eq + 1);
+			if (key === "--click" || key === "--then-wait") {
+				addClickArg(out, key, arg.slice(eq + 1));
+			} else {
+				out[key] = arg.slice(eq + 1);
+			}
 			continue;
 		}
 		if (VALUED.has(arg)) {
 			const value = argv[++i];
 			if (value === undefined) throw new Error(`${arg} requires a value`);
-			out[arg] = value;
+			if (arg === "--click" || arg === "--then-wait") {
+				addClickArg(out, arg, value);
+			} else {
+				out[arg] = value;
+			}
 			continue;
 		}
 		if (
@@ -237,12 +280,15 @@ export async function main(argv) {
 		args["--min-interval"] === undefined
 			? undefined
 			: validateMinInterval(args["--min-interval"], "--min-interval");
+	// Same up-front rule for the click list (empty selectors and the like).
+	const click = args.clicks ? normalizeClickSteps(args.clicks) : undefined;
 
 	const result = await render(args._[0], {
 		format,
 		readability: !args["--no-readability"],
 		selector: args["--selector"],
 		waitForSelector: args["--wait-for"],
+		...(click ? { click } : {}),
 		settle: args["--settle"] ? toNumber(args["--settle"], "--settle") : 0,
 		waitUntil: args["--wait-until"] ?? "networkidle",
 		timeout: args["--timeout"]

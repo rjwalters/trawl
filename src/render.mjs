@@ -50,6 +50,119 @@ export class AuthWallError extends Error {
 	}
 }
 
+// Thrown when a click step cannot run: its selector never became visible,
+// its `waitFor` never appeared, or the click tried to navigate the page away.
+// `step` is 1-based so it matches the order the caller wrote the steps in.
+export class ClickError extends Error {
+	constructor(message, { step, selector, waitFor } = {}) {
+		super(message);
+		this.name = "ClickError";
+		this.step = step;
+		this.selector = selector;
+		this.waitFor = waitFor;
+	}
+}
+
+// Accepts `click` as a string, or an array of strings and/or
+// `{ selector, waitFor }` objects, and returns `[{ selector, waitFor }]`.
+// Pure, so the CLI and library callers fail the same way on bad input, and
+// before any network or browser work.
+export function normalizeClickSteps(click) {
+	if (click === undefined || click === null) return [];
+	const list = Array.isArray(click) ? click : [click];
+	return list.map((step, i) => {
+		const where = `click step ${i + 1}`;
+		const obj = typeof step === "string" ? { selector: step } : step;
+		if (!obj || typeof obj !== "object") {
+			throw new Error(
+				`${where}: expected a CSS selector string or { selector, waitFor }`,
+			);
+		}
+		const { selector, waitFor } = obj;
+		if (typeof selector !== "string" || selector.trim() === "") {
+			throw new Error(`${where}: selector must be a non-empty CSS selector`);
+		}
+		if (
+			waitFor !== undefined &&
+			waitFor !== null &&
+			(typeof waitFor !== "string" || waitFor.trim() === "")
+		) {
+			throw new Error(`${where}: waitFor must be a non-empty CSS selector`);
+		}
+		return waitFor ? { selector, waitFor } : { selector };
+	});
+}
+
+const isTimeout = (err) =>
+	err?.name === "TimeoutError" || /Timeout .*exceeded/.test(err?.message ?? "");
+
+// Press each step's element in order, on the page that is already loaded.
+// A click only presses an element already on the page: a click that tries to
+// load a different top-level document (a link, a form submit, a popup) is
+// aborted and reported, so a run still makes exactly one page request and
+// every request trawl makes stays paced.
+async function runClickSteps(page, context, steps, { timeout, settle }) {
+	let blockedNavigation = null;
+	await context.route("**/*", (route) => {
+		const request = route.request();
+		let topLevel = false;
+		try {
+			topLevel =
+				request.isNavigationRequest() && request.frame().parentFrame() === null;
+		} catch {
+			// Service-worker requests have no frame; they are never navigations.
+		}
+		if (topLevel) {
+			blockedNavigation ??= request.url();
+			return route.abort("blockedbyclient");
+		}
+		return route.fallback();
+	});
+
+	const ms = timeout > 0 ? `${timeout}ms` : "the timeout";
+	for (let i = 0; i < steps.length; i++) {
+		const { selector, waitFor } = steps[i];
+		const step = i + 1;
+		const label = `click step ${step} of ${steps.length} ("${selector}")`;
+		// The first match in document order, so a selector that matches several
+		// buttons presses one instead of tripping Playwright's strict mode.
+		const target = page.locator(selector).first();
+		try {
+			await target.waitFor({ state: "visible", timeout });
+			await target.click({ timeout });
+		} catch (err) {
+			if (!isTimeout(err)) throw err;
+			throw new ClickError(
+				`${label}: no visible, clickable element matched within ${ms}`,
+				{ step, selector, waitFor },
+			);
+		}
+		if (blockedNavigation) {
+			throw new ClickError(
+				`${label}: the click tried to navigate to ${blockedNavigation}; ` +
+					"trawl clicks only to reveal content on the loaded page — fetch " +
+					"that URL directly instead",
+				{ step, selector, waitFor },
+			);
+		}
+		if (waitFor) {
+			try {
+				await page
+					.locator(waitFor)
+					.first()
+					.waitFor({ state: "visible", timeout });
+			} catch (err) {
+				if (!isTimeout(err)) throw err;
+				throw new ClickError(
+					`${label}: "${waitFor}" did not appear within ${ms} after the click`,
+					{ step, selector, waitFor },
+				);
+			}
+		}
+		if (settle > 0) await page.waitForTimeout(settle);
+	}
+}
+
 // Heuristics only — deliberately biased toward false positives over silently
 // returning login-wall HTML as if it were the page. A caller that knows
 // better has `--no-auth-check` / `authCheck: false`.
@@ -292,6 +405,10 @@ export async function render(url, options = {}) {
 			? DEFAULT_MIN_INTERVAL_MS
 			: validateMinInterval(opts.minIntervalMs, "minIntervalMs");
 
+	// Validated here for the same reason: a malformed click list is a caller
+	// bug, and must not cost a robots.txt request or a browser launch.
+	const clickSteps = normalizeClickSteps(opts.click);
+
 	const userAgent = opts.userAgent ?? (await defaultUserAgent());
 
 	// Cross-run pacing (src/pacing.mjs): every explicit request this call
@@ -454,9 +571,26 @@ export async function render(url, options = {}) {
 		// see a login page reported the same way as a successful fetch. Probes
 		// the *full* page regardless of `--selector`, since the wall is usually
 		// outside whatever the caller scoped extraction to.
-		if (opts.authCheck !== false) {
+		//
+		// With click steps this runs on the loaded page first, so a login wall
+		// is reported as one rather than as "selector never appeared", and
+		// again after the clicks, in case the content they revealed is a wall.
+		const checkAuth = async () => {
+			if (opts.authCheck === false) return;
 			const reasons = await probeAuthWall(page);
 			if (reasons.length > 0) throw new AuthWallError(reasons, page.url());
+		};
+		await checkAuth();
+
+		// Click steps run after load, `waitForSelector` and `settle`, in the
+		// order given; each waits for its element to be visible, clicks it,
+		// waits for its own `waitFor` if any, then `settle` again.
+		if (clickSteps.length > 0) {
+			await runClickSteps(page, context, clickSteps, {
+				timeout: opts.timeout,
+				settle,
+			});
+			await checkAuth();
 		}
 
 		const body = await extract(page, opts);

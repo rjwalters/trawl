@@ -441,86 +441,129 @@ test("an unreadable lock file is recovered after a short grace period", async ()
 	assert.equal(await q.gate(noop), "sent");
 });
 
+// Spacing is asserted on the stamps the pacer records (`lastRequestAt`, written
+// to the state file just before `start()` runs), not on `Date.now()` inside
+// `start()`. The pacer waits out the interval measured between its own stamps;
+// the delay from stamp to `start()` varies by tens of milliseconds on a loaded
+// machine, so a gap measured in `start()` is roughly `interval - d_A + d_B` and
+// can fall short of an interval that was correctly enforced (#58).
+function recordedStamp(statePath) {
+	return JSON.parse(readFileSync(statePath, "utf8")).lastRequestAt;
+}
+
 test("concurrent gates in one process are serialized with the required spacing", async () => {
 	const dir = stateDir();
-	const starts = [];
+	const stamps = [];
 	const mk = () => createPacer({ origin: ORIGIN, stateDir: dir, minIntervalMs: 200, warn: () => {} });
 	await Promise.all(
 		[mk(), mk(), mk()].map((p) =>
 			p.gate(async () => {
-				starts.push(Date.now());
+				// This gate holds the lock, so the file is its own stamp.
+				stamps.push(recordedStamp(p.statePath));
 			}),
 		),
 	);
-	starts.sort((a, b) => a - b);
-	assert.ok(starts[1] - starts[0] >= 195, `gap ${starts[1] - starts[0]}ms`);
-	assert.ok(starts[2] - starts[1] >= 195, `gap ${starts[2] - starts[1]}ms`);
+	stamps.sort((a, b) => a - b);
+	assert.ok(stamps[1] - stamps[0] >= 200, `stamps ${stamps[1] - stamps[0]}ms apart`);
+	assert.ok(stamps[2] - stamps[1] >= 200, `stamps ${stamps[2] - stamps[1]}ms apart`);
+	// All three contended from the start, so the spacing is pacing, not luck.
+	assert.ok(stamps[2] - stamps[0] < 2 * 200 + 1500, `unexpectedly large spread ${stamps[2] - stamps[0]}ms`);
 });
 
 // --- independent processes sharing one state dir ---
 
-// Each child waits until a shared wall-clock instant (so they really contend),
-// then gates one "request" and prints the time it was initiated.
+// Each child loads the pacer, reports "up", and waits for a "go" line on stdin,
+// so a batch of children is released together however long each one took to
+// spawn (several seconds on a loaded machine) and they really contend. It then
+// gates one "request" and prints, as JSON: when it was ready to gate, the stamp
+// the pacer recorded for the request (read back from the state file while the
+// child still holds the lock), and when `start()` actually ran.
 const CHILD = `
 const { createPacer } = await import(process.env.PACING_URL);
-const at = Number(process.env.START_AT);
-while (Date.now() < at) await new Promise((r) => setTimeout(r, 1));
+const { readFileSync } = await import("node:fs");
 const p = createPacer({
 	origin: process.env.ORIGIN,
 	stateDir: process.env.STATE_DIR,
 	minIntervalMs: Number(process.env.INTERVAL),
 });
-await p.gate(async () => { process.stdout.write(String(Date.now())); });
+process.stdout.write("up\\n");
+await new Promise((resolve) => process.stdin.once("data", resolve));
+process.stdin.pause();
+const ready = Date.now();
+await p.gate(async () => {
+	const stamp = JSON.parse(readFileSync(p.statePath, "utf8")).lastRequestAt;
+	process.stdout.write(JSON.stringify({ ready, stamp, at: Date.now() }) + "\\n");
+});
 `;
 
-function runChild(env) {
-	return new Promise((resolve, reject) => {
+// Spawn one child per env, release them all at once, and resolve with each
+// child's report in the same order.
+async function runChildren(envs) {
+	const children = envs.map((env) => {
 		const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD], {
 			env: { ...process.env, PACING_URL, ...env },
 		});
 		let out = "";
 		let err = "";
+		let markUp;
+		const up = new Promise((resolve) => {
+			markUp = resolve;
+		});
 		child.stdout.on("data", (d) => {
 			out += d;
+			if (out.includes("up\n")) markUp();
 		});
 		child.stderr.on("data", (d) => {
 			err += d;
 		});
-		child.on("error", reject);
-		child.on("close", (code) => {
-			if (code !== 0) reject(new Error(`child exited ${code}: ${err}`));
-			else resolve(Number(out));
+		const done = new Promise((resolve, reject) => {
+			child.on("error", reject);
+			child.on("close", (code) => {
+				if (code !== 0) reject(new Error(`child exited ${code}: ${err}`));
+				else resolve(JSON.parse(out.slice(out.indexOf("up\n") + 3)));
+			});
 		});
+		// A child that dies before reporting "up" must not hang the test.
+		done.catch(() => {});
+		return { child, up: Promise.race([up, done]), done };
 	});
+	await Promise.all(children.map((c) => c.up));
+	for (const { child } of children) child.stdin.end("go\n");
+	return Promise.all(children.map((c) => c.done));
 }
 
 test("two independent processes are serialized with the required spacing", async () => {
 	const dir = stateDir();
-	const env = {
-		STATE_DIR: dir,
-		ORIGIN,
-		INTERVAL: "400",
-		START_AT: String(Date.now() + 700),
-	};
-	const [a, b] = await Promise.all([runChild(env), runChild(env)]);
-	const gap = Math.abs(a - b);
-	assert.ok(gap >= 390, `request starts only ${gap}ms apart`);
-	// The two did contend (started together), so the gap is pacing, not luck.
-	assert.ok(gap < 400 + 1500, `unexpectedly large gap ${gap}ms`);
+	const env = { STATE_DIR: dir, ORIGIN, INTERVAL: "400" };
+	const [a, b] = await runChildren([env, env]);
+	const [first, second] = a.stamp <= b.stamp ? [a, b] : [b, a];
+	const gap = second.stamp - first.stamp;
+	assert.ok(gap >= 400, `recorded request starts only ${gap}ms apart`);
+	// The two did contend: the second was ready to go well inside the first's
+	// interval, so the gap is pacing, not luck ...
+	assert.ok(
+		second.ready < first.stamp + 400,
+		`no contention: second ready ${second.ready - first.stamp}ms after the first stamp`,
+	);
+	// ... and it went once its turn came, not arbitrarily later.
+	const late = second.stamp - (first.stamp + 400);
+	assert.ok(late < 1500, `second request ${late}ms later than required`);
+	// And each request really was initiated after its own recorded start.
+	assert.ok(first.at >= first.stamp && second.at >= second.stamp, "start() ran before its stamp");
 });
 
 test("an independent process on another origin does not wait on a primed one", async () => {
 	const dir = stateDir();
 	const base = { STATE_DIR: dir, INTERVAL: "3000" };
 	// Prime one origin: a second request to it would have to wait ~3s.
-	await runChild({ ...base, ORIGIN: "https://one.test", START_AT: "0" });
-	const startAt = Date.now() + 500;
-	const [other, same] = await Promise.all([
-		runChild({ ...base, ORIGIN: "https://two.test", START_AT: String(startAt) }),
-		runChild({ ...base, ORIGIN: "https://one.test", START_AT: String(startAt) }),
+	const [primed] = await runChildren([{ ...base, ORIGIN: "https://one.test" }]);
+	const [other, same] = await runChildren([
+		{ ...base, ORIGIN: "https://two.test" },
+		{ ...base, ORIGIN: "https://one.test" },
 	]);
-	assert.ok(other - startAt < 1000, `other origin delayed ${other - startAt}ms`);
-	assert.ok(same - startAt >= 1500, `same origin was not paced (${same - startAt}ms)`);
+	// Measured from when each child was ready, so a slow spawn is not a delay.
+	assert.ok(other.stamp - other.ready < 1000, `other origin delayed ${other.stamp - other.ready}ms`);
+	assert.ok(same.stamp - primed.stamp >= 3000, `same origin was not paced (${same.stamp - primed.stamp}ms)`);
 });
 
 test("a lock orphaned by a SIGKILLed process does not strand the origin", async () => {
@@ -542,11 +585,24 @@ test("a lock orphaned by a SIGKILLed process does not strand the origin", async 
 		{ stdio: ["ignore", "pipe", "inherit"] },
 	);
 	await new Promise((resolve) => holder.stdout.once("data", resolve));
-	// Give it a moment to actually take the lock.
-	for (let i = 0; i < 100 && !existsSync(p.lockPath); i++) {
+	// Wait until the holder has fully taken the lock: the file exists *and*
+	// carries its owner record. The pacer creates the file and then writes the
+	// record, so killing on bare existence could land between the two and leave
+	// an unreadable lock, which is recovered only after a grace period longer
+	// than the timeout below. Poll by deadline, not by count, so a slow child
+	// on a loaded machine still gets there (#58).
+	const holdsLock = () => {
+		try {
+			return JSON.parse(readFileSync(p.lockPath, "utf8")).pid === holder.pid;
+		} catch {
+			return false;
+		}
+	};
+	const deadline = Date.now() + 10_000;
+	while (!holdsLock() && Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, 10));
 	}
-	assert.equal(existsSync(p.lockPath), true, "holder never took the lock");
+	assert.equal(holdsLock(), true, "holder never took the lock");
 	holder.kill("SIGKILL");
 	await new Promise((resolve) => holder.once("close", resolve));
 	const q = createPacer({

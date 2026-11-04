@@ -18,6 +18,18 @@
 #   the reaper reconciles their state on the next start. To actively cancel a
 #   sweep, use `mcp__loom__cancel_sweep` against a running daemon before stopping.
 #
+#   Scheduled ROLE agents (Champion/Curator/Judge/Doctor/Guide/…) survive this
+#   stop for the same reason, and on a Linux `systemd --user` host they can
+#   ALSO be architecturally detached from this daemon's own process tree — a
+#   transient `systemd-run --user --scope` (issue #5111's CPU-quota mechanism)
+#   parents them to the user manager, not to `loom-daemon`, so they keep
+#   running and drawing on the token pool even after this script reports
+#   success (issue #6129). This script's stop is intentionally NOT a fleet
+#   quiesce. An operator who actually wants to stop dispatch AND every
+#   in-flight role/sweep child — draining a host for maintenance or an
+#   exhausted token pool — should run `loom-daemon-quiesce.sh` instead, which
+#   does both, the same way on launchd and systemd.
+#
 # Linux systemd --user counterpart (#4268): when loom-daemon-start.sh installed
 # the daemon as a `systemd --user` service, this script detects that ownership
 # (`systemctl --user is-active`/`is-enabled <unit>`) and stops + DISABLES the unit
@@ -51,28 +63,63 @@
 # the inverted-#4011 silent-success hole where a failed bootout could leave a
 # relaunched daemon dispatching while the script reported success.
 #
-# Autonomy-desired marker (#4011): a normal operator stop is INTENT to stop, so
-# it removes the durable `autonomy-desired` marker loom-daemon-start.sh wrote and
-# tears down the watchdog scheduler — the launchd LaunchAgent on Darwin
-# (`launchctl bootout`), or the `<unit>-watchdog.timer` + `.service` pair on a
-# systemd Linux host (`systemctl --user disable --now`, #4260 sub-issue D) —
-# after that the watchdog correctly stays silent (no daemon is expected). But
-# the internal stop that
-# loom-daemon-update.sh performs is NOT operator intent to stop; it is a restart,
-# so update.sh passes --restarting (or LOOM_DAEMON_STOP_KEEP_INTENT=1) and this
-# script PRESERVES the marker + watchdog. Inferring restart-vs-stop would be
-# wrong (every self-update would silently disarm the detector — the exact bug
-# class #4011 fixes), so it must be an explicit signal.
+# Autonomy-desired marker (#4011, #9957): a normal operator stop is INTENT to
+# stop, but the marker is the operator's standing wish, not stop state -- so the
+# stop RECORDS itself instead of deleting it. `loom-daemon operator-stop record`
+# moves the `autonomy-desired` marker loom-daemon-start.sh wrote aside, verbatim,
+# into `<marker>.stopped` (the #9588 operator-stop record) with
+# `operator_stop_reason=loom-daemon-stop.sh caller=<a<b<c>`: the caller's process
+# chain as `comm` names only (never arguments). The watchdog is left armed; it
+# honours the record (no revival, no page), so a stop it did not issue can no
+# longer take the detector down with it. `loom-daemon restart --abort-drain`
+# restores the marker from the record; an explicit loom-daemon-start.sh clears
+# it. A binary older than #9957 lacks the verb: the stop then falls back to
+# removing the marker, with a warning, and still succeeds. But the internal stop
+# that loom-daemon-update.sh performs is NOT operator intent to stop; it is a
+# restart, so update.sh passes --restarting (or LOOM_DAEMON_STOP_KEEP_INTENT=1)
+# and this script leaves the marker untouched and writes no record. Inferring
+# restart-vs-stop would be wrong (every self-update would silently disarm the
+# detector -- the exact bug class #4011 fixes), so it must be an explicit signal.
+#
+# Test-only dry-run seam (#5501): a test proving "default label = the
+# operator's real stop, behaviour unchanged" needs LOOM_LAUNCHD_LABEL /
+# LOOM_WATCHDOG_LABEL to resolve to the REAL production values — but doing
+# that against a live host is exactly the incident this seam exists to close
+# (verifying #5131 booted the operator's real daemon, see #5501). With
+# LOOM_DAEMON_STOP_DRYRUN=1, this script still RESOLVES the pid / launchd job /
+# systemd unit it would act on (so the "what would this target" logic is fully
+# exercised), but every MUTATING action against it — kill -TERM/-KILL, launchctl
+# bootout, systemctl --user disable --now — becomes a logged "DRY-RUN: would ..." line instead of a real
+# syscall. Pair with LOOM_DAEMON_STOP_DRYRUN_LOG=<path> to capture those lines
+# for a test to grep instead of parsing captured stdout.
 #
 # Usage:
-#   ./.loom/scripts/cli/loom-daemon-stop.sh              Graceful stop (SIGTERM -> SIGKILL); clears the autonomy-desired marker
+#   ./.loom/scripts/cli/loom-daemon-stop.sh              Graceful stop (SIGTERM -> SIGKILL); records the stop (autonomy-desired -> autonomy-desired.stopped)
 #   ./.loom/scripts/cli/loom-daemon-stop.sh --force      Skip the grace window (SIGKILL)
-#   ./.loom/scripts/cli/loom-daemon-stop.sh --restarting Restart (update.sh): PRESERVE the marker + watchdog
+#   ./.loom/scripts/cli/loom-daemon-stop.sh --restarting Restart (update.sh): leave the marker in place, record nothing
 #   ./.loom/scripts/cli/loom-daemon-stop.sh --help
 #
 # Environment:
+#   LOOM_PID_FILE                 #6386: the pid file to read, TIER 1 -- ahead of the
+#                                 $PWD/machine-derived "<state home>/.daemon.pid".
+#                                 Same precedence the daemon (daemon_pidfile.rs) and
+#                                 loom-daemon-watchdog.sh use, and the value
+#                                 loom-daemon-start.sh exports, so all four ends
+#                                 always mean the SAME file. Before #6386 this script
+#                                 ignored it and killed whatever $PWD's repo resolved
+#                                 to -- which SIGTERM'd a live fleet dispatcher during
+#                                 a test run that had explicitly pointed it elsewhere.
 #   LOOM_DAEMON_STOP_GRACE_SECS   Grace window before SIGKILL (default 10)
-#   LOOM_DAEMON_STOP_KEEP_INTENT  1/true/yes: preserve the autonomy-desired marker + watchdog (same as --restarting)
+#   LOOM_DAEMON_STOP_KEEP_INTENT  1/true/yes: preserve the autonomy-desired marker, record nothing (same as --restarting)
+#   LOOM_DAEMON_SELF_BIN          The loom-daemon that implements `operator-stop record`;
+#                                 else the usual lib/locate-daemon-bin.sh resolution.
+#   LOOM_DAEMON_STOP_DRYRUN       1/true/yes: TEST-ONLY. Resolve the target pid/launchd
+#                                 job/systemd unit but never actually kill/bootout/disable
+#                                 it — logs "DRY-RUN: would ..." instead (#5501). The
+#                                 supported way to exercise default-label semantics
+#                                 without touching a real supervised job.
+#   LOOM_DAEMON_STOP_DRYRUN_LOG   Path to also append each dry-run action line to
+#                                 (in addition to stdout), for a test to grep.
 #   LOOM_LAUNCHD_LABEL            macOS only: the LaunchAgent label to bootout (default com.rjwalters.loom-daemon)
 #   LOOM_LAUNCHD_DOMAIN           macOS only: pin the launchd domain (gui/<uid> or
 #                                 user/<uid>); else auto-resolved gui→user (#4130).
@@ -103,6 +150,25 @@
 
 set -uo pipefail
 
+# ---------- help banner: read "$0" exactly ONCE, before anything else (#7794) ----------
+# `--help` prints this file's leading comment block. Recovering that text
+# lazily -- an awk pass over "$0" from inside show_help(), after sourcing and
+# argument parsing have run -- races a same-path truncate+rewrite of this very
+# file (a resync step, a shared self-hosted-runner checkout, or an operator's
+# `git merge --ff-only` all write in place: open+truncate+write, not an atomic
+# rename-into-place), handing back a torn, incomplete banner with no I/O error
+# to catch. That has failed CI twice on unrelated PRs (#7201, PR #7768).
+# Capturing it here -- the first statement executed, before any sourcing,
+# argument parsing or subprocess -- narrows the window to this script's own
+# startup instant and lets show_help() print from memory. It narrows the
+# window, it does not close it: the permanent fix is #7810 Phase 6, where this
+# wrapper becomes an `exec` stub and clap owns `--help`. Deliberately interim,
+# and deliberately byte-identical -- awk stops at the first non-comment line
+# (the blank line above `set -uo pipefail`), so the captured text never ends in
+# a blank line and the single trailing newline `$( )` strips is exactly the one
+# show_help()'s `printf '%s\n'` puts back.
+_LOOM_HELP_BANNER="$(awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0")"
+
 if [[ -t 1 ]]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 else
@@ -112,12 +178,8 @@ err()  { echo -e "${RED}$*${NC}" >&2; }
 warn() { echo -e "${YELLOW}$*${NC}" >&2; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
 
-show_help() {
-    # Print the leading comment banner (line 2 through the last comment line
-    # before `set -uo pipefail`), stripping the leading "# ". Same pattern as
-    # loom-daemon-start.sh's show_help -- robust to the banner growing.
-    awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
-}
+# Prints the banner captured at startup above -- no filesystem access (#7794).
+show_help() { printf '%s\n' "$_LOOM_HELP_BANNER"; }
 
 find_repo_root() {
     local dir="$PWD"
@@ -135,7 +197,7 @@ find_repo_root() {
 }
 
 FORCE=false
-# Preserve the autonomy-desired marker + watchdog across this stop? True for a
+# Leave the autonomy-desired marker in place and record nothing? True for a
 # restart (update.sh), false for an operator stop. Env or --restarting.
 KEEP_INTENT=false
 if [[ "${LOOM_DAEMON_STOP_KEEP_INTENT:-}" =~ ^(1|true|yes|on)$ ]]; then
@@ -171,44 +233,110 @@ else
     exit 1
 fi
 
-PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+# ---------- pid-file resolution (#6386) ----------
+# LOOM_PID_FILE is TIER 1, ahead of the $PWD/machine-derived state home --
+# exactly the precedence the daemon's own `daemon_pidfile::resolve_pid_file_path_from`
+# and loom-daemon-watchdog.sh's resolve_pid_file() already use, and the value
+# loom-daemon-start.sh exports (and bakes into the rendered plist / systemd
+# unit) for the pid file the daemon actually claims.
+#
+# Before #6386 this script IGNORED LOOM_PID_FILE entirely and always read
+# "$DAEMON_STATE_HOME/.daemon.pid" -- while honoring LOOM_SOCKET_PATH for the
+# marker/loom-dir. That split resolution is what killed the fleet's live
+# dispatcher for 11h: an Auditor run of the shell test suites from the LIVE
+# checkout invoked this script with LOOM_PID_FILE pointed at a scratch file
+# (and no `cd` into a fixture), so `find_repo_root` walked up from $PWD onto
+# the real checkout, and the script SIGTERM'd + `rm -f`'d the REAL daemon's
+# pid file that the caller had explicitly told it not to touch.
+#
+# On a real host this is a no-op: whatever LOOM_PID_FILE is present there was
+# exported by loom-daemon-start.sh and already names the same file the tier
+# below derives. It differs only when a caller DELIBERATELY names another file
+# -- which is precisely the request that must be honored, not overruled by cwd.
+#
+# Deliberately NOT widened: the "Not in a Loom workspace" refusal above still
+# runs first, so LOOM_PID_FILE narrows which pid file a stop targets but never
+# grants a stop from a directory that previously refused outright. Letting the
+# env var bypass that gate would ENLARGE the blast radius (an agent session
+# exports LOOM_PID_FILE=<the real .daemon.pid> into every child it spawns, so a
+# stray `loom-daemon-stop.sh` from /tmp would newly reach the live daemon) --
+# the opposite of this fix's purpose. An empty value is skipped exactly like an
+# unset one, which is how the suites pin a case to the derived tier on purpose.
+if [[ -n "${LOOM_PID_FILE:-}" ]]; then
+    PID_FILE="$LOOM_PID_FILE"
+else
+    PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+fi
 GRACE_SECS="${LOOM_DAEMON_STOP_GRACE_SECS:-10}"
 
-# ---------- autonomy-desired marker + watchdog (#4011) ----------
+# ---------- dry-run seam (#5501) ----------
+# See the header comment. Resolution stays real; every mutating action against
+# the resolved pid/job/unit is replaced by a logged line instead.
+DRYRUN=false
+if [[ "${LOOM_DAEMON_STOP_DRYRUN:-}" =~ ^(1|true|yes|on)$ ]]; then
+    DRYRUN=true
+fi
+dryrun_log() {
+    echo "DRY-RUN: $*"
+    if [[ -n "${LOOM_DAEMON_STOP_DRYRUN_LOG:-}" ]]; then
+        printf '%s\n' "$*" >> "$LOOM_DAEMON_STOP_DRYRUN_LOG"
+    fi
+}
+
+# ---------- autonomy-desired marker -> operator-stop record (#4011, #9957) ----------
 SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
 LOOM_DIR="$(dirname "$SOCKET_PATH")"
 INTENT_MARKER="${LOOM_AUTONOMY_MARKER:-$LOOM_DIR/autonomy-desired}"
 
-# Remove the operator-intent marker and tear down the watchdog LaunchAgent /
-# systemd timer+service. Only called on an operator-initiated stop (NOT a
-# --restarting update.sh stop). After this the watchdog sees no marker and
-# correctly stays silent — no false page on a deliberate stop. Best-effort;
-# failures never change the stop's exit status.
-teardown_autonomy_intent() {
+# The caller's process chain, `comm` names only -- NEVER arguments, which can
+# carry secrets (CLAUDE.md rule 12). Up to three ancestors from $PPID, nearest
+# first, joined by `<` (e.g. `bash<claude<launchd`). basename because macOS
+# `ps -o comm=` prints the executable's full path. `unknown` when ps is absent.
+stop_caller_chain() {
+    local pid="$PPID" chain="" comm
+    for _ in 1 2 3; do
+        [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) || break
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || break
+        comm="${comm##*/}"
+        comm="${comm//[[:space:]]/}"
+        [[ -n "$comm" ]] || break
+        chain="${chain:+$chain<}$comm"
+        (( pid == 1 )) && break
+        pid="$(ps -o ppid= -p "$pid" 2>/dev/null)" || break
+        pid="${pid//[[:space:]]/}"
+    done
+    printf '%s\n' "${chain:-unknown}"
+}
+
+# Record an operator-initiated stop (NOT a --restarting update.sh stop) via the
+# #9588 operator-stop record, written by the daemon itself so the format has one
+# implementation: the marker moves aside, verbatim, into "$INTENT_MARKER.stopped".
+# The watchdog is deliberately left armed -- it reads the record and stays
+# silent, and a stop it did not issue can no longer disarm it (#9957).
+#
+# --if-marker: record only when a marker exists (the "nothing to stop" path,
+# where there is no daemon to attribute a stop to and no intent to move aside).
+#
+# A binary that predates the verb (or none at all) falls back to the pre-#9957
+# `rm -f` with a warning. Best-effort; never changes the stop's exit status.
+# Sets STOP_INTENT_NOTE for the final summary line.
+# requires-daemon: operator-stop optional   Without the `record` verb (absent binary, or one predating #9957) the stop removes the autonomy-desired marker as before, with a warning; the stop itself never fails on it.
+STOP_INTENT_NOTE=""
+record_operator_stop() {
+    [[ "${1:-}" == "--if-marker" && ! -f "$INTENT_MARKER" ]] && return 0
+    local reason bin
+    reason="loom-daemon-stop.sh caller=$(stop_caller_chain)"
+    bin="$(declare -f loom_locate_daemon_bin >/dev/null 2>&1 \
+        && { loom_daemon_self_bin_override || loom_locate_daemon_bin "$REPO_ROOT"; })"
+    if [[ -n "$bin" ]] && "$bin" operator-stop record --marker "$INTENT_MARKER" \
+        --reason "$reason" >/dev/null 2>&1; then
+        STOP_INTENT_NOTE="Operator stop recorded in $INTENT_MARKER.stopped ($reason)."
+        return 0
+    fi
+    warn "Could not record the operator stop (${bin:-no loom-daemon found}; a binary older than #9957 lacks \`operator-stop record\`)."
+    warn "  Removing the autonomy-desired marker instead (pre-#9957 behaviour)."
     rm -f "$INTENT_MARKER" 2>/dev/null || true
-    local wd_label wd_service
-    wd_label="${LOOM_WATCHDOG_LABEL:-${LAUNCHD_LABEL}-watchdog}"
-    # $LAUNCHD_DOMAIN is resolved below (gui/<uid> ↦ user/<uid>, #4130) before any
-    # call to this function; the launchctl calls here are gated on USE_LAUNCHD.
-    wd_service="${LAUNCHD_DOMAIN}/${wd_label}"
-    if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
-        if launchctl print "$wd_service" >/dev/null 2>&1; then
-            launchctl bootout "$wd_service" >/dev/null 2>&1 || true
-        fi
-    fi
-    # systemd --user watchdog timer+service teardown (#4260 sub-issue D),
-    # symmetric with the launchd bootout above. $IS_LINUX_SYSTEMD is resolved
-    # below (before any call to this function); mirrors loom-daemon-start.sh's
-    # resolve_systemd_watchdog_unit() naming (<daemon unit>-watchdog, same
-    # LOOM_WATCHDOG_LABEL override) so stop always targets the SAME unit pair
-    # start provisioned.
-    if [[ "$IS_LINUX_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
-        local sd_daemon_unit sd_wd_unit
-        sd_daemon_unit="$(resolve_systemd_unit)"
-        sd_wd_unit="${LOOM_WATCHDOG_LABEL:-${sd_daemon_unit%.service}-watchdog}"
-        systemctl --user disable --now "${sd_wd_unit}.timer" >/dev/null 2>&1 || true
-        systemctl --user disable --now "${sd_wd_unit}.service" >/dev/null 2>&1 || true
-    fi
+    STOP_INTENT_NOTE="Autonomy-desired marker cleared (operator-stop record unavailable)."
 }
 
 # ---------- launchd plumbing (macOS, #3972) ----------
@@ -225,6 +353,10 @@ if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/systemd-user.sh" ]]; then
     # shellcheck source=../lib/systemd-user.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/systemd-user.sh"
 fi
+# loom-daemon resolver (#8134) for `operator-stop record` (#9957). Optional:
+# without it the stop falls back to removing the marker.
+# shellcheck source=../lib/locate-daemon-bin.sh
+[[ -r "$_LOOM_LAUNCHD_LIB_DIR/locate-daemon-bin.sh" ]] && source "$_LOOM_LAUNCHD_LIB_DIR/locate-daemon-bin.sh"
 
 IS_DARWIN=false
 [[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
@@ -270,6 +402,10 @@ launchd_job_pid() {
 # best-effort -- a job that was never loaded (or already unloaded) is a no-op.
 launchd_bootout_if_loaded() {
     if launchd_job_loaded; then
+        if [[ "$DRYRUN" == "true" ]]; then
+            dryrun_log "would launchctl bootout $LAUNCHD_SERVICE"
+            return 0
+        fi
         launchctl bootout "$LAUNCHD_SERVICE" >/dev/null 2>&1 || true
     fi
 }
@@ -295,6 +431,19 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
     # scratch unit) should route to the pid-file tier, not a no-op disable.
     if systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
         || systemctl --user is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null; then
+        if [[ "$DRYRUN" == "true" ]]; then
+            # #5501: never actually stop/disable the resolved unit -- log the
+            # intended action and skip the mutating call + its post-disable
+            # verification (which assumes the disable really happened).
+            dryrun_log "would systemctl --user disable --now $SYSTEMD_UNIT"
+            if [[ "$KEEP_INTENT" != "true" ]]; then
+                record_operator_stop
+                ok "DRY-RUN: loom-daemon stop simulated (systemd unit $SYSTEMD_UNIT). $STOP_INTENT_NOTE No real action taken."
+            else
+                ok "DRY-RUN: loom-daemon stop simulated (systemd unit $SYSTEMD_UNIT). No real action taken."
+            fi
+            exit 0
+        fi
         echo "Stopping loom-daemon via systemd (systemctl --user disable --now $SYSTEMD_UNIT)..."
         systemctl --user disable --now "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
         # Verify the unit is actually down — a disable --now that did not stop the
@@ -307,12 +456,12 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
         fi
         rm -f "$PID_FILE"
         if [[ "$KEEP_INTENT" != "true" ]]; then
-            teardown_autonomy_intent
-            ok "loom-daemon stopped + disabled (systemd unit $SYSTEMD_UNIT). Autonomy-desired marker cleared."
+            record_operator_stop
+            ok "loom-daemon stopped + disabled (systemd unit $SYSTEMD_UNIT). $STOP_INTENT_NOTE"
         else
             ok "loom-daemon stopped + disabled (systemd unit $SYSTEMD_UNIT). Autonomy-desired marker preserved (restart in progress)."
         fi
-        echo "In-flight sweeps (if any) were left running by design; the next start reconciles them."
+        echo "In-flight sweeps and role agents (if any) were left running by design; the next start reconciles sweeps. To also stop them, run: .loom/scripts/cli/loom-daemon-quiesce.sh (issue #6129)."
         exit 0
     fi
 fi
@@ -344,6 +493,15 @@ if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     # label-blind kill would violate that scoping and contradict the #4054
     # label-scoped-stop discipline. With the default label we keep the fallback
     # as a genuine lost-PID-file recovery path.
+    # #5548 cross-reference: this tier's `pgrep -f` is still forgeable by a
+    # leaked test fixture whose path literally ends in `/loom-daemon` (the
+    # exact shape #5548 hit) -- the `(^|/)...$` anchor narrows it versus a
+    # bare substring match, but does not close that gap. No code change here:
+    # this is the intentionally-last-resort tier, already gated behind the
+    # default-label check above and already covered by a decoy regression
+    # test (test-loom-daemon-update.sh's suite-level decoy, #4078). #5548's
+    # actual fixes are in scripts/stop-daemon.sh, scripts/start-daemon.sh, and
+    # the renamed `loom-daemon-mock` test fixtures elsewhere in this repo.
     if [[ "$LAUNCHD_LABEL" == "$DEFAULT_LAUNCHD_LABEL" ]] && command -v pgrep >/dev/null 2>&1; then
         pid=$(pgrep -f '(^|/)loom-daemon$' 2>/dev/null | head -n1 || true)
     fi
@@ -353,8 +511,59 @@ if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     warn "No running loom-daemon found (nothing to stop)."
     rm -f "$PID_FILE"
     launchd_bootout_if_loaded
+    # #5131: apply the SAME scoping to the teardown that already protects the
+    # kill. The pid resolver's last-resort  tier is deliberately skipped
+    # for a non-default LOOM_LAUNCHD_LABEL (#4078) — "stop THAT daemon, not
+    # whatever else is named loom-daemon". But the marker is
+    # HOST-GLOBAL ($LOOM_DIR/autonomy-desired), while PID_FILE is per-workspace,
+    # so a label-scoped stop that legitimately finds nothing would still disarm
+    # the whole host and exit 0 — silently, since "nothing to stop" reads like a
+    # correct no-op.
+    #
+    # An invocation that scoped its label but NOT its marker is asking to stop
+    # one specific daemon; it is not asking to revoke host-wide autonomy. Only
+    # tear down when this stop owns that state: the default label (the
+    # operator's real daemon), or an explicit LOOM_AUTONOMY_MARKER (the caller
+    # scoped the marker too — what the test suites do via
+    # live_state_sandbox_init).
+    _teardown_is_in_scope=true
+    if [[ "$LAUNCHD_LABEL" != "$DEFAULT_LAUNCHD_LABEL" && -z "${LOOM_AUTONOMY_MARKER:-}" ]]; then
+        _teardown_is_in_scope=false
+    fi
     if [[ "$KEEP_INTENT" != "true" ]]; then
-        teardown_autonomy_intent
+        if [[ "$_teardown_is_in_scope" == "true" ]]; then
+            # Nothing was stopped, so record only when there is intent to move
+            # aside -- a repeated stop on a quiet host invents no record.
+            record_operator_stop --if-marker
+        else
+            warn "Label-scoped stop (LOOM_LAUNCHD_LABEL=$LAUNCHD_LABEL) found no daemon;"
+            warn "  leaving the host-global autonomy marker untouched (#5131)."
+            warn "  Set LOOM_AUTONOMY_MARKER to scope the marker too, or use the default"
+            warn "  label, if this stop is meant to disarm the host."
+        fi
+    fi
+    exit 0
+fi
+
+if [[ "$DRYRUN" == "true" ]]; then
+    # #5501: a pid WAS resolved (possibly via the launchd-label fallback above,
+    # which is exactly how a #5501-shaped default-label test would reach the
+    # operator's real daemon) -- log what would happen and stop here, never
+    # sending a real signal, never calling launchctl bootout for real, and
+    # never running the "still alive" verification below (it assumes a real
+    # stop was attempted).
+    if [[ "$FORCE" == "true" ]]; then
+        dryrun_log "would SIGKILL pid $pid"
+    else
+        dryrun_log "would SIGTERM pid $pid (grace ${GRACE_SECS}s), escalating to SIGKILL on timeout"
+    fi
+    launchd_bootout_if_loaded
+    rm -f "$PID_FILE"
+    if [[ "$KEEP_INTENT" != "true" ]]; then
+        record_operator_stop
+        ok "DRY-RUN: loom-daemon stop simulated (pid $pid, target $LAUNCHD_SERVICE). $STOP_INTENT_NOTE No real signal or launchd/systemd action was taken."
+    else
+        ok "DRY-RUN: loom-daemon stop simulated (pid $pid, target $LAUNCHD_SERVICE). No real signal or launchd/systemd action was taken."
     fi
     exit 0
 fi
@@ -408,14 +617,15 @@ if launchd_job_loaded; then
 fi
 
 rm -f "$PID_FILE"
-# Operator stop ⇒ clear the autonomy-desired marker + watchdog so the detector
-# stays silent (no daemon is expected). A --restarting stop (update.sh) preserves
-# both so a self-update never silently disarms the detector (#4011).
+# Operator stop ⇒ record it (#9957): the marker moves aside into the record, so
+# the still-armed watchdog stays silent (no daemon is expected). A --restarting
+# stop (update.sh) leaves the marker alone so a self-update never silently
+# disarms the detector (#4011).
 if [[ "$KEEP_INTENT" != "true" ]]; then
-    teardown_autonomy_intent
-    ok "loom-daemon stopped (pid $pid). Autonomy-desired marker cleared."
+    record_operator_stop
+    ok "loom-daemon stopped (pid $pid). $STOP_INTENT_NOTE"
 else
     ok "loom-daemon stopped (pid $pid). Autonomy-desired marker preserved (restart in progress)."
 fi
-echo "In-flight sweeps (if any) were left running by design; the next start reconciles them."
+echo "In-flight sweeps and role agents (if any) were left running by design; the next start reconciles sweeps. To also stop them, run: .loom/scripts/cli/loom-daemon-quiesce.sh (issue #6129)."
 exit 0

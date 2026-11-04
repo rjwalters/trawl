@@ -38,25 +38,7 @@ CLEAN_SCRIPT="$SCRIPTS_DIR/clean.sh"
 CLEANUP_SCRIPT="$SCRIPTS_DIR/cleanup.sh"
 RECOVER_SCRIPT="$SCRIPTS_DIR/recover-orphaned-shepherds.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -246,8 +228,17 @@ mkdir -p "$STAGE/lib"
 cp "$CLEAN_SCRIPT" "$CLEANUP_SCRIPT" "$RECOVER_SCRIPT" "$STAGE/"
 cp "$SCRIPTS_DIR/lib/locate-daemon-bin.sh" "$STAGE/lib/"
 
+# Isolate step 4 of loom_locate_daemon_bin (the machine-level install fallback
+# under ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}) too -- on a host with a real
+# machine-level Loom install, leaving $HOME untouched would let that step
+# resolve the real binary and defeat this "no resolvable binary" fixture
+# (#5183).
+EMPTY_HOME="$WORK/empty-home"
+mkdir -p "$EMPTY_HOME"
+
 for s in clean.sh cleanup.sh recover-orphaned-shepherds.sh; do
     out="$(LOOM_DAEMON_BIN="/nonexistent/loom-daemon" PATH="$STUB_DIR:$STRIPPED_PATH" \
+        HOME="$EMPTY_HOME" LOOM_DAEMON_BIN_DIR="/nonexistent" \
         "$STAGE/$s" 2>&1)"
     rc=$?
     if [[ "$rc" -ne 0 ]]; then

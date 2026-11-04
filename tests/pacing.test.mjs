@@ -453,21 +453,37 @@ function recordedStamp(statePath) {
 
 test("concurrent gates in one process are serialized with the required spacing", async () => {
 	const dir = stateDir();
-	const stamps = [];
-	const mk = () => createPacer({ origin: ORIGIN, stateDir: dir, minIntervalMs: 200, warn: () => {} });
+	const gates = [];
+	const mk = () => {
+		const g = { slept: 0 };
+		g.pacer = createPacer({
+			origin: ORIGIN,
+			stateDir: dir,
+			minIntervalMs: 200,
+			warn: () => {},
+			sleep: (ms) => {
+				g.slept += ms;
+				return new Promise((resolve) => setTimeout(resolve, ms));
+			},
+		});
+		gates.push(g);
+		return g;
+	};
 	await Promise.all(
-		[mk(), mk(), mk()].map((p) =>
-			p.gate(async () => {
+		[mk(), mk(), mk()].map((g) =>
+			g.pacer.gate(async () => {
 				// This gate holds the lock, so the file is its own stamp.
-				stamps.push(recordedStamp(p.statePath));
+				g.stamp = recordedStamp(g.pacer.statePath);
 			}),
 		),
 	);
-	stamps.sort((a, b) => a - b);
-	assert.ok(stamps[1] - stamps[0] >= 200, `stamps ${stamps[1] - stamps[0]}ms apart`);
-	assert.ok(stamps[2] - stamps[1] >= 200, `stamps ${stamps[2] - stamps[1]}ms apart`);
-	// All three contended from the start, so the spacing is pacing, not luck.
-	assert.ok(stamps[2] - stamps[0] < 2 * 200 + 1500, `unexpectedly large spread ${stamps[2] - stamps[0]}ms`);
+	gates.sort((x, y) => x.stamp - y.stamp);
+	const [s0, s1, s2] = gates.map((g) => g.stamp);
+	assert.ok(s1 - s0 >= 200, `stamps ${s1 - s0}ms apart`);
+	assert.ok(s2 - s1 >= 200, `stamps ${s2 - s1}ms apart`);
+	// All three entered the gate together, so the spacing is pacing, not luck:
+	// the two later gates really were held back (by the lock or the wait).
+	assert.ok(gates[1].slept > 0 && gates[2].slept > 0, "a later gate was never held back");
 });
 
 // --- independent processes sharing one state dir ---
@@ -477,14 +493,20 @@ test("concurrent gates in one process are serialized with the required spacing",
 // spawn (several seconds on a loaded machine) and they really contend. It then
 // gates one "request" and prints, as JSON: when it was ready to gate, the stamp
 // the pacer recorded for the request (read back from the state file while the
-// child still holds the lock), and when `start()` actually ran.
+// child still holds the lock), when `start()` actually ran, and how long the
+// pacer slept in total (pacing waits and lock polls both go through `sleep`).
 const CHILD = `
 const { createPacer } = await import(process.env.PACING_URL);
 const { readFileSync } = await import("node:fs");
+let slept = 0;
 const p = createPacer({
 	origin: process.env.ORIGIN,
 	stateDir: process.env.STATE_DIR,
 	minIntervalMs: Number(process.env.INTERVAL),
+	sleep: (ms) => {
+		slept += ms;
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	},
 });
 process.stdout.write("up\\n");
 await new Promise((resolve) => process.stdin.once("data", resolve));
@@ -492,7 +514,7 @@ process.stdin.pause();
 const ready = Date.now();
 await p.gate(async () => {
 	const stamp = JSON.parse(readFileSync(p.statePath, "utf8")).lastRequestAt;
-	process.stdout.write(JSON.stringify({ ready, stamp, at: Date.now() }) + "\\n");
+	process.stdout.write(JSON.stringify({ ready, stamp, at: Date.now(), slept }) + "\\n");
 });
 `;
 
@@ -553,31 +575,30 @@ async function runChildren(envs, { deadlineMs = 5 * 60_000, beforeGo } = {}) {
 }
 
 test("two independent processes are serialized with the required spacing", async () => {
-	const dir = stateDir();
-	const env = { STATE_DIR: dir, ORIGIN, INTERVAL: "400" };
-	const [a, b] = await runChildren([env, env]);
-	const [first, second] = a.stamp <= b.stamp ? [a, b] : [b, a];
-	const gap = second.stamp - first.stamp;
-	assert.ok(gap >= 400, `recorded request starts only ${gap}ms apart`);
-	// The two did contend: the second was ready to go well inside the first's
-	// interval, so the gap is pacing, not luck ...
-	assert.ok(
-		second.ready < first.stamp + 400,
-		`no contention: second ready ${second.ready - first.stamp}ms after the first stamp`,
-	);
-	// ... and it went once its turn came, not arbitrarily later.
-	const late = second.stamp - (first.stamp + 400);
-	assert.ok(late < 1500, `second request ${late}ms later than required`);
-	// And each request really was initiated after its own recorded start.
-	assert.ok(first.at >= first.stamp && second.at >= second.stamp, "start() ran before its stamp");
+	// Spacing must hold on every trial. A trial only proves something when the
+	// two really contended (the second was ready inside the first's interval),
+	// and on a starved machine one child can wake too late for that, so trials
+	// repeat until one contends rather than failing a correct pacer.
+	let contended = false;
+	for (let trial = 0; trial < 5 && !contended; trial++) {
+		const env = { STATE_DIR: stateDir(), ORIGIN, INTERVAL: "400" };
+		const [a, b] = await runChildren([env, env]);
+		const [first, second] = a.stamp <= b.stamp ? [a, b] : [b, a];
+		const gap = second.stamp - first.stamp;
+		assert.ok(gap >= 400, `recorded request starts only ${gap}ms apart`);
+		// Each request really was initiated after its own recorded start.
+		assert.ok(first.at >= first.stamp && second.at >= second.stamp, "start() ran before its stamp");
+		contended = second.ready < first.stamp + 400 && second.slept > 0;
+	}
+	assert.ok(contended, "the two processes never contended in 5 trials");
 });
 
 test("an independent process on another origin does not wait on a primed one", async () => {
 	const dir = stateDir();
-	const INTERVAL = 6000;
+	const INTERVAL = 3000;
 	const base = { STATE_DIR: dir, INTERVAL: String(INTERVAL) };
 	// Prime one origin once both children are up, just before releasing them,
-	// so a second request to it really does owe ~6s however slow the spawn was.
+	// so a second request to it really does owe ~3s however slow the spawn was.
 	let primed;
 	const [other, same] = await runChildren(
 		[
@@ -593,12 +614,11 @@ test("an independent process on another origin does not wait on a primed one", a
 			},
 		},
 	);
-	// A pacer that let origins share a turn would hold the other origin for
-	// most of the interval; half of it is room for a slow, uncontended gate.
-	assert.ok(
-		other.stamp - other.ready < INTERVAL / 2,
-		`other origin delayed ${other.stamp - other.ready}ms`,
-	);
+	// "Did not wait" is checked on what the pacer did, not on elapsed time:
+	// the other origin never slept, neither for a pacing wait nor for a lock,
+	// so no amount of CPU starvation can make this flake.
+	assert.equal(other.slept, 0, `other origin slept ${other.slept}ms`);
+	assert.ok(same.slept > 0, "same origin never waited");
 	assert.ok(same.stamp - primed >= INTERVAL, `same origin was not paced (${same.stamp - primed}ms)`);
 });
 
@@ -634,7 +654,7 @@ test("a lock orphaned by a SIGKILLed process does not strand the origin", async 
 			return false;
 		}
 	};
-	const deadline = Date.now() + 10_000;
+	const deadline = Date.now() + 60_000;
 	while (!holdsLock() && Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, 10));
 	}

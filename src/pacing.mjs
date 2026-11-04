@@ -30,22 +30,24 @@
 // Browser-free, and every side effect (clock, sleep, directory, diagnostics,
 // liveness check) is injectable so the policy is testable deterministically.
 
-import { createHash, randomBytes } from "node:crypto";
-import {
-	closeSync,
-	linkSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-	writeSync,
-} from "node:fs";
-import { homedir, hostname } from "node:os";
+import { mkdirSync, readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import path from "node:path";
 import { MAX_CRAWL_DELAY_MS } from "./robots.mjs";
+import {
+	LockTimeoutError,
+	createFileLock,
+	defaultIsAlive,
+	defaultStateDir,
+	originDigest,
+	realSleep,
+	stateOrigin,
+	writeJsonAtomic,
+} from "./state.mjs";
+
+// Re-exported: the state directory and file naming are shared with
+// src/cooldown.mjs through src/state.mjs.
+export { defaultStateDir, originDigest };
 
 // The documented floor between two requests to one origin when robots.txt
 // asks for nothing (or for less).
@@ -67,11 +69,6 @@ export const DEFAULT_LOCK_TIMEOUT_MS = 2 * MAX_CRAWL_DELAY_MS;
 // host, or a PID that may have been reused).
 export const STALE_LOCK_MS = 5 * 60 * 1000;
 
-// A lock file whose owner record cannot be parsed (a crash between create and
-// write) is presumed abandoned once it is this old.
-const UNREADABLE_LOCK_GRACE_MS = 5000;
-
-const LOCK_POLL_MS = 25;
 const STATE_VERSION = 1;
 
 export class PacingError extends Error {
@@ -79,15 +76,6 @@ export class PacingError extends Error {
 		super(message);
 		this.name = "PacingError";
 	}
-}
-
-// `$TRAWL_STATE_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/trawl`. A relative
-// XDG_CACHE_HOME is ignored, as the XDG spec requires.
-export function defaultStateDir(env = process.env, home = homedir()) {
-	if (env.TRAWL_STATE_DIR) return env.TRAWL_STATE_DIR;
-	const xdg = env.XDG_CACHE_HOME;
-	const cache = xdg && path.isAbsolute(xdg) ? xdg : path.join(home, ".cache");
-	return path.join(cache, "trawl");
 }
 
 // Accepts a number or a numeric string; returns milliseconds or throws. The
@@ -116,19 +104,7 @@ export function validateMinInterval(value, label = "minIntervalMs") {
 // The pacing key: scheme + host + effective port, never a path. Returns null
 // for anything that is not http(s), which bypasses pacing (and the cache)
 // entirely.
-export function pacingOrigin(url) {
-	try {
-		const u = new URL(url);
-		if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-		return u.origin;
-	} catch {
-		return null;
-	}
-}
-
-export function originDigest(origin) {
-	return createHash("sha256").update(origin).digest("hex").slice(0, 32);
-}
+export const pacingOrigin = stateOrigin;
 
 // How long to wait before the next request. A `lastRequestAt` in the future
 // (the clock went backwards, or another host's clock is ahead) is clamped:
@@ -168,37 +144,6 @@ export function parseState(raw) {
 	};
 }
 
-function parseOwner(raw) {
-	try {
-		const o = JSON.parse(raw);
-		if (
-			o &&
-			typeof o.token === "string" &&
-			Number.isInteger(o.pid) &&
-			typeof o.host === "string" &&
-			typeof o.createdAt === "number" &&
-			Number.isFinite(o.createdAt)
-		) {
-			return o;
-		}
-	} catch {
-		// fall through
-	}
-	return null;
-}
-
-function defaultIsAlive(pid) {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		// EPERM: the process exists, it just isn't ours to signal.
-		return err?.code === "EPERM";
-	}
-}
-
-const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 export function createPacer({
 	origin,
 	stateDir = defaultStateDir(),
@@ -236,127 +181,32 @@ export function createPacer({
 		);
 	};
 
-	const token = () => `${pid}-${randomBytes(8).toString("hex")}`;
-
-	function isStale(owner, mtimeMs) {
-		const t = now();
-		if (!owner) return t - mtimeMs > UNREADABLE_LOCK_GRACE_MS;
-		const age = t - owner.createdAt;
-		const ancient = age > staleLockMs || age < -staleLockMs;
-		if (owner.host === host) {
-			if (!isAlive(owner.pid)) return true;
-			// Alive, but a lock this old outlives any real hold — the PID has
-			// been reused by an unrelated process.
-			return ancient;
-		}
-		// Another host's PIDs mean nothing here; only age can decide.
-		return ancient;
-	}
-
-	// Returns true when the caller should retry acquisition immediately.
-	function tryEvictStale() {
-		let raw;
-		let mtimeMs;
-		try {
-			mtimeMs = statSync(lockPath).mtimeMs;
-			raw = readFileSync(lockPath, "utf8");
-		} catch (err) {
-			return err?.code === "ENOENT";
-		}
-		const owner = parseOwner(raw);
-		if (!isStale(owner, mtimeMs)) return false;
-
-		// Rename is atomic, so only one evicter wins a given file. Then check
-		// we moved the lock we judged stale, not a fresh one created between
-		// our read and the rename; if we did grab a fresh one, put it back
-		// without clobbering (link fails if the name is taken again).
-		const tomb = `${lockPath}.stale-${token()}`;
-		try {
-			renameSync(lockPath, tomb);
-		} catch {
-			return true;
-		}
-		let moved = null;
-		try {
-			moved = parseOwner(readFileSync(tomb, "utf8"));
-		} catch {
-			moved = null;
-		}
-		const same = owner ? moved?.token === owner.token : moved === null;
-		if (!same) {
-			try {
-				linkSync(tomb, lockPath);
-			} catch {
-				// Someone already holds the name again; nothing to restore.
-			}
-		}
-		try {
-			unlinkSync(tomb);
-		} catch {
-			// best effort
-		}
-		return same;
-	}
+	const lock = createFileLock({
+		lockPath,
+		timeoutMs: lockTimeoutMs,
+		staleMs: staleLockMs,
+		now,
+		sleep,
+		isAlive,
+		pid,
+		host,
+	});
 
 	async function acquire() {
 		if (degraded) return null;
 		try {
 			mkdirSync(dir, { recursive: true });
+			return await lock.acquire();
 		} catch (err) {
-			degrade(err);
-			return null;
-		}
-		const mine = token();
-		const started = now();
-		for (;;) {
-			let fd;
-			try {
-				fd = openSync(lockPath, "wx");
-			} catch (err) {
-				if (err?.code !== "EEXIST") {
-					degrade(err);
-					return null;
-				}
-			}
-			if (fd !== undefined) {
-				try {
-					writeSync(
-						fd,
-						JSON.stringify({ token: mine, pid, host, createdAt: now() }),
-					);
-					closeSync(fd);
-				} catch (err) {
-					try {
-						closeSync(fd);
-					} catch {}
-					try {
-						unlinkSync(lockPath);
-					} catch {}
-					degrade(err);
-					return null;
-				}
-				return () => release(mine);
-			}
-			if (tryEvictStale()) continue;
-			if (now() - started >= lockTimeoutMs) {
+			if (err instanceof LockTimeoutError) {
 				throw new PacingError(
 					`pacing: gave up after ${lockTimeoutMs}ms waiting for another ` +
 						`trawl process to finish pacing requests to ${origin}. ` +
 						"Retry, or pass --no-pacing to skip cross-run pacing.",
 				);
 			}
-			await sleep(LOCK_POLL_MS);
-		}
-	}
-
-	function release(mine) {
-		try {
-			const owner = parseOwner(readFileSync(lockPath, "utf8"));
-			// Only remove our own lock — if it was (wrongly) evicted and someone
-			// else holds the name now, leave theirs alone.
-			if (owner?.token === mine) unlinkSync(lockPath);
-		} catch {
-			// Already gone; nothing to release.
+			degrade(err);
+			return null;
 		}
 	}
 
@@ -369,17 +219,9 @@ export function createPacer({
 	}
 
 	function writeState(state) {
-		const tmp = `${statePath}.${token()}.tmp`;
 		try {
-			writeFileSync(
-				tmp,
-				JSON.stringify({ version: STATE_VERSION, ...state }),
-			);
-			renameSync(tmp, statePath);
+			writeJsonAtomic(statePath, { version: STATE_VERSION, ...state });
 		} catch (err) {
-			try {
-				unlinkSync(tmp);
-			} catch {}
 			degrade(err);
 		}
 	}
@@ -393,7 +235,15 @@ export function createPacer({
 	//   useStoredDelay when no fresh delay is given, honour the last one stored
 	//                  (default). `false` = minimum interval only, e.g. under
 	//                  --ignore-robots.
-	async function gate(start, { crawlDelayMs, useStoredDelay = true } = {}) {
+	//   admit          called after the wait, immediately before the attempt
+	//                  is recorded and `start()` runs; if it throws, nothing
+	//                  is recorded or sent and the error propagates. Used to
+	//                  re-check a cooldown another process may have recorded
+	//                  while this one waited (src/cooldown.mjs).
+	async function gate(
+		start,
+		{ crawlDelayMs, useStoredDelay = true, admit } = {},
+	) {
 		const releaseLock = await acquire();
 		let promise;
 		try {
@@ -426,6 +276,8 @@ export function createPacer({
 				await sleep(step);
 				slept += step;
 			}
+
+			admit?.();
 
 			const state = {
 				lastRequestAt: now(),

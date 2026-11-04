@@ -10,6 +10,7 @@ import {
 } from "./pacing.mjs";
 import {
 	AuthWallError,
+	CooldownError,
 	FORMATS,
 	normalizeClickSteps,
 	render,
@@ -85,6 +86,10 @@ Options:
                             still honored within a run). Pacing state lives
                             in $TRAWL_STATE_DIR, else
                             \${XDG_CACHE_HOME:-~/.cache}/trawl
+      --ignore-cooldown    Fetch even if the origin is cooling down after a
+                            429/503 (see exit code 4). Bypasses the refusal
+                            only: robots.txt and pacing still apply, and a
+                            new 429/503 is still recorded.
       --profile <dir>      Persistent browser profile dir (cookies/
                             localStorage survive across runs); also read from
                             $TRAWL_PROFILE_DIR. Populate one with "trawl login"
@@ -109,8 +114,15 @@ Examples:
   trawl login https://example.com --profile ~/.trawl/example
   trawl https://example.com --profile ~/.trawl/example
 
+Cooldowns: when a page answers 429 or 503, trawl records a per-origin
+cooldown in the same state directory — until its Retry-After (seconds or an
+HTTP-date), else 60s doubling per consecutive failure up to 1h. Until then,
+every trawl call to that origin is refused before any request is made. A 2xx
+page, or 24h without a failure, resets the backoff.
+
 Exit codes: 0 success, 22 page returned 4xx/5xx (as curl --fail), 3 page
 appears to be behind a login wall (see --no-auth-check / trawl login),
+4 origin is cooling down after a 429/503 (see --ignore-cooldown),
 1 usage or runtime error.
 `;
 
@@ -204,7 +216,8 @@ export function parseArgs(argv) {
 			arg === "--ignore-robots" ||
 			arg === "--no-readability" ||
 			arg === "--no-auth-check" ||
-			arg === "--no-pacing"
+			arg === "--no-pacing" ||
+			arg === "--ignore-cooldown"
 		) {
 			out[arg] = true;
 			continue;
@@ -311,6 +324,7 @@ export async function main(argv) {
 		profileDir: args["--profile"] ?? process.env.TRAWL_PROFILE_DIR,
 		authCheck: !args["--no-auth-check"],
 		pacing: !args["--no-pacing"],
+		ignoreCooldown: args["--ignore-cooldown"] === true,
 		...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
 		// pacingStateDir is left to render(), which reads $TRAWL_STATE_DIR.
 		// Only override when the flag was actually supplied, so render()'s own
@@ -443,6 +457,8 @@ if (isMainModule()) {
 		// A distinct exit code for the one failure mode a calling agent should
 		// react to differently: stop and ask a human to sign in, rather than
 		// retry or (worse) treat the login-wall body as real content.
-		process.exitCode = err instanceof AuthWallError ? 3 : 1;
+		// Likewise a cooldown refusal: wait until the stated time, don't retry.
+		process.exitCode =
+			err instanceof AuthWallError ? 3 : err instanceof CooldownError ? 4 : 1;
 	}
 }

@@ -6,6 +6,12 @@ import { chromium } from "playwright-core";
 import TurndownService from "turndown";
 import { resolveExecutablePath } from "./browser.mjs";
 import {
+	COOLDOWN_STATUSES,
+	CooldownError,
+	cooldownOrigin,
+	createCooldownStore,
+} from "./cooldown.mjs";
+import {
 	DEFAULT_MIN_INTERVAL_MS,
 	createPacer,
 	defaultStateDir,
@@ -18,6 +24,8 @@ import {
 	crawlDelayMs,
 	robotsDenialMessage,
 } from "./robots.mjs";
+
+export { CooldownError };
 
 export const FORMATS = ["text", "html", "links", "title", "markdown"];
 
@@ -451,6 +459,28 @@ export async function render(url, options = {}) {
 
 	const userAgent = opts.userAgent ?? (await defaultUserAgent());
 
+	// One state directory for everything trawl remembers between runs:
+	// `stateDir`, else the older pacing-only `pacingStateDir`, else
+	// $TRAWL_STATE_DIR / ${XDG_CACHE_HOME:-~/.cache}/trawl.
+	const stateDir =
+		opts.stateDir ?? opts.pacingStateDir ?? defaultStateDir();
+
+	// Per-origin cooldowns (src/cooldown.mjs): a main-frame 429/503 seen by
+	// any earlier run refuses this one with a CooldownError until it expires —
+	// checked here, before robots.txt or any browser work, and again right
+	// before each explicit page request. `ignoreCooldown` skips the refusal
+	// only; responses are still recorded. Non-http(s) URLs never touch it.
+	// Only the requested origin is admitted: a redirect to another origin is
+	// not intercepted, though a 429/503 there is recorded against it.
+	const origin = pacingOrigin(url);
+	const cooldown = origin ? createCooldownStore({ stateDir }) : null;
+	const admit = (checkOpts) => {
+		if (!cooldown) return;
+		if (opts.ignoreCooldown) cooldown.read(origin);
+		else cooldown.check(origin, checkOpts);
+	};
+	admit();
+
 	// Cross-run pacing (src/pacing.mjs): every explicit request this call
 	// makes to an http(s) origin — the robots.txt fetch, the page navigation,
 	// and the networkidle-fallback navigation — waits its turn behind the last
@@ -458,12 +488,11 @@ export async function render(url, options = {}) {
 	// and redirects are not gated. Non-http(s) URLs never touch the state dir.
 	// `pacing: false` turns this off and keeps only the in-run Crawl-delay
 	// sleep below.
-	const origin = pacingOrigin(url);
 	const pacer =
 		opts.pacing !== false && origin
 			? createPacer({
 					origin,
-					stateDir: opts.pacingStateDir ?? defaultStateDir(),
+					stateDir: opts.pacingStateDir ?? stateDir,
 					minIntervalMs,
 				})
 			: null;
@@ -493,7 +522,11 @@ export async function render(url, options = {}) {
 			// Paced on the Crawl-delay stored by an earlier run (if any), since
 			// this run hasn't learned the current policy yet. A failed fetch
 			// records the attempt but keeps the stored delay.
-			...(pacer && { gate: (start) => pacer.gate(start) }),
+			// The cooldown is re-checked after the pacing wait, in case another
+			// process recorded one meanwhile.
+			...(pacer && {
+				gate: (start) => pacer.gate(start, { admit: () => admit() }),
+			}),
 		});
 		if (!verdict.allowed) throw new Error(robotsDenialMessage(verdict));
 		navCrawlDelayMs = crawlDelayMs(verdict.crawlDelay);
@@ -509,9 +542,15 @@ export async function render(url, options = {}) {
 		navCrawlDelayMs !== undefined
 			? { crawlDelayMs: navCrawlDelayMs }
 			: { useStoredDelay: !opts.ignoreRobots };
-	const navigate = (page, waitUntil) => {
+	// Each explicit page request re-checks the cooldown last thing before it
+	// is sent (after any pacing wait). For the networkidle-fallback retry this
+	// is what stops a retry straight into the 429/503 the first attempt saw.
+	const navigate = async (page, waitUntil, checkOpts) => {
 		const start = () => page.goto(url, { waitUntil, timeout: opts.timeout });
-		return pacer ? pacer.gate(start, navPolicy) : start();
+		const gateAdmit = () => admit(checkOpts);
+		if (pacer) return pacer.gate(start, { ...navPolicy, admit: gateAdmit });
+		gateAdmit();
+		return start();
 	};
 
 	const executablePath = resolveExecutablePath(opts.executablePath);
@@ -555,6 +594,34 @@ export async function render(url, options = {}) {
 	// Set immediately before the successful return, so the teardown can tell
 	// "nothing went wrong" from "an error is already propagating".
 	let ok = false;
+	let page;
+	// Records every main-frame navigation response's 429/503 (or 2xx) as it
+	// arrives — before goto() resolves, so a navigation that then times out
+	// waiting for networkidle, or a run that fails later on, still leaves the
+	// cooldown behind. Iframes and subresources are ignored, and robots.txt
+	// is fetched outside the browser, so neither ever lands here.
+	const seenResponses = new WeakSet();
+	const onResponse = (response) => {
+		try {
+			if (!cooldown || seenResponses.has(response)) return;
+			seenResponses.add(response);
+			const request = response.request();
+			if (!request.isNavigationRequest()) return;
+			if (request.frame() !== page.mainFrame()) return;
+			const status = response.status();
+			const at = cooldownOrigin(response.url());
+			if (COOLDOWN_STATUSES.has(status)) {
+				cooldown.recordFailure(at, {
+					status,
+					retryAfter: response.headers()["retry-after"],
+				});
+			} else if (status >= 200 && status < 300) {
+				cooldown.recordSuccess(at);
+			}
+		} catch {
+			// Advisory bookkeeping: it must never take the render down.
+		}
+	};
 	try {
 		if (opts.profileDir) {
 			mkdirSync(opts.profileDir, { recursive: true });
@@ -567,7 +634,8 @@ export async function render(url, options = {}) {
 			browser = await chromium.launch({ executablePath, headless: true });
 			context = await browser.newContext(contextOptions);
 		}
-		const page = await context.newPage();
+		page = await context.newPage();
+		page.on("response", onResponse);
 
 		// `networkidle` never fires on a page that deliberately keeps a socket
 		// open — a websocket, an SSE stream, a long-poll — and that describes a
@@ -587,7 +655,9 @@ export async function render(url, options = {}) {
 			if (opts.waitUntil !== "networkidle" || !/Timeout .*exceeded/.test(err.message)) {
 				throw err;
 			}
-			response = await navigate(page, "domcontentloaded");
+			response = await navigate(page, "domcontentloaded", {
+				retrySuppressed: true,
+			});
 			waitUntilFallback = { from: "networkidle", to: "domcontentloaded" };
 		}
 
@@ -663,6 +733,10 @@ export async function render(url, options = {}) {
 			waitUntilFallback,
 		};
 	} finally {
+		// Land the cooldown writes before anything else can fail: a 429/503
+		// this run saw must be on disk for the next one, whatever happened.
+		page?.off("response", onResponse);
+		await cooldown?.flush();
 		// A recorded HAR is only flushed to disk when the *context* closes, so
 		// close it explicitly and first — `browser.close()` alone would lose the
 		// trace of exactly the runs worth tracing (a goto that timed out, a host

@@ -51,8 +51,9 @@ Options:
       --click <css>        Click the first match after load, before
                             extracting. Repeatable; runs in the order given.
                             Each waits until visible (up to --timeout), then
-                            --settle. Fails (exit 1) if it never appears,
-                            or if the click would load another page.
+                            --settle (at least 250ms). Fails (exit 1) if it
+                            never appears, or if a click would load another
+                            page.
       --then-wait <css>    After the preceding --click, block until this
                             selector appears
       --settle <ms>        Extra pause after load                (default: 0)

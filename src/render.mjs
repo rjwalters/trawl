@@ -93,6 +93,14 @@ export function normalizeClickSteps(click) {
 	});
 }
 
+// The least a click step pauses after its click (and `waitFor`), whatever
+// `settle` says. Click handlers often navigate on a short timer or after a
+// microtask hop; this floor gives such a navigation time to reach the route
+// below while its step is still the current one, so it fails the run naming
+// the right step instead of racing the end of the run. Same idea as the 1s
+// floor on the networkidle fallback.
+const CLICK_SETTLE_FLOOR_MS = 250;
+
 const isTimeout = (err) =>
 	err?.name === "TimeoutError" || /Timeout .*exceeded/.test(err?.message ?? "");
 
@@ -100,8 +108,18 @@ const isTimeout = (err) =>
 // A click only presses an element already on the page: a click that tries to
 // load a different top-level document (a link, a form submit, a popup or
 // `target=_blank`, a script that sets `location` a moment later) is aborted
-// before the request leaves and fails the step, so a run still makes exactly
+// before the request leaves and fails the run, so a run still makes exactly
 // one page request and every request trawl makes stays paced.
+//
+// The route stays on the context for the rest of the run, through
+// extraction and the screenshot, until the context closes: a handler can
+// navigate any number of milliseconds after its click, and a guard that ended
+// with the clicks would let that request out and hand back the other page.
+// Returns `checkNavigation`, which the caller runs once more right before it
+// returns results, so a navigation stopped at any point after a click fails
+// the run. (Routing turns Playwright's HTTP cache off for the requests the
+// page makes after this point; the document and its first subresources have
+// already loaded, so that costs close to nothing.)
 async function runClickSteps(page, context, steps, { timeout, settle }) {
 	let current = 0;
 	// The first top-level navigation a click set off: its URL and the step
@@ -139,55 +157,50 @@ async function runClickSteps(page, context, steps, { timeout, settle }) {
 	};
 
 	await context.route("**/*", handler);
-	try {
-		const ms = timeout > 0 ? `${timeout}ms` : "the timeout";
-		for (let i = 0; i < steps.length; i++) {
-			const { selector, waitFor } = steps[i];
-			const step = i + 1;
-			current = step;
-			const label = `click step ${step} of ${steps.length} ("${selector}")`;
-			// The first match in document order, so a selector that matches
-			// several buttons presses one instead of tripping strict mode.
-			const target = page.locator(selector).first();
+	const ms = timeout > 0 ? `${timeout}ms` : "the timeout";
+	for (let i = 0; i < steps.length; i++) {
+		const { selector, waitFor } = steps[i];
+		const step = i + 1;
+		current = step;
+		const label = `click step ${step} of ${steps.length} ("${selector}")`;
+		// The first match in document order, so a selector that matches
+		// several buttons presses one instead of tripping strict mode.
+		const target = page.locator(selector).first();
+		try {
+			await target.waitFor({ state: "visible", timeout });
+			await target.click({ timeout });
+		} catch (err) {
+			if (!isTimeout(err)) throw err;
+			throw new ClickError(
+				`${label}: no visible, clickable element matched within ${ms}`,
+				{ step, selector, waitFor },
+			);
+		}
+		checkNavigation();
+		if (waitFor) {
 			try {
-				await target.waitFor({ state: "visible", timeout });
-				await target.click({ timeout });
+				await page
+					.locator(waitFor)
+					.first()
+					.waitFor({ state: "visible", timeout });
 			} catch (err) {
+				// A navigation stopped while waiting is the better explanation
+				// for a `waitFor` that never appeared.
+				checkNavigation();
 				if (!isTimeout(err)) throw err;
 				throw new ClickError(
-					`${label}: no visible, clickable element matched within ${ms}`,
+					`${label}: "${waitFor}" did not appear within ${ms} after the click`,
 					{ step, selector, waitFor },
 				);
 			}
-			checkNavigation();
-			if (waitFor) {
-				try {
-					await page
-						.locator(waitFor)
-						.first()
-						.waitFor({ state: "visible", timeout });
-				} catch (err) {
-					// A navigation stopped while waiting is the better explanation
-					// for a `waitFor` that never appeared.
-					checkNavigation();
-					if (!isTimeout(err)) throw err;
-					throw new ClickError(
-						`${label}: "${waitFor}" did not appear within ${ms} after the click`,
-						{ step, selector, waitFor },
-					);
-				}
-			}
-			if (settle > 0) await page.waitForTimeout(settle);
-			// Again after the wait and settle: a handler that navigates a
-			// moment after the click must fail the run, never pass silently.
-			checkNavigation();
 		}
+		await page.waitForTimeout(Math.max(settle, CLICK_SETTLE_FLOOR_MS));
+		// Again after the wait and settle: a handler that navigates a
+		// moment after the click must fail the run, never pass silently.
 		checkNavigation();
-	} finally {
-		// Scope the blocking to the clicks; routing also disables Playwright's
-		// HTTP cache, which the rest of the render should keep.
-		await context.unroute("**/*", handler);
 	}
+	checkNavigation();
+	return checkNavigation;
 }
 
 // Heuristics only — deliberately biased toward false positives over silently
@@ -612,8 +625,9 @@ export async function render(url, options = {}) {
 		// Click steps run after load, `waitForSelector` and `settle`, in the
 		// order given; each waits for its element to be visible, clicks it,
 		// waits for its own `waitFor` if any, then `settle` again.
+		let checkClickNavigation = null;
 		if (clickSteps.length > 0) {
-			await runClickSteps(page, context, clickSteps, {
+			checkClickNavigation = await runClickSteps(page, context, clickSteps, {
 				timeout: opts.timeout,
 				settle,
 			});
@@ -633,6 +647,12 @@ export async function render(url, options = {}) {
 			});
 			screenshot = opts.screenshot;
 		}
+
+		// Last word on the click guard: a navigation a click set off late —
+		// during the auth probe, extraction or the screenshot — was stopped by
+		// the route (the page above is still the original), but the run must
+		// still fail rather than report success.
+		checkClickNavigation?.();
 
 		ok = true;
 		return {

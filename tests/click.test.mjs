@@ -38,12 +38,20 @@ const PAGE = `<!doctype html>
   <a id="tab" href="/other" target="_blank">New tab</a>
   <button id="popup" onclick="window.open('/other')">Popup</button>
   <button id="delayed">Later</button>
+  <button id="soon">Soon</button>
+  <button id="late">Late</button>
   <section id="panel" hidden></section>
 </main>
 <script>
   const panel = document.getElementById("panel");
   document.getElementById("delayed").addEventListener("click", () => {
     setTimeout(() => { location.href = "/other"; }, 150);
+  });
+  document.getElementById("late").addEventListener("click", () => {
+    setTimeout(() => { location.href = "/other"; }, 400);
+  });
+  document.getElementById("soon").addEventListener("click", () => {
+    setTimeout(() => { location.href = "/other"; }, 10);
   });
   document.getElementById("open").addEventListener("click", () => {
     panel.hidden = false;
@@ -82,6 +90,18 @@ async function serve() {
 }
 
 const fast = { minIntervalMs: 0 };
+
+// An absence check has to wait: a request the browser let out could still be
+// in flight when render() settles. Poll the server log for a bounded window
+// and fail the moment `path` shows up.
+async function assertNeverRequested(s, path, windowMs = 400) {
+	const deadline = Date.now() + windowMs;
+	while (Date.now() < deadline) {
+		assert.ok(!s.hits.includes(path), `server saw ${s.hits.join(", ")}`);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	assert.ok(!s.hits.includes(path), `server saw ${s.hits.join(", ")}`);
+}
 
 // --- parsing ---------------------------------------------------------------
 
@@ -205,7 +225,7 @@ test("a click that would load another page is refused, and never requested", opt
 			render(s.url, { ...fast, timeout: 2000, click: ["#away"] }),
 			(err) => err instanceof ClickError && /tried to navigate to .*\/other/.test(err.message),
 		);
-		assert.ok(!s.hits.includes("/other"), `server saw ${s.hits.join(", ")}`);
+		await assertNeverRequested(s, "/other");
 	} finally {
 		await s.close();
 	}
@@ -213,9 +233,13 @@ test("a click that would load another page is refused, and never requested", opt
 
 // Each of these would load /other as a new top-level page. The assertion
 // that matters is the server log: the request must never leave the browser.
+// The popup and 10ms cases run at the default settle of 0, where the
+// navigation reaches the browser after the click loop has ended — the guard
+// has to last the whole run, not just the clicks.
 for (const [name, click, extra] of [
-	["a target=_blank link", "#tab", {}],
-	["a window.open() popup", "#popup", {}],
+	["a target=_blank link (settle 0)", "#tab", { settle: 0 }],
+	["a window.open() popup (settle 0)", "#popup", { settle: 0 }],
+	["a navigation 10ms after the click (default settle)", "#soon", {}],
 	["a navigation 150ms after the click (settle 500)", "#delayed", { settle: 500 }],
 ]) {
 	test(`${name} is refused, and never requested`, opts, async () => {
@@ -230,7 +254,7 @@ for (const [name, click, extra] of [
 					return true;
 				},
 			);
-			assert.ok(!s.hits.includes("/other"), `server saw ${s.hits.join(", ")}`);
+			await assertNeverRequested(s, "/other");
 		} finally {
 			await s.close();
 		}
@@ -249,7 +273,30 @@ test("a late navigation is pinned to the step that set it off", opts, async () =
 			}),
 			(err) => err instanceof ClickError && err.step === 1,
 		);
-		assert.ok(!s.hits.includes("/other"));
+		await assertNeverRequested(s, "/other");
+	} finally {
+		await s.close();
+	}
+});
+
+// Past the per-click floor, the navigation may land during extraction, after
+// the final check, or after render() returns. Whichever: the route is still
+// on, so it never leaves the browser, and a resolved result is the original
+// page, never the one the click was heading for.
+test("a navigation late in the run never returns the other page", opts, async () => {
+	const s = await serve();
+	try {
+		let result = null;
+		try {
+			result = await render(s.url, { ...fast, timeout: 2000, click: ["#late"], selector: "#open" });
+		} catch (err) {
+			assert.ok(err instanceof ClickError, `got ${err}`);
+		}
+		if (result) {
+			assert.equal(result.body, "Show transcript");
+			assert.equal(result.url, s.url);
+		}
+		await assertNeverRequested(s, "/other", 600);
 	} finally {
 		await s.close();
 	}

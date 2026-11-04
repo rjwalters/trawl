@@ -43,8 +43,9 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --click <css>        Click the first match after load, before
                             extracting. Repeatable; runs in the order given.
                             Each waits until visible (up to --timeout), then
-                            --settle. Fails (exit 1) if it never appears,
-                            or if the click would load another page.
+                            --settle (at least 250ms). Fails (exit 1) if it
+                            never appears, or if a click would load another
+                            page.
       --then-wait <css>    After the preceding --click, block until this
                             selector appears
       --settle <ms>        Extra pause after load                (default: 0)
@@ -99,7 +100,7 @@ Some content only exists after a person presses something: a "show more", an
 expandable details panel, a transcript pane. `--click <css>` presses it.
 After the page loads (and any `--wait-for` / `--settle`), each `--click` waits
 for the first element matching its selector to become visible, clicks it,
-then pauses for `--settle`. Repeat the flag to click several things; they run
+then pauses for `--settle` (at least 250 ms after each click). Repeat the flag to click several things; they run
 in the order given. Extraction (`-s`, `-f`) then reads the page as usual:
 
 ```sh
@@ -122,10 +123,12 @@ different page — a link, a form submit, a popup or `target=_blank` link, a
 script that sets `location` a moment later — is stopped before the request
 goes out and fails the run, so a `trawl` run still fetches exactly one page,
 and every request it makes stays [paced](#etiquette). Fetch that other URL
-directly instead. The guard covers each click and its `--then-wait` and
-`--settle`; a page that navigates later than that is outside it, so give a
-page like that a `--settle`. Scripts on the page can still make their own
-background requests in response to a click, as they would for a person.
+directly instead. Once a click has happened the guard stays on for the whole
+run, through extraction and `--screenshot`, so a navigation can never swap
+in the other page however late it starts; the 250 ms pause after each click
+is there so a click handler's short-timer navigation is caught and reported
+against the step that caused it. Scripts on the page can still make their
+own background requests in response to a click, as they would for a person.
 
 ### Markdown
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
+`trawl` can now press buttons before it reads a page (`--click`), backs off an
+origin that answers 429/503, and paces requests to one origin across runs. It
+also finds the browser that Playwright's own installer downloads on x64 Linux,
+and `trawl login` no longer needs a profile path chosen up front.
+
 ### Added
 
 - **Click steps.** `--click <css>` (repeatable, run in the order given)
@@ -55,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between its `robots.txt` request and the page request (browser startup
   usually absorbs most of it). (#38)
 
+- `trawl login <origin>` defaults to a shared `~/.trawl/profile` (created on
+  first use, announced on stderr) when neither `--profile` nor
+  `$TRAWL_PROFILE_DIR` is set. Explicit values still win. Plain `trawl <url>`
+  fetches stay ephemeral. (#25)
+- `--help` and the README document `--wait-until domcontentloaded --settle
+  15000` as the workaround for anti-bot interstitials that hold `networkidle`
+  open. (#25)
+
 ### Changed
 
 - **Behavior change:** an unreachable `robots.txt` is now a full disallow, per
@@ -75,21 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `robots.txt` request is built from the page's origin, so credentials in
   a `user:pass@host` URL are never sent to (or reported for) `robots.txt`;
   Node's `fetch` would otherwise reject such a URL, which is now a denial. (#37)
-
-## [0.3.0] - 2026-09-30
-
-`trawl` now finds the browser that Playwright's own installer downloads on x64
-Linux, and `trawl login` no longer needs a profile path chosen up front.
-
-### Added
-
-- `trawl login <origin>` defaults to a shared `~/.trawl/profile` (created on
-  first use, announced on stderr) when neither `--profile` nor
-  `$TRAWL_PROFILE_DIR` is set. Explicit values still win. Plain `trawl <url>`
-  fetches stay ephemeral. (#25)
-- `--help` and the README document `--wait-until domcontentloaded --settle
-  15000` as the workaround for anti-bot interstitials that hold `networkidle`
-  open. (#25)
 
 ### Fixed
 
@@ -186,5 +186,7 @@ instead of an empty `<div id="root">`.
   The installed command is `trawl` either way — the scope affects the package
   name, not the binary.
 
+[Unreleased]: https://github.com/rjwalters/trawl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rjwalters/trawl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rjwalters/trawl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rjwalters/trawl/releases/tag/v0.1.0

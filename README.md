@@ -83,6 +83,8 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
                             --profile/$TRAWL_PROFILE_DIR here too.
       --no-auth-check      Skip login-wall detection (see "Auth walls" below)
   -S, --show-status        Print HTTP status + final URL to stderr
+  -h, --help               Show this help
+  -v, --version            Show version
 ```
 
 ```sh

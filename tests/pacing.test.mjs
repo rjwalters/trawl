@@ -497,8 +497,11 @@ await p.gate(async () => {
 `;
 
 // Spawn one child per env, release them all at once, and resolve with each
-// child's report in the same order.
-async function runChildren(envs) {
+// child's report in the same order. Every child is killed if the batch has not
+// finished within `deadlineMs`, or as soon as any child fails, so a stuck or
+// crashed child fails the test instead of leaving its siblings waiting on stdin
+// and the test file hanging.
+async function runChildren(envs, { deadlineMs = 60_000 } = {}) {
 	const children = envs.map((env) => {
 		const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD], {
 			env: { ...process.env, PACING_URL, ...env },
@@ -527,9 +530,23 @@ async function runChildren(envs) {
 		done.catch(() => {});
 		return { child, up: Promise.race([up, done]), done };
 	});
-	await Promise.all(children.map((c) => c.up));
-	for (const { child } of children) child.stdin.end("go\n");
-	return Promise.all(children.map((c) => c.done));
+	let timer;
+	const deadline = new Promise((_, reject) => {
+		timer = setTimeout(
+			() => reject(new Error(`children still running after ${deadlineMs}ms`)),
+			deadlineMs,
+		);
+	});
+	try {
+		await Promise.race([Promise.all(children.map((c) => c.up)), deadline]);
+		for (const { child } of children) child.stdin.end("go\n");
+		return await Promise.race([Promise.all(children.map((c) => c.done)), deadline]);
+	} finally {
+		clearTimeout(timer);
+		for (const { child } of children) {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		}
+	}
 }
 
 test("two independent processes are serialized with the required spacing", async () => {

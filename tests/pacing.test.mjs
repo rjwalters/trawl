@@ -497,12 +497,13 @@ await p.gate(async () => {
 `;
 
 // Spawn one child per env, release them all at once, and resolve with each
-// child's report in the same order. Every child is killed if the batch has not
+// child's report in the same order. `beforeGo` runs once every child is up and
+// before any is released. Every child is killed if the batch has not
 // finished within `deadlineMs`, or as soon as any child fails, so a stuck or
 // crashed child fails the test instead of leaving its siblings waiting on stdin
 // and the test file hanging. The deadline only guards against a hang: on a
 // starved machine a child can take over a minute just to start.
-async function runChildren(envs, { deadlineMs = 5 * 60_000 } = {}) {
+async function runChildren(envs, { deadlineMs = 5 * 60_000, beforeGo } = {}) {
 	const children = envs.map((env) => {
 		const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD], {
 			env: { ...process.env, PACING_URL, ...env },
@@ -540,6 +541,7 @@ async function runChildren(envs, { deadlineMs = 5 * 60_000 } = {}) {
 	});
 	try {
 		await Promise.race([Promise.all(children.map((c) => c.up)), deadline]);
+		await beforeGo?.();
 		for (const { child } of children) child.stdin.end("go\n");
 		return await Promise.race([Promise.all(children.map((c) => c.done)), deadline]);
 	} finally {
@@ -572,16 +574,32 @@ test("two independent processes are serialized with the required spacing", async
 
 test("an independent process on another origin does not wait on a primed one", async () => {
 	const dir = stateDir();
-	const base = { STATE_DIR: dir, INTERVAL: "3000" };
-	// Prime one origin: a second request to it would have to wait ~3s.
-	const [primed] = await runChildren([{ ...base, ORIGIN: "https://one.test" }]);
-	const [other, same] = await runChildren([
-		{ ...base, ORIGIN: "https://two.test" },
-		{ ...base, ORIGIN: "https://one.test" },
-	]);
-	// Measured from when each child was ready, so a slow spawn is not a delay.
-	assert.ok(other.stamp - other.ready < 1000, `other origin delayed ${other.stamp - other.ready}ms`);
-	assert.ok(same.stamp - primed.stamp >= 3000, `same origin was not paced (${same.stamp - primed.stamp}ms)`);
+	const INTERVAL = 6000;
+	const base = { STATE_DIR: dir, INTERVAL: String(INTERVAL) };
+	// Prime one origin once both children are up, just before releasing them,
+	// so a second request to it really does owe ~6s however slow the spawn was.
+	let primed;
+	const [other, same] = await runChildren(
+		[
+			{ ...base, ORIGIN: "https://two.test" },
+			{ ...base, ORIGIN: "https://one.test" },
+		],
+		{
+			beforeGo: async () => {
+				const p = createPacer({ origin: "https://one.test", stateDir: dir, minIntervalMs: 0, warn: () => {} });
+				await p.gate(async () => {
+					primed = recordedStamp(p.statePath);
+				});
+			},
+		},
+	);
+	// A pacer that let origins share a turn would hold the other origin for
+	// most of the interval; half of it is room for a slow, uncontended gate.
+	assert.ok(
+		other.stamp - other.ready < INTERVAL / 2,
+		`other origin delayed ${other.stamp - other.ready}ms`,
+	);
+	assert.ok(same.stamp - primed >= INTERVAL, `same origin was not paced (${same.stamp - primed}ms)`);
 });
 
 test("a lock orphaned by a SIGKILLed process does not strand the origin", async () => {

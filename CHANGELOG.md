@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run still fetches one page. Library: `render(url, { click: ["#a", {
   selector: "#b", waitFor: "#c" }] })`, rejecting with a `ClickError`. The
   MCP server stays click-free on purpose. (#56)
+- **Per-origin cooldown after 429/503.** When a page navigation answers
+  `429` or `503`, `trawl` still returns the page (exit 22) and records a
+  cooldown for the origin: until its `Retry-After` (delta-seconds or
+  HTTP-date), else 60 s doubling per consecutive failure, capped at 1 h.
+  Until it ends, a later call to that origin is refused before `robots.txt`
+  or any browser launch, with **exit code 4**, empty stdout and a message
+  naming the origin, UTC expiry and time left; library `render()` rejects
+  with an exported `CooldownError`. A 2xx page or 24 h without a failure
+  resets the backoff. Only top-level navigation responses count, never
+  subresources, iframes or `robots.txt`; a `networkidle`-fallback retry into
+  a fresh cooldown is skipped. `--ignore-cooldown` (library
+  `ignoreCooldown: true`) overrides the refusal for one call but still
+  records new failures. State lives beside the pacing state under
+  `cooldown/`, with a per-origin lock so concurrent runs never shorten a
+  cooldown or let an older success erase a newer failure; an unusable state
+  directory warns and keeps cooldowns in-run only. The new library option
+  `stateDir` sets the directory for both (`pacingStateDir` still works).
+  (#39)
 - **Cross-run request pacing.** Requests to an origin are now spaced across
   separate `trawl` invocations (and concurrent ones), not just within one run:
   before the `robots.txt` request, the page navigation, and the

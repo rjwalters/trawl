@@ -69,6 +69,10 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
                             still honored within a run). Pacing state lives
                             in $TRAWL_STATE_DIR, else
                             ${XDG_CACHE_HOME:-~/.cache}/trawl
+      --ignore-cooldown    Fetch even if the origin is cooling down after a
+                            429/503 (see exit code 4). Bypasses the refusal
+                            only: robots.txt and pacing still apply, and a
+                            new 429/503 is still recorded.
       --profile <dir>      Persistent browser profile (cookies/localStorage
                             survive across runs); also $TRAWL_PROFILE_DIR.
                             Populate one with "trawl login" (which defaults
@@ -191,8 +195,10 @@ captures the whole scroll height instead of just the viewport, and
 `--viewport <WxH>` sets the window size the page is rendered at.
 
 Exit codes: `0` success, `22` page returned 4xx/5xx (as `curl --fail`), `3`
-page appears to be behind a login wall (see "Auth walls" below), `1` usage or
-runtime error.
+page appears to be behind a login wall (see "Auth walls" below), `4` the
+origin is cooling down after a 429/503 and nothing was requested (see
+[Etiquette](#etiquette); `--ignore-cooldown` overrides), `1` usage or runtime
+error.
 
 ### Auth walls & signed-in sessions
 
@@ -287,8 +293,13 @@ const { body } = await render("https://example.com/video", {
 `render()` paces its `http(s)` requests across calls and processes the same
 way the CLI does (see [Etiquette](#etiquette)): `{ minIntervalMs }` sets the
 per-origin floor (default 1000, 0–60000), `{ pacing: false }` turns
-cross-run pacing off, and `{ pacingStateDir }` overrides where the state is
-kept (default `$TRAWL_STATE_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/trawl`).
+cross-run pacing off, and `{ stateDir }` overrides where the state is
+kept (default `$TRAWL_STATE_DIR`, else `${XDG_CACHE_HOME:-~/.cache}/trawl`;
+the older `{ pacingStateDir }` still moves the pacing state alone). A request
+to an origin that is cooling down after a 429/503 rejects with a
+`CooldownError` (exported; `code: "TRAWL_COOLDOWN"`, with `origin`, `until`
+in epoch ms, and `remainingMs`) before any network or browser work;
+`{ ignoreCooldown: true }` overrides it for that call.
 
 ### As an MCP server
 
@@ -397,6 +408,45 @@ default rather than asking you to promise you will.
     `robots.txt` request and the page request within the one run.
     `--ignore-robots` skips `robots.txt` and its `Crawl-delay`, but not the
     `--min-interval` floor.
+- **A 429 or 503 puts the origin on a cooldown, across runs.** When the page
+  navigation itself answers `429 Too Many Requests` or `503 Service
+  Unavailable`, `trawl` still returns that page (exit `22`), and records
+  that the origin asked to be left alone. Until the cooldown ends, every
+  later `trawl` call to that origin fails fast with **exit code 4** and a
+  message naming the origin, the UTC expiry, and the time left — before the
+  `robots.txt` request, before any browser starts, with nothing on stdout.
+  - *How long:* the response's `Retry-After`, as delta-seconds or an
+    HTTP-date, honored as sent (even beyond an hour); `0` or a past date
+    means no wait. Without a usable `Retry-After`, 60 s doubling per
+    consecutive 429/503 from that origin — 60 s, 2 min, 4 min, … — capped
+    at 1 h. The failure streak outlives the cooldown, so a site that keeps
+    failing keeps backing off; a 2xx page response, or 24 h with no
+    failure, resets it. Other statuses and network errors leave it alone.
+  - *What counts:* only top-level page navigation responses (including the
+    `domcontentloaded` retry after a `networkidle` timeout, which is itself
+    skipped when the first attempt just put the origin on a cooldown).
+    Subresources, iframes, the `robots.txt` request (see above), and
+    `trawl login` never record a cooldown. A 429/503 at the end of a
+    redirect is recorded against the origin that sent it; the check before
+    a run looks only at the origin you asked for, so a redirect into a
+    cooling-down origin is not stopped in advance.
+  - *Where state lives:* beside the pacing state, in
+    `${XDG_CACHE_HOME:-~/.cache}/trawl/cooldown/` (or `$TRAWL_STATE_DIR`,
+    library `stateDir`) — one JSON file per origin, named by a hash of it,
+    holding only the expiry, the failure count, the last failure's time and
+    status, and a revision counter. Updates take a short per-origin lock, so
+    concurrent runs never shorten each other's cooldown, and an older run's
+    success cannot erase a newer run's failure. Requests already in flight
+    when another run records a cooldown are not recalled. A missing or
+    corrupt file means "no cooldown"; an unusable directory, or a lock busy
+    for more than 5s, warns on stderr and keeps cooldowns for the current
+    run only.
+  - *Overriding it:* `--ignore-cooldown` (library: `ignoreCooldown: true`)
+    sends the request anyway for that one call. It does not delete the
+    record, a new 429/503 is still recorded, and `robots.txt` and pacing
+    still apply; `--ignore-robots` and `--no-pacing` do not skip the
+    cooldown either. To forget every cooldown, delete the `cooldown/`
+    directory.
 - **It identifies itself**: the default `User-Agent` is
   `trawl/<version> (+https://github.com/rjwalters/trawl)`, so an operator
   reading their logs can see what hit them and block it if they want.

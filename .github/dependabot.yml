@@ -14,7 +14,7 @@ updates:
     cooldown:
       default-days: 14
     labels:
-      - "tier:maintenance"   # org policy names `dependencies`, which doesn't exist here
+      - "dependencies"
     commit-message:
       prefix: "chore(ci)"
     groups:
@@ -36,7 +36,7 @@ updates:
     cooldown:
       default-days: 14
     labels:
-      - "tier:maintenance"
+      - "dependencies"
     commit-message:
       prefix: "chore(deps)"
     open-pull-requests-limit: 5

@@ -118,10 +118,13 @@ clickable element matched within 30000ms`) rather than handing back a page
 that silently lacks what you asked for.
 
 A click only presses an element already on the page. One that would load a
-different page — a link, a form submit, a popup — is stopped before the
-request goes out and fails the run, so a `trawl` run still fetches exactly
-one page, and every request it makes stays [paced](#etiquette). Fetch that
-other URL directly instead. Scripts on the page can still make their own
+different page — a link, a form submit, a popup or `target=_blank` link, a
+script that sets `location` a moment later — is stopped before the request
+goes out and fails the run, so a `trawl` run still fetches exactly one page,
+and every request it makes stays [paced](#etiquette). Fetch that other URL
+directly instead. The guard covers each click and its `--then-wait` and
+`--settle`; a page that navigates later than that is outside it, so give a
+page like that a `--settle`. Scripts on the page can still make their own
 background requests in response to a click, as they would for a person.
 
 ### Markdown

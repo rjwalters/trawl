@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `--click` blocks until that selector appears. Each click waits for its
   element up to `--timeout`, then `--settle`; a selector that never appears
   fails the run (exit 1) naming the step, and a click that would load another
-  page (a link, a form submit, a popup) is stopped before the request and
-  fails the run, so one run still fetches one page. Library: `render(url, {
+  page (a link, a form submit, a popup or `target=_blank` link, a delayed
+  `location` change during the click's wait or `--settle`) is stopped before
+  the request and fails the run, so one run still fetches one page. Library: `render(url, {
   click: ["#a", { selector: "#b", waitFor: "#c" }] })`, rejecting with a
   `ClickError`. The MCP server stays click-free on purpose. (#56)
 - **Cross-run request pacing.** Requests to an origin are now spaced across

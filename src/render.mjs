@@ -98,68 +98,95 @@ const isTimeout = (err) =>
 
 // Press each step's element in order, on the page that is already loaded.
 // A click only presses an element already on the page: a click that tries to
-// load a different top-level document (a link, a form submit, a popup) is
-// aborted and reported, so a run still makes exactly one page request and
-// every request trawl makes stays paced.
+// load a different top-level document (a link, a form submit, a popup or
+// `target=_blank`, a script that sets `location` a moment later) is aborted
+// before the request leaves and fails the step, so a run still makes exactly
+// one page request and every request trawl makes stays paced.
 async function runClickSteps(page, context, steps, { timeout, settle }) {
-	let blockedNavigation = null;
-	await context.route("**/*", (route) => {
+	let current = 0;
+	// The first top-level navigation a click set off: its URL and the step
+	// that was running when it was stopped.
+	let blocked = null;
+	const handler = (route) => {
 		const request = route.request();
 		let topLevel = false;
-		try {
-			topLevel =
-				request.isNavigationRequest() && request.frame().parentFrame() === null;
-		} catch {
-			// Service-worker requests have no frame; they are never navigations.
-		}
-		if (topLevel) {
-			blockedNavigation ??= request.url();
-			return route.abort("blockedbyclient");
-		}
-		return route.fallback();
-	});
-
-	const ms = timeout > 0 ? `${timeout}ms` : "the timeout";
-	for (let i = 0; i < steps.length; i++) {
-		const { selector, waitFor } = steps[i];
-		const step = i + 1;
-		const label = `click step ${step} of ${steps.length} ("${selector}")`;
-		// The first match in document order, so a selector that matches several
-		// buttons presses one instead of tripping Playwright's strict mode.
-		const target = page.locator(selector).first();
-		try {
-			await target.waitFor({ state: "visible", timeout });
-			await target.click({ timeout });
-		} catch (err) {
-			if (!isTimeout(err)) throw err;
-			throw new ClickError(
-				`${label}: no visible, clickable element matched within ${ms}`,
-				{ step, selector, waitFor },
-			);
-		}
-		if (blockedNavigation) {
-			throw new ClickError(
-				`${label}: the click tried to navigate to ${blockedNavigation}; ` +
-					"trawl clicks only to reveal content on the loaded page — fetch " +
-					"that URL directly instead",
-				{ step, selector, waitFor },
-			);
-		}
-		if (waitFor) {
+		if (request.isNavigationRequest()) {
 			try {
-				await page
-					.locator(waitFor)
-					.first()
-					.waitFor({ state: "visible", timeout });
+				topLevel = request.frame().parentFrame() === null;
+			} catch {
+				// A popup's first navigation is sent before its frame exists, so
+				// `frame()` throws. That is a new top-level page: block it.
+				topLevel = true;
+			}
+		}
+		if (!topLevel) return route.fallback();
+		blocked ??= { url: request.url(), step: current };
+		// "aborted", not "blockedbyclient": the latter makes Chromium commit
+		// its own error page over the loaded document, which would then be
+		// extracted as an empty body.
+		return route.abort("aborted");
+	};
+	const checkNavigation = () => {
+		if (!blocked) return;
+		const { url, step } = blocked;
+		const { selector, waitFor } = steps[step - 1];
+		throw new ClickError(
+			`click step ${step} of ${steps.length} ("${selector}"): the click ` +
+				`tried to navigate to ${url}; trawl clicks only to reveal content ` +
+				"on the loaded page — fetch that URL directly instead",
+			{ step, selector, waitFor },
+		);
+	};
+
+	await context.route("**/*", handler);
+	try {
+		const ms = timeout > 0 ? `${timeout}ms` : "the timeout";
+		for (let i = 0; i < steps.length; i++) {
+			const { selector, waitFor } = steps[i];
+			const step = i + 1;
+			current = step;
+			const label = `click step ${step} of ${steps.length} ("${selector}")`;
+			// The first match in document order, so a selector that matches
+			// several buttons presses one instead of tripping strict mode.
+			const target = page.locator(selector).first();
+			try {
+				await target.waitFor({ state: "visible", timeout });
+				await target.click({ timeout });
 			} catch (err) {
 				if (!isTimeout(err)) throw err;
 				throw new ClickError(
-					`${label}: "${waitFor}" did not appear within ${ms} after the click`,
+					`${label}: no visible, clickable element matched within ${ms}`,
 					{ step, selector, waitFor },
 				);
 			}
+			checkNavigation();
+			if (waitFor) {
+				try {
+					await page
+						.locator(waitFor)
+						.first()
+						.waitFor({ state: "visible", timeout });
+				} catch (err) {
+					// A navigation stopped while waiting is the better explanation
+					// for a `waitFor` that never appeared.
+					checkNavigation();
+					if (!isTimeout(err)) throw err;
+					throw new ClickError(
+						`${label}: "${waitFor}" did not appear within ${ms} after the click`,
+						{ step, selector, waitFor },
+					);
+				}
+			}
+			if (settle > 0) await page.waitForTimeout(settle);
+			// Again after the wait and settle: a handler that navigates a
+			// moment after the click must fail the run, never pass silently.
+			checkNavigation();
 		}
-		if (settle > 0) await page.waitForTimeout(settle);
+		checkNavigation();
+	} finally {
+		// Scope the blocking to the clicks; routing also disables Playwright's
+		// HTTP cache, which the rest of the render should keep.
+		await context.unroute("**/*", handler);
 	}
 }
 

@@ -35,10 +35,16 @@ const PAGE = `<!doctype html>
 <main>
   <button id="open">Show transcript</button>
   <a id="away" href="/other">Elsewhere</a>
+  <a id="tab" href="/other" target="_blank">New tab</a>
+  <button id="popup" onclick="window.open('/other')">Popup</button>
+  <button id="delayed">Later</button>
   <section id="panel" hidden></section>
 </main>
 <script>
   const panel = document.getElementById("panel");
+  document.getElementById("delayed").addEventListener("click", () => {
+    setTimeout(() => { location.href = "/other"; }, 150);
+  });
   document.getElementById("open").addEventListener("click", () => {
     panel.hidden = false;
     panel.innerHTML =
@@ -61,6 +67,10 @@ async function serve() {
 			return;
 		}
 		res.writeHead(200, { "content-type": "text/html" });
+		if (req.url === "/wall") {
+			res.end("<title>Gated</title><body>Sign in</body>");
+			return;
+		}
 		res.end(req.url === "/other" ? "<title>Other</title><p>other page</p>" : PAGE);
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -201,6 +211,50 @@ test("a click that would load another page is refused, and never requested", opt
 	}
 });
 
+// Each of these would load /other as a new top-level page. The assertion
+// that matters is the server log: the request must never leave the browser.
+for (const [name, click, extra] of [
+	["a target=_blank link", "#tab", {}],
+	["a window.open() popup", "#popup", {}],
+	["a navigation 150ms after the click (settle 500)", "#delayed", { settle: 500 }],
+]) {
+	test(`${name} is refused, and never requested`, opts, async () => {
+		const s = await serve();
+		try {
+			await assert.rejects(
+				render(s.url, { ...fast, timeout: 2000, click: [click], ...extra }),
+				(err) => {
+					assert.ok(err instanceof ClickError, `got ${err}`);
+					assert.equal(err.step, 1);
+					assert.match(err.message, /tried to navigate to .*\/other/);
+					return true;
+				},
+			);
+			assert.ok(!s.hits.includes("/other"), `server saw ${s.hits.join(", ")}`);
+		} finally {
+			await s.close();
+		}
+	});
+}
+
+test("a late navigation is pinned to the step that set it off", opts, async () => {
+	const s = await serve();
+	try {
+		await assert.rejects(
+			render(s.url, {
+				...fast,
+				timeout: 2000,
+				settle: 500,
+				click: ["#delayed", "#open"],
+			}),
+			(err) => err instanceof ClickError && err.step === 1,
+		);
+		assert.ok(!s.hits.includes("/other"));
+	} finally {
+		await s.close();
+	}
+});
+
 // --- CLI, through a bin symlink (the shape a PATH install runs) -------------
 
 function runBin(args) {
@@ -265,6 +319,32 @@ test("trawl --then-wait with no --click exits 1 before any request", async () =>
 		assert.equal(code, 1);
 		assert.match(stderr, /--then-wait must follow a --click/);
 		assert.deepEqual(s.hits, []);
+	} finally {
+		await s.close();
+	}
+});
+
+test("trawl reports a login wall (exit 3) before trying the clicks", opts, async () => {
+	const s = await serve();
+	try {
+		const wall = `${s.url}wall`;
+		const gated = await runBin([wall, "--min-interval", "0", "--timeout", "1000", "--click", "#nope"]);
+		assert.equal(gated.code, 3, gated.stderr);
+		assert.match(gated.stderr, /login wall/);
+		assert.doesNotMatch(gated.stderr, /click step/);
+
+		const unchecked = await runBin([
+			wall,
+			"--min-interval",
+			"0",
+			"--timeout",
+			"1000",
+			"--no-auth-check",
+			"--click",
+			"#nope",
+		]);
+		assert.equal(unchecked.code, 1);
+		assert.match(unchecked.stderr, /click step 1 of 1 \("#nope"\)/);
 	} finally {
 		await s.close();
 	}

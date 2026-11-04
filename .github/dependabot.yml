@@ -1,41 +1,47 @@
 version: 2
 
 updates:
-  # GitHub Actions. Currently pinned at actions/checkout@v4 and
-  # actions/setup-node@v4, both of which GitHub now warns are Node-20-based and
-  # are being force-run on Node 24 — this is what keeps that from rotting.
-  # Grouped into a single PR: action bumps are low-risk and reviewing them
-  # one-by-one is pure noise.
+  # GitHub Actions (currently actions/checkout@v7 and actions/setup-node@v7 in
+  # ci.yml). Grouped into a single PR, majors included: action bumps are
+  # low-risk and reviewing them one-by-one is pure noise.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    cooldown:
+      default-days: 14
     labels:
-      - "tier:maintenance"
+      - "dependencies"
     commit-message:
       prefix: "chore(ci)"
     groups:
       github-actions:
-        patterns:
-          - "*"
+        patterns: ["*"]
+        update-types: ["major", "minor", "patch"]
 
   # Runtime dependencies. Minor and patch bumps are grouped into one PR;
-  # majors deliberately are NOT, so a breaking change to playwright-core
-  # (which is coupled to the browser binary and carries the most rendering
-  # risk here) arrives as its own reviewable PR rather than buried in a batch.
+  # majors deliberately are NOT. playwright-core is excluded from the group
+  # even at minor/patch: it is coupled to the browser binary and carries the
+  # most rendering risk here, so every bump arrives as its own reviewable PR.
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    cooldown:
+      default-days: 14
     labels:
-      - "tier:maintenance"
+      - "dependencies"
     commit-message:
       prefix: "chore(deps)"
     open-pull-requests-limit: 5
     groups:
       minor-and-patch:
-        update-types:
-          - "minor"
-          - "patch"
+        patterns: ["*"]
+        exclude-patterns: ["playwright-core"]
+        update-types: ["minor", "patch"]

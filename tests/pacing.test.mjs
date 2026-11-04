@@ -500,8 +500,9 @@ await p.gate(async () => {
 // child's report in the same order. Every child is killed if the batch has not
 // finished within `deadlineMs`, or as soon as any child fails, so a stuck or
 // crashed child fails the test instead of leaving its siblings waiting on stdin
-// and the test file hanging.
-async function runChildren(envs, { deadlineMs = 60_000 } = {}) {
+// and the test file hanging. The deadline only guards against a hang: on a
+// starved machine a child can take over a minute just to start.
+async function runChildren(envs, { deadlineMs = 5 * 60_000 } = {}) {
 	const children = envs.map((env) => {
 		const child = spawn(process.execPath, ["--input-type=module", "-e", CHILD], {
 			env: { ...process.env, PACING_URL, ...env },

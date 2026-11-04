@@ -32,25 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROBE_SCRIPT="$SCRIPTS_DIR/probe-tokens.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # -------- Test 1: script exists and is executable --------
 echo "Test 1: script exists and is executable"
@@ -106,11 +88,20 @@ NO_DAEMON_WS="$(mktemp -d)"
 trap 'rm -rf "$NO_DAEMON_WS"' EXIT
 STRIPPED_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
+# An empty $HOME so step 4 of loom_locate_daemon_bin (the machine-level
+# install fallback under ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}) can't fall
+# through to a real host's install -- on a host with a genuine machine-level
+# Loom install, leaving $HOME/LOOM_DAEMON_BIN_DIR untouched would defeat these
+# "no resolvable daemon binary" fixtures (#5183).
+EMPTY_HOME="$(mktemp -d)"
+trap 'rm -rf "$NO_DAEMON_WS" "$EMPTY_HOME"' EXIT
+
 # -------- Test 4: no capable daemon binary fails loudly (exit 1,
 #                   actionable message) --------
 echo "Test 4: no capable daemon binary -> exit 1"
 out="$(cd "$NO_DAEMON_WS" && LOOM_DAEMON_BIN="/nonexistent/loom-daemon" \
-    PATH="$STRIPPED_PATH" "$PROBE_SCRIPT" --json 2>&1)"
+    PATH="$STRIPPED_PATH" HOME="$EMPTY_HOME" LOOM_DAEMON_BIN_DIR="/nonexistent" \
+    "$PROBE_SCRIPT" --json 2>&1)"
 rc=$?
 if [[ "$rc" -eq 1 ]]; then
     pass "no resolvable daemon binary exits 1"
@@ -136,7 +127,8 @@ STALE_EOF
 chmod +x "$STALE_BIN_DIR/loom-tokens"
 
 stale_out="$(cd "$NO_DAEMON_WS" && LOOM_DAEMON_BIN="/nonexistent/loom-daemon" \
-    PATH="$STALE_BIN_DIR:$STRIPPED_PATH" "$PROBE_SCRIPT" --json 2>&1)"
+    PATH="$STALE_BIN_DIR:$STRIPPED_PATH" HOME="$EMPTY_HOME" LOOM_DAEMON_BIN_DIR="/nonexistent" \
+    "$PROBE_SCRIPT" --json 2>&1)"
 rc=$?
 rm -rf "$STALE_BIN_DIR"
 if [[ "$rc" -eq 1 ]]; then

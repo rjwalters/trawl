@@ -29,27 +29,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GH_CACHED="$(cd "$SCRIPT_DIR/.." && pwd)/gh-cached"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$expected" == "$actual" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
+# shellcheck source=lib/assert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 if [[ ! -x "$GH_CACHED" ]]; then
     echo "FAIL: gh-cached not found or not executable at $GH_CACHED" >&2
@@ -281,8 +262,26 @@ FAKE_DAEMON_DIR="$TMP_ROOT/daemon"
 mkdir -p "$FAKE_DAEMON_DIR"
 # A fake loom-daemon: `forge <e> list --cached` with --json succeeds and emits a
 # sentinel; any shape without --json exits 3 (decline), mirroring the real one.
-cat > "$FAKE_DAEMON_DIR/loom-daemon" <<'FAKE'
+#
+# Named `loom-daemon-mock`, NOT `loom-daemon` (#5548): gh-cached's
+# locate_loom_daemon() checks $LOOM_DAEMON_BIN (set explicitly below) BEFORE
+# falling back to a bare `which("loom-daemon")` PATH lookup, so this fixture
+# never needs the literal name to be resolved. A distinct name means a leaked
+# fixture can never forge a production `pgrep -f loom-daemon`-style liveness
+# check the way the incident describes.
+cat > "$FAKE_DAEMON_DIR/loom-daemon-mock" <<'FAKE'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_DAEMON_LOG"
+if [[ "$1" == "forge" && "$3" == "view" ]]; then
+    # #9254 view path: --invalidate succeeds silently; a --json shape without
+    # `author` is served; everything else declines (exit 3), like the real one.
+    if [[ "$*" == *--invalidate* ]]; then exit 0; fi
+    if [[ "$*" == *--json* && "$*" != *author* ]]; then
+        echo '{"labels":[{"name":"from-etag-view"}],"state":"OPEN"}'
+        exit 0
+    fi
+    exit 3
+fi
 if [[ "$1" == "forge" && "$3" == "list" ]]; then
     if printf '%s\n' "$@" | grep -q -- '--json'; then
         echo '[{"number":777,"title":"from-etag-daemon"}]'
@@ -292,13 +291,20 @@ if [[ "$1" == "forge" && "$3" == "list" ]]; then
 fi
 exit 3
 FAKE
-chmod +x "$FAKE_DAEMON_DIR/loom-daemon"
+chmod +x "$FAKE_DAEMON_DIR/loom-daemon-mock"
 
-# Runner with the fake daemon on PATH and the ETag layer ENABLED.
+# Runner with the fake daemon pinned via LOOM_DAEMON_BIN and the ETag layer
+# ENABLED. FAKE_DAEMON_DIR is still added to PATH as a belt-and-suspenders
+# safety net for any code path that falls through to a PATH search, but
+# LOOM_DAEMON_BIN is what locate_loom_daemon() actually resolves first.
+FAKE_DAEMON_LOG="$TMP_ROOT/daemon-calls.log"
+: > "$FAKE_DAEMON_LOG"
+export FAKE_DAEMON_LOG
+
 ghc_etag() {
     PATH="$STUB_DIR:$FAKE_DAEMON_DIR:$PATH" \
     GH_CACHE_DIR="$CACHE_DIR" \
-    LOOM_DAEMON_BIN="$FAKE_DAEMON_DIR/loom-daemon" \
+    LOOM_DAEMON_BIN="$FAKE_DAEMON_DIR/loom-daemon-mock" \
       "$GH_CACHED" "$@"
 }
 
@@ -317,6 +323,200 @@ assert_eq "1" "$(call_count)" "a daemon-declined list shape falls through to a r
 reset_cache
 LOOM_ETAG_LIST_DISABLE=1 ghc_etag issue list --label "loom:issue" --state open --json number,title >/dev/null
 assert_eq "1" "$(call_count)" "LOOM_ETAG_LIST_DISABLE=1 bypasses the ETag path (falls to gh)"
+
+# --- 9b. Conditional single-object reads (#9254) ---------------------------
+# `issue view` / `pr view` try `forge … view --cached` before the TTL cache;
+# a decline (exit 3) falls through to exactly the TTL + plain-gh behaviour, and
+# a wrapped mutation drops the daemon's view entries for that number.
+echo ""
+echo "Testing the #9254 ETag/REST single-object view routing..."
+
+reset_cache
+view_out=$(ghc_etag issue view 123 --json labels,state)
+assert_eq '{"labels":[{"name":"from-etag-view"}],"state":"OPEN"}' "$view_out" \
+    "'issue view --json labels,state' is served by the daemon's conditional view path"
+assert_eq "0" "$(call_count)" "…and the stub gh is never called for the ETag-served view"
+case "$(tail -n 1 "$FAKE_DAEMON_LOG")" in
+  "forge issue view --cached 123 --json labels,state") fwd_ok="yes" ;;
+  *) fwd_ok="no: $(tail -n 1 "$FAKE_DAEMON_LOG")" ;;
+esac
+assert_eq "yes" "$fwd_ok" "…with the argv forwarded verbatim after '--cached'"
+
+reset_cache
+declined_out=$(ghc_etag pr view 4242 --json author)
+declined_out2=$(ghc_etag pr view 4242 --json author)
+assert_eq "$(cat "$STATE_DIR/pr-view.json")" "$declined_out" \
+    "a daemon-declined view shape returns exactly plain gh's output"
+assert_eq "1" "$(call_count)" "…through the TTL path (one gh call, the repeat is a TTL hit)"
+assert_eq "$declined_out" "$declined_out2" "…and the TTL hit is identical"
+
+reset_cache
+: > "$FAKE_DAEMON_LOG"
+ghc_etag issue edit 123 --add-label "loom:building" >/dev/null
+assert_eq "1" "$(grep -c -- '--invalidate 123$' "$FAKE_DAEMON_LOG")" \
+    "a wrapped 'issue edit 123' drops the daemon's ETag view entries for #123"
+: > "$FAKE_DAEMON_LOG"
+ghc_etag pr comment 4242 --body hi >/dev/null
+assert_eq "1" "$(grep -c -- '--invalidate 4242$' "$FAKE_DAEMON_LOG")" \
+    "a wrapped 'pr comment 4242' drops the view entries for #4242"
+
+reset_cache
+LOOM_ETAG_VIEW_DISABLE=1 ghc_etag issue view 123 --json labels,state >/dev/null 2>&1
+assert_eq "1" "$(call_count)" "LOOM_ETAG_VIEW_DISABLE=1 bypasses the view path (falls to gh)"
+
+# --- 10. Multi-repo cache isolation (#5224) --------------------------------
+# CACHE_DIR is scoped per-repo so two different repos on the same host never
+# share a cache entry for a textually identical `gh` invocation — the bug
+# reported in #5224 (a leaked PR from an unrelated repo's cached `pr list`).
+echo ""
+echo "Testing multi-repo cache isolation (#5224)..."
+
+# GH_CACHE_REPO_ID is the direct override (used here as the "injected
+# repo-identity override for the test" per the issue's suggested test shape).
+ghc_repo() {
+    local repo_id="$1"; shift
+    PATH="$STUB_DIR:$PATH" \
+    GH_CACHE_DIR="$CACHE_DIR" \
+    GH_CACHE_TTL="${TTL_OVERRIDE:-30}" \
+    GH_CACHE_REPO_ID="$repo_id" \
+    LOOM_ETAG_LIST_DISABLE=1 \
+      "$GH_CACHED" "$@"
+}
+
+reset_cache
+echo '[{"number":4242,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
+repoA_out1=$(ghc_repo repoA pr list --label "loom:review-requested" --state open --limit 500)
+echo '[{"number":9999,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
+repoB_out1=$(ghc_repo repoB pr list --label "loom:review-requested" --state open --limit 500)
+assert_eq "2" "$(call_count)" "identical 'gh' args from two different repo identities both hit the real gh (no cross-repo cache hit)"
+case "$repoB_out1" in
+  *4242*) leaked="yes" ;;
+  *) leaked="no" ;;
+esac
+assert_eq "no" "$leaked" "repo B's read does not return repo A's cached PR #4242"
+
+# repoA's own cache is still warm and unaffected by repoB's read.
+repoA_out2=$(ghc_repo repoA pr list --label "loom:review-requested" --state open --limit 500)
+assert_eq "2" "$(call_count)" "repoA's own repeat read is still served from its own cache (unaffected by repoB's read)"
+assert_eq "$repoA_out1" "$repoA_out2" "…and returns repoA's original cached payload, not repoB's"
+
+# restore baseline listing for later blocks
+echo '[{"number":4242,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
+
+# Invalidation isolation ("Additional risk" in #5224): a mutation issued
+# under repoA's identity must not invalidate repoB's cached entry for a
+# numerically-identical resource id (both have a "#4242").
+reset_cache
+ghc_repo repoA pr view 4242 --json labels >/dev/null            # warm repoA: 1 call
+ghc_repo repoB pr view 4242 --json labels >/dev/null            # warm repoB: 2 calls
+ghc_repo repoA pr edit 4242 --add-label "loom:pr" >/dev/null    # mutation in repoA: 3 calls
+ghc_repo repoB pr view 4242 --json labels >/dev/null            # repoB re-read: still cached
+assert_eq "3" "$(call_count)" "a mutation issued under repoA's identity does not invalidate repoB's cached entry for the same resource id"
+
+# The real (non-override) resolution path: distinct git toplevels, not just
+# the GH_CACHE_REPO_ID override, must isolate too.
+if command -v git >/dev/null 2>&1; then
+    echo ""
+    echo "Testing multi-repo isolation via real distinct git toplevels..."
+
+    REPO_A_DIR="$TMP_ROOT/repoA"
+    REPO_B_DIR="$TMP_ROOT/repoB"
+    mkdir -p "$REPO_A_DIR" "$REPO_B_DIR"
+    git -C "$REPO_A_DIR" init -q
+    git -C "$REPO_B_DIR" init -q
+
+    ghc_cwd() {
+        local dir="$1"; shift
+        ( cd "$dir" && \
+          PATH="$STUB_DIR:$PATH" \
+          GH_CACHE_DIR="$CACHE_DIR" \
+          GH_CACHE_TTL="${TTL_OVERRIDE:-30}" \
+          LOOM_ETAG_LIST_DISABLE=1 \
+            "$GH_CACHED" "$@" )
+    }
+
+    reset_cache
+    echo '[{"number":1111,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
+    outA=$(ghc_cwd "$REPO_A_DIR" pr list --label "loom:review-requested" --state open --limit 500)
+    echo '[{"number":2222,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
+    outB=$(ghc_cwd "$REPO_B_DIR" pr list --label "loom:review-requested" --state open --limit 500)
+    assert_eq "2" "$(call_count)" "two distinct real git toplevels issuing the same 'gh' args both hit the real gh (default git-based resolution, not just the override)"
+    case "$outA" in
+      *1111*) sawA="yes" ;;
+      *) sawA="no" ;;
+    esac
+    assert_eq "yes" "$sawA" "repo A (a distinct real git toplevel) reads its own PR #1111 from the real gh"
+    case "$outB" in
+      *2222*) sawB="yes" ;;
+      *) sawB="no" ;;
+    esac
+    assert_eq "yes" "$sawB" "repo B (a distinct real git toplevel) reads its own PR #2222, not repo A's cached response"
+    case "$outB" in
+      *1111*) leaked2="yes" ;;
+      *) leaked2="no" ;;
+    esac
+    assert_eq "no" "$leaked2" "repo B (a distinct real git toplevel) does not see repo A's cached PR #1111"
+
+    echo '[{"number":4242,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
+else
+    echo "SKIP: git not available — skipping real-git-toplevel isolation test"
+fi
+
+# --- LOOM_GH_BIN + x-loom-cache outcome field (#9988) -----------------------
+echo ""
+echo "Testing LOOM_GH_BIN and the x-loom-cache outcome record (#9988)..."
+reset_cache
+OUTCOME_LOG="$TMP_ROOT/outcomes.jsonl"
+: > "$OUTCOME_LOG"
+ALT_BIN="$TMP_ROOT/alt-gh"
+cat > "$ALT_BIN" <<'ALT'
+#!/usr/bin/env bash
+echo "ALT-GH-RAN $*"
+ALT
+chmod +x "$ALT_BIN"
+alt_out="$(LOOM_GH_BIN="$ALT_BIN" GH_CACHE_OUTCOME_LOG="$OUTCOME_LOG" ghc pr view 7 --json labels)"
+case "$alt_out" in
+  *ALT-GH-RAN*) alt_ran="yes" ;;
+  *) alt_ran="no" ;;
+esac
+assert_eq "yes" "$alt_ran" "LOOM_GH_BIN runs the named binary instead of gh from PATH"
+assert_eq "0" "$(call_count)" "…and the PATH stub gh is never called"
+LOOM_GH_BIN="$ALT_BIN" GH_CACHE_OUTCOME_LOG="$OUTCOME_LOG" ghc pr view 7 --json labels >/dev/null
+LOOM_GH_BIN="$ALT_BIN" GH_CACHE_OUTCOME_LOG="$OUTCOME_LOG" ghc --no-cache pr view 7 --json labels >/dev/null
+outcomes="$(python3 -c 'import json,sys; print(",".join(json.loads(l)["x-loom-cache"] for l in open(sys.argv[1])))' "$OUTCOME_LOG")"
+assert_eq "miss,hit,bypass" "$outcomes" "records carry x-loom-cache: miss, then hit, then bypass"
+reset_cache
+
+# --- Sweep-support script call sites (#9953) --------------------------------
+# Static contract: observation scripts route reads through $GH_READ and keep
+# the probe/fallback; arbitration scripts stay on literal plain `gh`.
+S_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+for sc in check-duplicate blame-issue sync-labels; do
+    grep -q 'GH_READ="gh"' "$S_DIR/$sc.sh" && grep -q '"$_ghc" --version' "$S_DIR/$sc.sh"
+    assert_eq "0" "$?" "$sc.sh resolves \$GH_READ with the --version probe + plain-gh fallback"
+    grep -q '"$GH_READ" ' "$S_DIR/$sc.sh"
+    assert_eq "0" "$?" "$sc.sh routes at least one read through \$GH_READ"
+done
+for sc in check-evaluating-staleness sweep-lease-renew verdict-staleness-guard claim-staleness rebase-stacked-children; do
+    grep -q 'GH_READ' "$S_DIR/$sc.sh"
+    assert_eq "1" "$?" "$sc.sh (arbitration/CAS) never uses \$GH_READ"
+    grep -q 'gh-cached.md' "$S_DIR/$sc.sh"
+    assert_eq "0" "$?" "$sc.sh cites docs/gh-cached.md for its plain-gh carve-out"
+done
+# The probe degrades to plain gh when the wrapper is absent.
+GH_READ="gh"; _ghc="/nonexistent-dir/gh-cached"
+if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
+assert_eq "gh" "$GH_READ" "missing wrapper -> GH_READ falls back to plain gh"
+# ...and when it is present but broken (its --version probe fails), under set -euo pipefail.
+BROKEN_DIR="$(mktemp -d)"; printf '#!/usr/bin/env bash\nexit 1\n' > "$BROKEN_DIR/gh-cached"; chmod +x "$BROKEN_DIR/gh-cached"
+broken_out="$(SCRIPT_DIR="$BROKEN_DIR" bash -c 'set -euo pipefail; GH_READ="gh"; _ghc="$SCRIPT_DIR/gh-cached"; if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi; echo "$GH_READ"')"
+assert_eq "gh" "$broken_out" "broken wrapper -> GH_READ falls back to plain gh (set -euo pipefail safe)"
+rm -rf "$BROKEN_DIR"
+# Each routed script resolves the probe on ONE code line.
+for sc in check-duplicate blame-issue sync-labels; do
+    grep -qE '^GH_READ="gh"; _ghc=.*"\$_ghc" --version >/dev/null 2>&1; then GH_READ="\$_ghc"; fi$' "$S_DIR/$sc.sh"
+    assert_eq "0" "$?" "$sc.sh resolves \$GH_READ on a single probe line"
+done
 
 # --- Summary ---------------------------------------------------------------
 echo ""

@@ -1,8 +1,5 @@
-<!-- BEGIN LOOM ORCHESTRATION -->
-This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
-<!-- END LOOM ORCHESTRATION -->
 <!-- BEGIN REPO-SKILLS -->
-This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.7.0 installed —
+This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.25.5 installed —
 general repository hygiene and environment commands invoked as `/repo:<command>`. Run
 `/repo:help` for the command list, or see `.claude/skills/repo/SKILL.md` for the full
 guide. Hygiene commands apply safe, reversible fixes by default and report each
@@ -46,3 +43,9 @@ anything merged here.
 Tests that need a browser skip cleanly when none is present, so a green local
 run does not always mean the render path was exercised — CI installs Chromium
 to keep them meaningful.
+
+<!-- BEGIN LOOM ORCHESTRATION -->
+This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
+
+Work is coordinated through `loom:` labels on issues and pull requests, and the same roles run either under `loom-daemon` or by hand in an attended session — daemon mode is optional. Create the labels once with `.loom/scripts/sync-labels.sh` (an install ships `.github/labels.yml` but does not create the labels on the forge). A pull request ready for review carries `loom:review-requested`; Judge reviews it and applies `loom:pr` (approved) or `loom:changes-requested`; Doctor fixes a `loom:changes-requested` pull request and returns it to `loom:review-requested`. Only a `loom:pr` pull request gets merged, and always via this repo's merge script (`.loom/scripts/merge-pr.sh`) — never a raw forge merge command such as `gh pr merge`. Full state machine: `.loom/docs/label-state-machine.md`.
+<!-- END LOOM ORCHESTRATION -->

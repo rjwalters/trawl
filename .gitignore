@@ -54,3 +54,6 @@ node_modules
 .loom/*.bak
 .loom/logs/
 # <<< loom-managed <<<
+
+# Repo Skills Codex-side machine-local install metadata (never committed)
+.agents/skills/repo/.install-local.json

@@ -38,11 +38,42 @@ Run each of the following checks and compile results into a single report:
 - Markdown links (`[text](path)`) pointing to nonexistent files
 - CLAUDE.md paths that don't resolve
 - Skill/command cross-references to missing files
+- Links inside an **install-template tree** (an installer's `defaults/`, a
+  cookiecutter skeleton) resolve at their installed destination when the repo
+  declares the mapping in `.repo/link-roots.json`. Fold [[links]]' mapping table
+  into this report and say which mapping resolved a link — a mapping fails by
+  hiding errors, so it has to show its work. With no declaration, resolution is
+  unchanged.
+- A relative link that resolves **outside the repo root** (a citation into a
+  sibling repo in a multi-repo workspace) is checked against
+  `.repo/link-siblings.json` when the repo declares one. Report it distinctly:
+  `resolved via sibling repo` when the checkout is present and the target
+  exists, a normal `MISSING` finding when the checkout is present but the
+  target is gone, and `sibling repo not present — unverifiable` — never
+  `MISSING` — when the sibling isn't checked out on this machine at all. With
+  no declaration, out-of-repo links are handled exactly as they are today.
 
 ### 4. Gitignore Issues (see [[gitignore]])
 - Files that are ignored but probably shouldn't be
+- Tracked files that match an ignore rule are unaffected by it — the rule only
+  hides new untracked files, so list those before suggesting removal and prefer
+  keeping the rule; see [[gitignore]] ("Tracked files that match an ignore
+  rule"). Read-only: report the finding, don't edit.
 - Build artifacts that aren't ignored but should be
-- Redundant or stale gitignore rules
+- Redundant or stale gitignore rules — but **not** `X` + `X/` pairs unless `X`
+  is verified to be a real, non-symlink directory (`[ -d "X" ] && [ ! -L "X" ]`);
+  see [[gitignore]] for the full check. A trailing slash never matches a
+  symlink, so wrongly deduping such a pair silently un-ignores one.
+- …and **not** a subdirectory rule matching an ancestor's pattern text, unless
+  the ancestor's pattern is unanchored. A pattern with a `/` other than a
+  trailing one is anchored to its own `.gitignore`'s directory, so root
+  `.vscode/*` never covers `proofs/.gitignore: .vscode/` (#531). Only a
+  *leading* `**/` un-anchors — a mid-pattern `**` does not, so `dir/**/name` is
+  anchored just like `dir/name`. See
+  [[gitignore]] for the anchoring table and the `git check-ignore -v`
+  before/after gate that has to clear before any such removal is applied. This
+  audit is read-only, so report the rule as *candidate* redundancy and name the
+  verification as still owed.
 
 ### 5. Branch & Worktree Hygiene (see [[branches]])
 - Local branches whose PRs are merged
@@ -75,7 +106,7 @@ Present findings as a table grouped by category:
 ### Summary
 - 2 README issues (0 critical, 1 warn, 1 info)
 - 1 orphan (0 critical, 0 warn, 1 info)
-- 0 broken links
+- 0 broken links (3 resolved via install mapping)
 - 0 gitignore issues
 - 3 stale branches
 ```

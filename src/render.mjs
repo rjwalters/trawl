@@ -50,6 +50,159 @@ export class AuthWallError extends Error {
 	}
 }
 
+// Thrown when a click step cannot run: its selector never became visible,
+// its `waitFor` never appeared, or the click tried to navigate the page away.
+// `step` is 1-based so it matches the order the caller wrote the steps in.
+export class ClickError extends Error {
+	constructor(message, { step, selector, waitFor } = {}) {
+		super(message);
+		this.name = "ClickError";
+		this.step = step;
+		this.selector = selector;
+		this.waitFor = waitFor;
+	}
+}
+
+// Accepts `click` as a string, or an array of strings and/or
+// `{ selector, waitFor }` objects, and returns `[{ selector, waitFor }]`.
+// Pure, so the CLI and library callers fail the same way on bad input, and
+// before any network or browser work.
+export function normalizeClickSteps(click) {
+	if (click === undefined || click === null) return [];
+	const list = Array.isArray(click) ? click : [click];
+	return list.map((step, i) => {
+		const where = `click step ${i + 1}`;
+		const obj = typeof step === "string" ? { selector: step } : step;
+		if (!obj || typeof obj !== "object") {
+			throw new Error(
+				`${where}: expected a CSS selector string or { selector, waitFor }`,
+			);
+		}
+		const { selector, waitFor } = obj;
+		if (typeof selector !== "string" || selector.trim() === "") {
+			throw new Error(`${where}: selector must be a non-empty CSS selector`);
+		}
+		if (
+			waitFor !== undefined &&
+			waitFor !== null &&
+			(typeof waitFor !== "string" || waitFor.trim() === "")
+		) {
+			throw new Error(`${where}: waitFor must be a non-empty CSS selector`);
+		}
+		return waitFor ? { selector, waitFor } : { selector };
+	});
+}
+
+// The least a click step pauses after its click (and `waitFor`), whatever
+// `settle` says. Click handlers often navigate on a short timer or after a
+// microtask hop; this floor gives such a navigation time to reach the route
+// below while its step is still the current one, so it fails the run naming
+// the right step instead of racing the end of the run. Same idea as the 1s
+// floor on the networkidle fallback.
+const CLICK_SETTLE_FLOOR_MS = 250;
+
+const isTimeout = (err) =>
+	err?.name === "TimeoutError" || /Timeout .*exceeded/.test(err?.message ?? "");
+
+// Press each step's element in order, on the page that is already loaded.
+// A click only presses an element already on the page: a click that tries to
+// load a different top-level document (a link, a form submit, a popup or
+// `target=_blank`, a script that sets `location` a moment later) is aborted
+// before the request leaves and fails the run, so a run still makes exactly
+// one page request and every request trawl makes stays paced.
+//
+// The route stays on the context for the rest of the run, through
+// extraction and the screenshot, until the context closes: a handler can
+// navigate any number of milliseconds after its click, and a guard that ended
+// with the clicks would let that request out and hand back the other page.
+// Returns `checkNavigation`, which the caller runs once more right before it
+// returns results, so a navigation stopped at any point after a click fails
+// the run. (Routing turns Playwright's HTTP cache off for the requests the
+// page makes after this point; the document and its first subresources have
+// already loaded, so that costs close to nothing.)
+async function runClickSteps(page, context, steps, { timeout, settle }) {
+	let current = 0;
+	// The first top-level navigation a click set off: its URL and the step
+	// that was running when it was stopped.
+	let blocked = null;
+	const handler = (route) => {
+		const request = route.request();
+		let topLevel = false;
+		if (request.isNavigationRequest()) {
+			try {
+				topLevel = request.frame().parentFrame() === null;
+			} catch {
+				// A popup's first navigation is sent before its frame exists, so
+				// `frame()` throws. That is a new top-level page: block it.
+				topLevel = true;
+			}
+		}
+		if (!topLevel) return route.fallback();
+		blocked ??= { url: request.url(), step: current };
+		// "aborted", not "blockedbyclient": the latter makes Chromium commit
+		// its own error page over the loaded document, which would then be
+		// extracted as an empty body.
+		return route.abort("aborted");
+	};
+	const checkNavigation = () => {
+		if (!blocked) return;
+		const { url, step } = blocked;
+		const { selector, waitFor } = steps[step - 1];
+		throw new ClickError(
+			`click step ${step} of ${steps.length} ("${selector}"): the click ` +
+				`tried to navigate to ${url}; trawl clicks only to reveal content ` +
+				"on the loaded page — fetch that URL directly instead",
+			{ step, selector, waitFor },
+		);
+	};
+
+	await context.route("**/*", handler);
+	const ms = timeout > 0 ? `${timeout}ms` : "the timeout";
+	for (let i = 0; i < steps.length; i++) {
+		const { selector, waitFor } = steps[i];
+		const step = i + 1;
+		current = step;
+		const label = `click step ${step} of ${steps.length} ("${selector}")`;
+		// The first match in document order, so a selector that matches
+		// several buttons presses one instead of tripping strict mode.
+		const target = page.locator(selector).first();
+		try {
+			await target.waitFor({ state: "visible", timeout });
+			await target.click({ timeout });
+		} catch (err) {
+			if (!isTimeout(err)) throw err;
+			throw new ClickError(
+				`${label}: no visible, clickable element matched within ${ms}`,
+				{ step, selector, waitFor },
+			);
+		}
+		checkNavigation();
+		if (waitFor) {
+			try {
+				await page
+					.locator(waitFor)
+					.first()
+					.waitFor({ state: "visible", timeout });
+			} catch (err) {
+				// A navigation stopped while waiting is the better explanation
+				// for a `waitFor` that never appeared.
+				checkNavigation();
+				if (!isTimeout(err)) throw err;
+				throw new ClickError(
+					`${label}: "${waitFor}" did not appear within ${ms} after the click`,
+					{ step, selector, waitFor },
+				);
+			}
+		}
+		await page.waitForTimeout(Math.max(settle, CLICK_SETTLE_FLOOR_MS));
+		// Again after the wait and settle: a handler that navigates a
+		// moment after the click must fail the run, never pass silently.
+		checkNavigation();
+	}
+	checkNavigation();
+	return checkNavigation;
+}
+
 // Heuristics only — deliberately biased toward false positives over silently
 // returning login-wall HTML as if it were the page. A caller that knows
 // better has `--no-auth-check` / `authCheck: false`.
@@ -292,6 +445,10 @@ export async function render(url, options = {}) {
 			? DEFAULT_MIN_INTERVAL_MS
 			: validateMinInterval(opts.minIntervalMs, "minIntervalMs");
 
+	// Validated here for the same reason: a malformed click list is a caller
+	// bug, and must not cost a robots.txt request or a browser launch.
+	const clickSteps = normalizeClickSteps(opts.click);
+
 	const userAgent = opts.userAgent ?? (await defaultUserAgent());
 
 	// Cross-run pacing (src/pacing.mjs): every explicit request this call
@@ -454,9 +611,27 @@ export async function render(url, options = {}) {
 		// see a login page reported the same way as a successful fetch. Probes
 		// the *full* page regardless of `--selector`, since the wall is usually
 		// outside whatever the caller scoped extraction to.
-		if (opts.authCheck !== false) {
+		//
+		// With click steps this runs on the loaded page first, so a login wall
+		// is reported as one rather than as "selector never appeared", and
+		// again after the clicks, in case the content they revealed is a wall.
+		const checkAuth = async () => {
+			if (opts.authCheck === false) return;
 			const reasons = await probeAuthWall(page);
 			if (reasons.length > 0) throw new AuthWallError(reasons, page.url());
+		};
+		await checkAuth();
+
+		// Click steps run after load, `waitForSelector` and `settle`, in the
+		// order given; each waits for its element to be visible, clicks it,
+		// waits for its own `waitFor` if any, then `settle` again.
+		let checkClickNavigation = null;
+		if (clickSteps.length > 0) {
+			checkClickNavigation = await runClickSteps(page, context, clickSteps, {
+				timeout: opts.timeout,
+				settle,
+			});
+			await checkAuth();
 		}
 
 		const body = await extract(page, opts);
@@ -472,6 +647,12 @@ export async function render(url, options = {}) {
 			});
 			screenshot = opts.screenshot;
 		}
+
+		// Last word on the click guard: a navigation a click set off late —
+		// during the auth probe, extraction or the screenshot — was stopped by
+		// the route (the page above is still the original), but the run must
+		// still fail rather than report success.
+		checkClickNavigation?.();
 
 		ok = true;
 		return {

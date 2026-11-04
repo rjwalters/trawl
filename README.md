@@ -40,6 +40,14 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --no-readability     Skip article extraction for -f markdown
   -s, --selector <css>     Extract only this element
   -w, --wait-for <css>     Block until this selector appears
+      --click <css>        Click the first match after load, before
+                            extracting. Repeatable; runs in the order given.
+                            Each waits until visible (up to --timeout), then
+                            --settle (at least 250ms). Fails (exit 1) if it
+                            never appears, or if a click would load another
+                            page.
+      --then-wait <css>    After the preceding --click, block until this
+                            selector appears
       --settle <ms>        Extra pause after load                (default: 0)
       --wait-until <ev>    load | domcontentloaded | networkidle
                                                         (default: networkidle)
@@ -79,11 +87,48 @@ trawl https://example.com -f links                 # href<TAB>text, one per line
 trawl https://example.com -s '#main' -f html       # one subtree, as HTML
 trawl https://example.com -f md                    # article, as Markdown
 trawl https://example.com -w '.loaded' --settle 500
+trawl https://example.com --click '#show-details' --then-wait '#details' -s '#details'
 trawl https://example.com --har trace.har          # + the full network trace
 trawl https://example.com --screenshot page.png --full-page   # text + a PNG
 trawl login https://example.com --profile ~/.trawl/example    # sign in once
 trawl https://example.com --profile ~/.trawl/example           # reuse the session
 ```
+
+### Clicking before extraction
+
+Some content only exists after a person presses something: a "show more", an
+expandable details panel, a transcript pane. `--click <css>` presses it.
+After the page loads (and any `--wait-for` / `--settle`), each `--click` waits
+for the first element matching its selector to become visible, clicks it,
+then pauses for `--settle` (at least 250 ms after each click). Repeat the flag to click several things; they run
+in the order given. Extraction (`-s`, `-f`) then reads the page as usual:
+
+```sh
+trawl https://example.com/video --click 'button.show-transcript' \
+      --then-wait '#transcript' -s '#transcript'
+```
+
+`--then-wait <css>` belongs to the `--click` right before it, and blocks until
+that selector is visible — for a panel that loads its contents after the
+click. Pair them by writing them next to each other; a `--then-wait` with no
+`--click` before it, or two for one click, is a usage error.
+
+A selector that never shows up within `--timeout` fails the run with exit
+code 1 and names the step (`click step 2 of 3 ("#more"): no visible,
+clickable element matched within 30000ms`) rather than handing back a page
+that silently lacks what you asked for.
+
+A click only presses an element already on the page. One that would load a
+different page — a link, a form submit, a popup or `target=_blank` link, a
+script that sets `location` a moment later — is stopped before the request
+goes out and fails the run, so a `trawl` run still fetches exactly one page,
+and every request it makes stays [paced](#etiquette). Fetch that other URL
+directly instead. Once a click has happened the guard stays on for the whole
+run, through extraction and `--screenshot`, so a navigation can never swap
+in the other page however late it starts; the 250 ms pause after each click
+is there so a click handler's short-timer navigation is caught and reported
+against the step that caused it. Scripts on the page can still make their
+own background requests in response to a click, as they would for a person.
 
 ### Markdown
 
@@ -226,6 +271,19 @@ the check. Pass `{ profileDir: "<dir>" }` to render through a persistent
 browser profile instead of a fresh one each call, the library equivalent of
 `--profile`.
 
+`render()` accepts the same click steps as `{ click: [...] }`: each entry is
+a CSS selector string, or `{ selector, waitFor }` for the `--then-wait` form.
+A step that cannot run rejects with a `ClickError` (`err.name ===
+"ClickError"`, with `err.step` counted from 1, `err.selector` and
+`err.waitFor`).
+
+```js
+const { body } = await render("https://example.com/video", {
+  click: ["button.show-transcript", { selector: "#more", waitFor: "#line-40" }],
+  selector: "#transcript",
+});
+```
+
 `render()` paces its `http(s)` requests across calls and processes the same
 way the CLI does (see [Etiquette](#etiquette)): `{ minIntervalMs }` sets the
 per-origin floor (default 1000, 0–60000), `{ pacing: false }` turns
@@ -246,7 +304,10 @@ empty shell a plain `WebFetch` sees.
 }
 ```
 
-Two tools, and nothing that clicks, types, or navigates a session:
+Two tools, and nothing that clicks, types, or navigates a session. That is
+deliberate: the CLI and library offer `--click` for a selector a person chose,
+while the MCP server stays read-only so an agent reading a page cannot be
+talked into pressing things on it.
 
 | Tool | Arguments |
 | --- | --- |

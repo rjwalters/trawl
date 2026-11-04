@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Click steps.** `--click <css>` (repeatable, run in the order given)
+  presses the first visible match after the page loads and before
+  extraction, so content behind a "show more", a details panel or a
+  transcript pane can be read with `-s/--selector`. `--then-wait <css>` after
+  a `--click` blocks until that selector appears. Each click waits for its
+  element up to `--timeout`, then `--settle` (at least 250 ms); a selector
+  that never appears fails the run (exit 1) naming the step. Once a click has
+  happened, any navigation to another page for the rest of the run (a link,
+  a form submit, a popup or `target=_blank` link, a delayed `location`
+  change) is stopped before the request leaves, and fails the run, so one
+  run still fetches one page. Library: `render(url, { click: ["#a", {
+  selector: "#b", waitFor: "#c" }] })`, rejecting with a `ClickError`. The
+  MCP server stays click-free on purpose. (#56)
 - **Cross-run request pacing.** Requests to an origin are now spaced across
   separate `trawl` invocations (and concurrent ones), not just within one run:
   before the `robots.txt` request, the page navigation, and the

@@ -16,6 +16,8 @@ $ trawl 'https://qwen.ai/blog?id=qwen3.8' | wc -w
 
 ## Install
 
+Requires Node 22 or newer.
+
 ```sh
 npm install -g @rjwalters/trawl
 npx --yes playwright install chromium --only-shell   # one-time browser fetch

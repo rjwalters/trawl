@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Minimum Node is now 22.** `engines.node` moves from `>=20` to `>=22`,
+  matching the versions CI tests (22 and 24) now that Node 20 is end-of-life.
+
 ## [0.3.0] - 2026-11-03
 
 `trawl` can now press buttons before it reads a page (`--click`), backs off an

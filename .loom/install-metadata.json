@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1264",
-  "loom_commit": "9e3ef4f96e11227c9119f1d551489e578c9e2f22",
+  "loom_version": "0.19.1270",
+  "loom_commit": "db33bfde17c210bfbacb1d2272e47c2903005e5a",
   "install_date": "2026-11-03",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
   "installed_files": [
@@ -769,8 +769,17 @@
     ".loom/scripts/version-check-gate.sh",
     ".loom/scripts/warn-operator-gated.sh",
     ".loom/scripts/warn-out-of-set-deps.sh",
-    ".loom/scripts/worktree.sh"
+    ".loom/scripts/worktree.sh",
+    ".loom/scripts/tests/test-guide-awaiting-revision-park.sh",
+    ".loom/scripts/tests/test-guide-transient-first-at.sh",
+    ".loom/scripts/tests/test-resync-installed-agents-md-create.sh",
+    ".agents/skills/loom-builder/SKILL.md",
+    ".agents/skills/loom-curator/SKILL.md",
+    ".agents/skills/loom-guide/SKILL.md",
+    ".agents/skills/loom-hermit/SKILL.md",
+    ".loom/hooks/guard-destructive-generic.sh",
+    ".loom/hooks/guard-worktree-paths.sh"
   ],
-  "last_resync": "2026-11-05",
+  "last_resync": "2026-11-06",
   "requires_daemon": "0.19.1146"
 }

@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	AUTH_COOKIES,
+	browserWouldReject,
 	CookieParseError,
 	filterCookies,
 	isAuthCookie,
 	MAX_EXPIRES,
 	parseCookies,
+	sourceUserAgent,
 	summarize,
 } from "../src/cookies.mjs";
 
@@ -266,6 +268,44 @@ test("filters: allow is exact-name, applied after domain", () => {
 	);
 });
 
+test("filters: matched counts what --domain/--allow left, before expiry and auth", () => {
+	const cs = parseCookies(
+		har(harEntry("https://a.test/", "keep=1; SID=2; other=3"), harEntry("https://b.test/", "keep=4")),
+	);
+	assert.equal(filterCookies(cs, { now: NOW }).matched, 4);
+	const r = filterCookies(cs, { domain: "a.test", allow: ["keep", "SID"], now: NOW });
+	assert.equal(r.matched, 2);
+	assert.equal(r.cookies.length, 1);
+	assert.equal(filterCookies(cs, { domain: "c.test", now: NOW }).matched, 0);
+});
+
+test("browserWouldReject mirrors Chromium's cookie checks", () => {
+	const ok = { name: "a", value: 'v"\\/+=', domain: "example.com", path: "/", secure: true };
+	assert.equal(browserWouldReject(ok), false);
+	assert.equal(browserWouldReject({ ...ok, name: "" }), false);
+	assert.equal(browserWouldReject({ ...ok, name: "__Host-a" }), false);
+	for (const bad of [
+		{ value: "x;y" },
+		{ name: "a=b" },
+		{ value: "x\ny" },
+		{ name: "a\u0001" },
+		{ value: " v" },
+		{ name: "", value: "" },
+		{ value: "x".repeat(4096) },
+		{ value: "é".repeat(2048) },
+		{ path: "x" },
+		{ path: "/a;b" },
+		{ path: `/${"p".repeat(1024)}` },
+		{ domain: " " },
+		{ name: "__Secure-a", secure: false },
+		{ name: "__HOST-a", path: "/x" },
+		{ name: "__Host-a", domain: ".example.com" },
+		{ name: "", value: "__Host-x", secure: false },
+	]) {
+		assert.equal(browserWouldReject({ ...ok, ...bad }), true, JSON.stringify(bad));
+	}
+});
+
 test("filters: expired cookies dropped and counted; session kept", () => {
 	const r = filterCookies(parseCookies(NETSCAPE), { now: NOW });
 	assert.equal(r.expiredDropped, 1);
@@ -469,4 +509,37 @@ test("HAR: Set-Cookie vs request cookie merge is independent of entry order", ()
 			[["t", ".example.com", "new"]],
 		);
 	}
+});
+
+// --- sourceUserAgent (#77) ---
+
+test("sourceUserAgent reads the first request User-Agent from a HAR", () => {
+	const har = JSON.stringify({
+		log: {
+			entries: [
+				{ request: { url: "https://a.example/", headers: [] } },
+				{ request: { url: "https://a.example/x", headers: [{ name: "user-agent", value: " UA/1 " }] } },
+				{ request: { url: "https://a.example/y", headers: [{ name: "User-Agent", value: "UA/2" }] } },
+			],
+		},
+	});
+	assert.equal(sourceUserAgent(har), "UA/1");
+});
+
+test("sourceUserAgent reads -A, --user-agent and -H from a cURL command", () => {
+	assert.equal(sourceUserAgent("curl https://a.example -A 'Fx/1'"), "Fx/1");
+	assert.equal(sourceUserAgent("curl --user-agent \"Fx/2\" https://a.example"), "Fx/2");
+	assert.equal(sourceUserAgent("curl -sSAFx/3 https://a.example"), "Fx/3");
+	assert.equal(sourceUserAgent("curl https://a.example -H 'user-agent: Fx/4' -H 'Accept: */*'"), "Fx/4");
+	// A cookie value that looks like a flag is not mistaken for one.
+	assert.equal(sourceUserAgent("curl https://a.example -b '-A=x' -H 'Cookie: a=-A'"), null);
+	assert.equal(sourceUserAgent("curl https://a.example"), null);
+});
+
+test("sourceUserAgent is null for cookies.txt and for anything unparseable", () => {
+	assert.equal(sourceUserAgent(`# Netscape HTTP Cookie File\n.a.example\tTRUE\t/\tFALSE\t0\tn\t${SENTINEL}\n`), null);
+	assert.equal(sourceUserAgent(`{"log": ${SENTINEL}`), null);
+	assert.equal(sourceUserAgent('{"log": {}}'), null);
+	assert.equal(sourceUserAgent(""), null);
+	assert.equal(sourceUserAgent(undefined), null);
 });

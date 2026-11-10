@@ -615,6 +615,67 @@ export function parseCookies(text) {
 	throw new CookieParseError("unrecognised");
 }
 
+function curlUserAgent(text) {
+	const words = shellWords(text);
+	let agent = null;
+	for (let i = 1; i < words.length; i++) {
+		const w = words[i];
+		let opt = w;
+		let value = null;
+		if (/^-[^-]/.test(w)) {
+			// Same bundled-short-option rule as parseCurl.
+			opt = null;
+			for (let k = 1; k < w.length; k++) {
+				const o = `-${w[k]}`;
+				if (o === "-H" || o === "-b" || CURL_VALUE_OPTS.has(o)) {
+					opt = o;
+					value = w.slice(k + 1) || null;
+					break;
+				}
+			}
+			if (opt === null) continue;
+		}
+		if (opt === "-A" || opt === "--user-agent") {
+			agent = value ?? words[++i] ?? null;
+		} else if (opt === "-H" || opt === "--header") {
+			const m = /^user-agent\s*:(.*)$/is.exec(value ?? words[++i] ?? "");
+			if (m) agent = m[1].trim();
+		} else if (opt === "-b" || opt === "--cookie" || opt === "--url") {
+			if (value === null) i++;
+		} else if (CURL_VALUE_OPTS.has(opt)) {
+			if (value === null) i++;
+		}
+	}
+	return agent || null;
+}
+
+/**
+ * The `User-Agent` the source was captured with, or null when it carries none
+ * (always null for a Netscape cookies.txt, which has no such field). For a HAR,
+ * the first request that sent one; for a cURL command, its `-A` /
+ * `--user-agent` / `-H 'User-Agent: …'` (last one wins, as in curl). Never
+ * throws: unrecognised input simply has no User-Agent.
+ */
+export function sourceUserAgent(text) {
+	if (typeof text !== "string") return null;
+	const trimmed = text.replace(/^﻿/, "").trim();
+	try {
+		if (trimmed.startsWith("{")) {
+			const entries = JSON.parse(trimmed)?.log?.entries;
+			if (!Array.isArray(entries)) return null;
+			for (const entry of entries) {
+				const [ua] = headerValues(entry?.request?.headers, "user-agent");
+				if (ua?.trim()) return ua.trim();
+			}
+			return null;
+		}
+		if (/^curl(\s|$)/.test(trimmed)) return curlUserAgent(trimmed);
+	} catch {
+		// Malformed input: parseCookies reports it; there is no agent to read.
+	}
+	return null;
+}
+
 // A cookie for a single-label domain (`com`, `test`) is only kept when the
 // filter names exactly that host: browsers never store a cookie on a bare
 // public suffix, so `example.com` must not match a `com` cookie. (Multi-label
@@ -630,9 +691,11 @@ function domainMatches(cookieDomain, hostFilter) {
 /**
  * Filter a cookie list. Order: domain, allow, expired, auth.
  * Options: `domain` (host), `allow` (exact names), `includeAuth`, `now` (ms,
- * injectable for tests). Returns `{ cookies, authDropped, expiredDropped }`.
- * `authDropped` holds `{ name, domain }` only, never values. Pass the result
- * to `summarize` for anything meant for display.
+ * injectable for tests). Returns `{ cookies, authDropped, expiredDropped,
+ * matched }`, where `matched` counts the cookies left after `domain`/`allow`
+ * (before the expired and auth steps). `authDropped` holds `{ name, domain }`
+ * only, never values. Pass the result to `summarize` for anything meant for
+ * display.
  */
 export function filterCookies(cookies, opts = {}) {
 	const { domain, allow, includeAuth = false, now = Date.now() } = opts;
@@ -642,6 +705,7 @@ export function filterCookies(cookies, opts = {}) {
 		const names = new Set(allow);
 		list = list.filter((c) => names.has(c.name));
 	}
+	const matched = list.length;
 	const nowSec = now / 1000;
 	let expiredDropped = 0;
 	list = list.filter((c) => {
@@ -660,7 +724,46 @@ export function filterCookies(cookies, opts = {}) {
 			return false;
 		});
 	}
-	return { cookies: list, authDropped, expiredDropped };
+	return { cookies: list, authDropped, expiredDropped, matched };
+}
+
+// Byte length, as Chromium measures cookie limits.
+function bytes(s) {
+	return Buffer.byteLength(String(s), "utf8");
+}
+
+const COOKIE_CONTROL = /[\u0000-\u001f\u007f;]/;
+
+/**
+ * True when Chromium's `Storage.setCookies` would refuse this cookie. One
+ * refused cookie fails the whole `addCookies` batch, so callers set these
+ * aside first and report them by name. Each rule was checked against real
+ * Chromium (playwright-core 1.64): it is a best-effort mirror of its
+ * `CanonicalCookie` checks, not a parser of its own, and Chromium stays the
+ * final word. Looks at the value but returns only a boolean.
+ */
+export function browserWouldReject(cookie) {
+	const name = String(cookie?.name ?? "");
+	const value = String(cookie?.value ?? "");
+	const path = String(cookie?.path ?? "");
+	const domain = String(cookie?.domain ?? "").trim();
+	if (!domain) return true;
+	if (COOKIE_CONTROL.test(name) || COOKIE_CONTROL.test(value)) return true;
+	if (name.includes("=")) return true;
+	if (/^\s|\s$/.test(name) || /^\s|\s$/.test(value)) return true;
+	if (name === "" && value === "") return true;
+	if (bytes(name) + bytes(value) > 4096) return true;
+	if (!path.startsWith("/") || path.includes(";") || bytes(path) > 1024) return true;
+	// With no name, the value is what the prefix rules read as the name.
+	const prefixed = (name === "" ? value : name).toLowerCase();
+	if (prefixed.startsWith("__secure-") && !cookie.secure) return true;
+	if (
+		prefixed.startsWith("__host-") &&
+		(!cookie.secure || path !== "/" || domain.startsWith("."))
+	) {
+		return true;
+	}
+	return false;
 }
 
 // Explicit field pick (never spread) so a field added to cookies later cannot

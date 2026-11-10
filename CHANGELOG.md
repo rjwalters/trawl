@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`trawl cookies import <file> --profile <dir>`.** Copies cookies from a
+  HAR, a Netscape `cookies.txt` or a copy-as-cURL command into a persistent
+  profile, so a later `trawl <url> --profile <dir>` presents them. Prints
+  names, domains and expiry only, never values. Session cookies are stored
+  with a 7-day expiry (a profile keeps no others). Expired cookies are dropped,
+  and so are sign-in cookies (a best-effort list) unless `--include-auth`;
+  `--domain <host>` and `--allow a,b` narrow the import further. Cookies the
+  browser would refuse are skipped by name, since one would fail the whole
+  batch. Nothing is written until the file parses and at least one cookie
+  survives filtering (otherwise exit 1, naming the filter that removed them;
+  profile untouched); a profile directory it creates is `0700`. A browser
+  error during the write is reported as a fixed message saying nothing was
+  imported, never the browser's own text. Warns when a HAR or cURL source came from a different browser, and
+  reminds you to delete the source file. `--profile` (or
+  `$TRAWL_PROFILE_DIR`) is required. (#77)
+
 ### Changed
 
 - **Minimum Node is now 22.** `engines.node` moves from `>=20` to `>=22`,

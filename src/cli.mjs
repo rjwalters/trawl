@@ -587,6 +587,17 @@ export async function runLogin(argv, deps = {}) {
 		(await import("./browser.mjs")).recordProfileBrowser;
 	try {
 		record(profileDir, executablePath);
+		// Fetches ignore a marker that isn't privately owned; say so rather than
+		// leave the version-skew precaution silently off.
+		const ignored = (
+			deps.markerIgnoredReason ?? (await import("./browser.mjs")).markerIgnoredReason
+		)(profileDir);
+		if (ignored !== null && ignored !== undefined) {
+			const fix = ignored === profileDir ? `chmod 700 ${profileDir}` : `chmod 600 ${ignored}`;
+			stderr(
+				`trawl: warning: ${ignored} is writable by group or others (or not yours), so fetches with this profile will ignore the recorded login browser; run: ${fix}\n`,
+			);
+		}
 	} catch (err) {
 		stderr(`trawl: could not record the login browser in ${profileDir}: ${err.message}\n`);
 	}

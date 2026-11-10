@@ -94,7 +94,7 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --cookies <file>     Send the cookies from a HAR, a Netscape
                             cookies.txt or a copy-as-cURL command with this
                             one fetch; no profile or cookie store is written
-                            (but --har records them). Filtered as cookies
+                            (--har records them unless --har-redact). Filtered as cookies
                             import is (below: same defaults, and --domain,
                             --allow, --include-auth work here too). Prints
                             names/domains/expiry to stderr under -S, or when
@@ -230,7 +230,8 @@ header and parsed cookies, and each response's `Set-Cookie`. So for any
 fetch that sends cookies — with `--cookies` or from a `--profile` — the HAR
 file holds those cookie values in plain text, sign-in cookies too, and
 `--har-omit-content` does not remove them. Treat such a HAR like the cookie
-file itself. `--cookies` together with `--har` prints a warning saying so.
+file itself. `--cookies` together with `--har` prints a warning saying so (omitted
+when `--har-redact` is also given).
 
 Pass `--har-redact` before sharing one: it replaces the values of those, plus
 `Authorization` and `Proxy-Authorization` headers, with `[redacted]` (names

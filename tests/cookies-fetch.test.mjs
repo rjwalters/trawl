@@ -196,7 +196,7 @@ test("--cookies with --har warns, with or without -S, naming the HAR but no valu
 	const dir = tempDir();
 	const clean = writeSource(dir, "clean.txt", netscape([[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", SENTINEL]]));
 	const har = join(dir, "trace.har");
-	const WARNING = `trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies\n`;
+	const WARNING = `trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies (add --har-redact to redact them)\n`;
 	try {
 		// Quiet otherwise, so the warning is the whole of stderr.
 		let r = await runMain([URL_, "--cookies", clean, "--har", har]);
@@ -210,6 +210,12 @@ test("--cookies with --har warns, with or without -S, naming the HAR but no valu
 		assert.match(r.stderr, /^Using 1 cookie from .*clean\.txt for this fetch only:\n {2}pref\t\.example\.com\t\S+\n/);
 		assert.ok(r.stderr.endsWith(WARNING), r.stderr);
 		assert.ok(!r.stderr.includes(SENTINEL) && !r.stdout.includes(SENTINEL));
+
+		// With --har-redact the warning would be false, so it is dropped.
+		r = await runMain([URL_, "--cookies", clean, "--har", har, "--har-redact"]);
+		assert.equal(r.code, 0);
+		assert.equal(r.calls[0][1].harRedact, true);
+		assert.equal(r.stderr, "");
 
 		// Neither half alone warns.
 		r = await runMain([URL_, "--cookies", clean]);

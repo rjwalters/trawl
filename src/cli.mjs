@@ -130,7 +130,7 @@ Options:
       --cookies <file>     Send the cookies from a HAR, a Netscape
                             cookies.txt or a copy-as-cURL command with this
                             one fetch; no profile or cookie store is written
-                            (but --har records them). Filtered as cookies
+                            (--har records them unless --har-redact). Filtered as cookies
                             import is (below: same defaults, and --domain,
                             --allow, --include-auth work here too). Prints
                             names/domains/expiry to stderr under -S, or when
@@ -500,9 +500,10 @@ function loadFetchCookies(args, { profileDir, stderr }) {
 	// The HAR is a full network trace: it keeps each request's Cookie header
 	// and parsed cookies, values included (--har-omit-content drops bodies
 	// only). Always said, -S or not; names the HAR file, never a value.
-	if (har) {
+	// With --har-redact the values are scrubbed, so the warning would be false.
+	if (har && !args["--har-redact"]) {
 		stderr(
-			`trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies\n`,
+			`trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies (add --har-redact to redact them)\n`,
 		);
 	}
 	return accepted;

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-10
+
+`trawl` can now borrow the cookies your everyday browser already has: import
+them into a profile (`trawl cookies import`) or send them with one fetch
+(`--cookies`), from a HAR, a `cookies.txt` or a copy-as-cURL line, with
+sign-in cookies left out unless you ask. The robots.txt request carries those
+cookies too, `--har` output can be redacted, and `trawl login` opens a real
+window again and finishes when you close it. Node 22 is now the minimum.
+
 ### Added
 
 - **`--har-redact`.** Opt-in redaction of `--har` output: replaces the values
@@ -304,7 +313,8 @@ instead of an empty `<div id="root">`.
   The installed command is `trawl` either way — the scope affects the package
   name, not the binary.
 
-[Unreleased]: https://github.com/rjwalters/trawl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rjwalters/trawl/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rjwalters/trawl/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rjwalters/trawl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rjwalters/trawl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rjwalters/trawl/releases/tag/v0.1.0

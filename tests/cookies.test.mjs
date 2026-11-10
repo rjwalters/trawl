@@ -1,0 +1,317 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
+	AUTH_COOKIES,
+	CookieParseError,
+	filterCookies,
+	isAuthCookie,
+	parseCookies,
+	summarize,
+} from "../src/cookies.mjs";
+
+const SENTINEL = "SENTINEL-s3cr3t-VALUE";
+const NOW = Date.parse("2026-06-01T00:00:00Z");
+const FUTURE = "2030-01-01T00:00:00Z";
+const FUTURE_SEC = Date.parse(FUTURE) / 1000;
+
+const harEntry = (url, reqCookie, setCookies = []) => ({
+	startedDateTime: "2026-06-01T00:00:00Z",
+	request: {
+		url,
+		headers: reqCookie ? [{ name: "Cookie", value: reqCookie }] : [],
+	},
+	response: {
+		headers: setCookies.map((v) => ({ name: "Set-Cookie", value: v })),
+	},
+});
+const har = (...entries) => JSON.stringify({ log: { version: "1.2", entries } });
+
+// Firefox-style HAR: request.cookies populated, header present.
+const FIREFOX_HAR = har(
+	harEntry("https://www.example.com/a", `theme=dark; tok=${SENTINEL}`, [
+		`tok=${SENTINEL}; Domain=example.com; Path=/app; Expires=Wed, 01 Jan 2030 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict`,
+	]),
+);
+// Chrome-style HAR: request cookies only in `cookies` array, no Cookie header.
+const CHROME_HAR = JSON.stringify({
+	log: {
+		entries: [
+			{
+				startedDateTime: "2026-06-01T00:00:00Z",
+				request: {
+					url: "http://plain.test/x",
+					headers: [],
+					cookies: [{ name: "a", value: SENTINEL }],
+				},
+				response: { headers: [], cookies: [] },
+			},
+		],
+	},
+});
+const NETSCAPE = [
+	"# Netscape HTTP Cookie File",
+	"# comment line",
+	"",
+	`.example.com\tTRUE\t/\tTRUE\t${FUTURE_SEC}\tkeep\t${SENTINEL}`,
+	`#HttpOnly_.example.com\tTRUE\t/\tFALSE\t0\tpref\t${SENTINEL}`,
+	`host.test\tFALSE\t/p\tFALSE\t100\told\t${SENTINEL}`,
+].join("\n");
+const CURL = `curl 'https://shop.example.com/cart' \\
+  -H 'Accept: */*' \\
+  -H 'Cookie: a=1; tok=${SENTINEL}' \\
+  -b "b=2" --compressed`;
+
+const names = (cs) => cs.map((c) => c.name);
+
+test("Firefox HAR: Set-Cookie attributes win over request Cookie", () => {
+	const cs = parseCookies(FIREFOX_HAR);
+	assert.equal(cs.length, 2);
+	const tok = cs.find((c) => c.name === "tok");
+	assert.deepEqual(tok, {
+		name: "tok",
+		value: SENTINEL,
+		domain: ".example.com",
+		path: "/app",
+		expires: FUTURE_SEC,
+		httpOnly: true,
+		secure: true,
+		sameSite: "Strict",
+	});
+	const theme = cs.find((c) => c.name === "theme");
+	assert.equal(theme.domain, "www.example.com");
+	assert.equal(theme.path, "/");
+	assert.equal(theme.expires, -1);
+	assert.equal(theme.secure, true);
+	assert.equal(theme.sameSite, undefined);
+});
+
+test("Chrome HAR: request.cookies fallback, http means not secure", () => {
+	const [c] = parseCookies(CHROME_HAR);
+	assert.equal(c.domain, "plain.test");
+	assert.equal(c.secure, false);
+	assert.equal(c.expires, -1);
+});
+
+test("Max-Age is relative to startedDateTime and beats Expires", () => {
+	const [c] = parseCookies(
+		har(
+			harEntry("https://a.test/", null, [
+				"x=1; Max-Age=3600; Expires=Wed, 01 Jan 2000 00:00:00 GMT",
+			]),
+		),
+	);
+	assert.equal(c.expires, Date.parse("2026-06-01T01:00:00Z") / 1000);
+});
+
+test("Netscape: HttpOnly prefix, comments, dot handling, session", () => {
+	const cs = parseCookies(NETSCAPE);
+	assert.deepEqual(names(cs), ["keep", "pref", "old"]);
+	assert.equal(cs[0].domain, ".example.com");
+	assert.equal(cs[0].secure, true);
+	assert.equal(cs[1].httpOnly, true);
+	assert.equal(cs[1].domain, ".example.com");
+	assert.equal(cs[1].expires, -1);
+	assert.equal(cs[2].domain, "host.test");
+	assert.equal(cs[2].path, "/p");
+});
+
+test("Netscape with CRLF line endings", () => {
+	const cs = parseCookies(NETSCAPE.replace(/\n/g, "\r\n"));
+	assert.deepEqual(names(cs), ["keep", "pref", "old"]);
+	assert.equal(cs[0].value, SENTINEL);
+});
+
+test("cURL: -H Cookie, -b, quoting and line continuations", () => {
+	const cs = parseCookies(CURL);
+	assert.deepEqual(names(cs), ["a", "tok", "b"]);
+	assert.equal(cs[0].domain, "shop.example.com");
+	assert.equal(cs[0].secure, true);
+	assert.equal(cs[1].value, SENTINEL);
+});
+
+test("cURL: $'...' strings and attached -b", () => {
+	const cs = parseCookies(`curl http://h.test/ -H $'Cookie: q=a\\x41\\tb' -bz=9`);
+	assert.deepEqual(
+		cs.map((c) => [c.name, c.value]),
+		[
+			["q", "aA\tb"],
+			["z", "9"],
+		],
+	);
+});
+
+test("cURL without URL or with no cookies", () => {
+	assert.throws(() => parseCookies("curl -H 'Cookie: a=1'"), CookieParseError);
+	assert.deepEqual(parseCookies("curl https://x.test/"), []);
+});
+
+test("edge: empty HAR and HAR without cookies yield []", () => {
+	assert.deepEqual(parseCookies(har()), []);
+	assert.deepEqual(parseCookies(har(harEntry("https://a.test/", null))), []);
+});
+
+test("edge: empty, malformed JSON, non-HAR JSON, unrecognised all throw", () => {
+	for (const bad of ["", "   \n", '{"log": ', '{"a":1}', "hello world"]) {
+		assert.throws(() => parseCookies(bad), CookieParseError);
+	}
+});
+
+test("edge: duplicate names across domains are all kept", () => {
+	const cs = parseCookies(
+		har(
+			harEntry("https://a.test/", "n=1"),
+			harEntry("https://b.test/", "n=2"),
+		),
+	);
+	assert.deepEqual(
+		cs.map((c) => [c.name, c.domain]),
+		[
+			["n", "a.test"],
+			["n", "b.test"],
+		],
+	);
+});
+
+test("edge: SameSite=None without Secure is downgraded to Lax", () => {
+	const [loose] = parseCookies(
+		har(harEntry("http://a.test/", null, ["x=1; SameSite=None"])),
+	);
+	assert.equal(loose.secure, false);
+	assert.equal(loose.sameSite, "Lax");
+	const [ok] = parseCookies(
+		har(harEntry("https://a.test/", null, ["x=1; SameSite=none; Secure"])),
+	);
+	assert.equal(ok.sameSite, "None");
+});
+
+test("edge: non-ASCII values round trip verbatim", () => {
+	const [c] = parseCookies(har(harEntry("https://a.test/", "n=héllo✓%C3%A9")));
+	assert.equal(c.value, "héllo✓%C3%A9");
+});
+
+test("filters: auth cookies dropped by default, includeAuth keeps them", () => {
+	const cs = parseCookies(
+		har(harEntry("https://google.com/", "SID=1; NID=2; AEC=3; __Secure-ENID=4; keep=5")),
+	);
+	const r = filterCookies(cs, { now: NOW });
+	assert.deepEqual(names(r.cookies), ["NID", "AEC", "__Secure-ENID", "keep"]);
+	assert.deepEqual(names(r.authDropped), ["SID"]);
+	assert.equal(filterCookies(cs, { now: NOW, includeAuth: true }).cookies.length, 5);
+});
+
+test("auth deny list covers the Google family", () => {
+	for (const n of [
+		"SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSID",
+		"__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PSIDCC",
+		"__Secure-1PSIDTS", "__Secure-3PSIDTS", "SIDCC", "PHPSESSID",
+	]) {
+		assert.ok(isAuthCookie(n), n);
+	}
+	for (const n of ["NID", "AEC", "__Secure-ENID", "theme"]) {
+		assert.ok(!isAuthCookie(n), n);
+	}
+});
+
+test("test is sensitive to the auth constant: emptied list drops nothing", () => {
+	assert.ok(AUTH_COOKIES.names.length > 0 && AUTH_COOKIES.patterns.length > 0);
+	const cs = parseCookies(har(harEntry("https://g.test/", "SID=1; __Secure-1PSID=2")));
+	assert.equal(filterCookies(cs, { now: NOW }).cookies.length, 0);
+	const savedNames = AUTH_COOKIES.names.splice(0);
+	const savedPatterns = AUTH_COOKIES.patterns.splice(0);
+	try {
+		assert.equal(filterCookies(cs, { now: NOW }).cookies.length, 2);
+	} finally {
+		AUTH_COOKIES.names.push(...savedNames);
+		AUTH_COOKIES.patterns.push(...savedPatterns);
+	}
+	assert.equal(filterCookies(cs, { now: NOW }).cookies.length, 0);
+});
+
+test("filters: domain matching incl. notexample.com negative", () => {
+	const mk = (domain) => ({
+		name: "n",
+		value: "v",
+		domain,
+		path: "/",
+		expires: -1,
+		httpOnly: false,
+		secure: false,
+	});
+	const cs = [
+		mk(".example.com"),
+		mk("www.example.com"),
+		mk("notexample.com"),
+		mk("other.test"),
+		mk("a.www.example.com"),
+	];
+	const got = (domain) =>
+		filterCookies(cs, { domain, now: NOW }).cookies.map((c) => c.domain);
+	assert.deepEqual(got("example.com"), [".example.com", "www.example.com", "a.www.example.com"]);
+	assert.deepEqual(got(".www.example.com"), [".example.com", "www.example.com", "a.www.example.com"]);
+	assert.deepEqual(got("notexample.com"), ["notexample.com"]);
+});
+
+test("filters: allow is exact-name, applied after domain", () => {
+	const cs = parseCookies(
+		har(
+			harEntry("https://a.test/", "keep=1; other=2; keepx=3"),
+			harEntry("https://b.test/", "keep=4"),
+		),
+	);
+	const r = filterCookies(cs, { domain: "a.test", allow: ["keep"], now: NOW });
+	assert.deepEqual(
+		r.cookies.map((c) => [c.name, c.domain]),
+		[["keep", "a.test"]],
+	);
+});
+
+test("filters: expired cookies dropped and counted; session kept", () => {
+	const r = filterCookies(parseCookies(NETSCAPE), { now: NOW });
+	assert.equal(r.expiredDropped, 1);
+	assert.deepEqual(names(r.cookies), ["keep", "pref"]);
+});
+
+test("summarize exposes only name, domain, expires", () => {
+	const s = summarize(filterCookies(parseCookies(NETSCAPE), { now: NOW }));
+	assert.deepEqual(Object.keys(s).sort(), ["authDropped", "expiredDropped", "kept"]);
+	for (const k of s.kept) assert.deepEqual(Object.keys(k), ["name", "domain", "expires"]);
+	assert.equal(s.expiredDropped, 1);
+	assert.equal(s.authDropped.count, 0);
+});
+
+test("redaction: sentinel never appears in summaries or errors", () => {
+	const sources = [FIREFOX_HAR, CHROME_HAR, NETSCAPE, CURL, `${NETSCAPE}\nSID`.replace("SID", "")];
+	for (const src of sources) {
+		const cs = parseCookies(src);
+		assert.ok(cs.some((c) => c.value === SENTINEL), "fixture carries sentinel");
+		for (const opts of [{}, { includeAuth: true }]) {
+			const out = JSON.stringify(summarize(filterCookies(cs, { now: NOW, ...opts })));
+			assert.ok(!out.includes(SENTINEL));
+		}
+		assert.ok(!JSON.stringify(summarize(cs)).includes(SENTINEL));
+	}
+	const authHar = har(harEntry("https://a.test/", `SID=${SENTINEL}`));
+	const authSummary = JSON.stringify(summarize(filterCookies(parseCookies(authHar), { now: NOW })));
+	assert.ok(!authSummary.includes(SENTINEL));
+
+	const bad = [
+		`{"log": {"entries": [ ${SENTINEL}`,
+		`{"x": "${SENTINEL}"}`,
+		`${SENTINEL} nothing recognisable`,
+		`curl -H 'Cookie: a=${SENTINEL}'`,
+		`{"log":{"entries":"${SENTINEL}"}}`,
+		"",
+	];
+	for (const src of bad) {
+		let err;
+		try {
+			parseCookies(src);
+		} catch (e) {
+			err = e;
+		}
+		assert.ok(err instanceof CookieParseError, src);
+		const dump = [err.message, err.stack, JSON.stringify(err), err.cause, ...Object.values(err)].join("|");
+		assert.ok(!dump.includes(SENTINEL), src);
+		assert.equal(err.cause, undefined);
+	}
+});

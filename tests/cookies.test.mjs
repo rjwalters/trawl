@@ -670,13 +670,13 @@ test("cookieHeaderFor: expiry (past, future, session)", () => {
 
 test("cookieHeaderFor: longer paths first, ties in input order, raw values, nameless cookies", () => {
 	const list = [
-		ck("b", "x=y;z", "example.com"),
+		ck("b", "x=y", "example.com"),
 		ck("long", "1", "example.com", { path: "/robots.txt" }),
 		ck("", "bare", ".example.com"),
 		ck("a", '"q"%20', "example.com"),
 		ck("httponly", "h", "example.com", { httpOnly: true, sameSite: "Strict" }),
 	];
-	assert.equal(cookieHeaderFor(list, ROBOTS), 'long=1; b=x=y;z; bare; a="q"%20; httponly=h');
+	assert.equal(cookieHeaderFor(list, ROBOTS), 'long=1; b=x=y; bare; a="q"%20; httponly=h');
 });
 
 test("cookieHeaderFor: no match, empty or junk input is undefined", () => {
@@ -732,6 +732,20 @@ test("cookieHeaderFor: a control character leaves that cookie out, by name or va
 	assert.equal(cookieHeaderFor([ck("lib", "a\u0000b", "example.com")], ROBOTS), undefined);
 	// Only cookies that would have been sent are reported.
 	assert.deepEqual(robotsCookieHeader([ck("far", "a\nb", "other.org")], ROBOTS).omitted, []);
+});
+
+test("robotsCookieHeader: `;` in a name or value, or `=` in a name, leaves that cookie out", () => {
+	const list = [
+		ck("lib", "LIBLEAK; injected=1", "example.com"),
+		ck("a=b", "LIBLEAK", "example.com"),
+		ck("semi;name", "x", "example.com"),
+		ck("eq", "v=w", "example.com"),
+		ck("ok", "fine", "example.com"),
+	];
+	const { header, omitted } = robotsCookieHeader(list, ROBOTS);
+	assert.deepEqual(omitted, ["lib", "a=b", "semi;name"]);
+	// `=` in a value is valid and still sent.
+	assert.equal(header, "eq=v=w; ok=fine");
 });
 
 test("cookieHeaderFor: non-ASCII goes as its UTF-8 bytes, as Chromium sends it on the page request", () => {

@@ -756,21 +756,26 @@ function cookiePathMatches(cookiePath, requestPath) {
 	return path.endsWith("/") || requestPath[path.length] === "/";
 }
 
-// A name or value that cannot go in the header: a control character. Node's
+// A name or value that cannot go in the header as given: a control character,
+// or a `;` in either (it would split the header into a phantom cookie), or an
+// `=` in the name (the server would split the pair at the first one). Node's
 // fetch refuses NUL, CR and LF outright (and quotes the whole header in its
-// error) and would send the others, tab included, raw. Chromium refuses all
-// of these cookies (`browserWouldReject`). Everything else is sent as given.
-const HEADER_UNSAFE = /[\u0000-\u001f\u007f]/;
+// error) and would send the others, tab included, raw. Chromium refuses all of
+// these cookies (`browserWouldReject`), so the browser never sends them either.
+// Everything else is sent as given; an `=` in a value is valid.
+const HEADER_UNSAFE = /[\u0000-\u001f\u007f;]/;
 
 function headerSafe(c) {
-	return !HEADER_UNSAFE.test(String(c.name ?? "")) && !HEADER_UNSAFE.test(String(c.value ?? ""));
+	const name = String(c.name ?? "");
+	return !HEADER_UNSAFE.test(name) && !name.includes("=") && !HEADER_UNSAFE.test(String(c.value ?? ""));
 }
 
 /**
  * The robots.txt `Cookie` header and what had to be left out of it:
  * `{ header, omitted }`. `header` is as `cookieHeaderFor` describes; `omitted`
  * holds the *names* (never values) of matching cookies that could not be sent
- * because a name or value holds a character that cannot go in a header.
+ * because a name or value holds a character that cannot go in a header
+ * as given (a control character or `;`, or an `=` in the name).
  *
  * Non-ASCII is sent, not omitted, as the bytes Chromium puts on the page
  * request: UTF-8 (checked against Chromium 156 for U+0080..U+00FF, U+2603,

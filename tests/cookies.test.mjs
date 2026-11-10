@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+	addCookiesFailure,
 	AUTH_COOKIES,
 	browserWouldReject,
 	CookieParseError,
@@ -10,6 +11,7 @@ import {
 	parseCookies,
 	sourceUserAgent,
 	summarize,
+	whyNoneLeft,
 } from "../src/cookies.mjs";
 
 const SENTINEL = "SENTINEL-s3cr3t-VALUE";
@@ -301,9 +303,54 @@ test("browserWouldReject mirrors Chromium's cookie checks", () => {
 		{ name: "__HOST-a", path: "/x" },
 		{ name: "__Host-a", domain: ".example.com" },
 		{ name: "", value: "__Host-x", secure: false },
+		{ name: "", value: "__Host-x" },
+		{ name: "", value: "__SECURE-x" },
+		{ name: "", value: "__Http-x", secure: false },
+		{ name: "", value: "__http-x", httpOnly: true },
+		{ name: "__Http-a" },
+		{ name: "__HTTP-a", httpOnly: true, secure: false },
+		{ name: "__Host-Http-a" },
+		{ name: "__host-http-a", httpOnly: true, path: "/x" },
+		{ domain: "::1" },
+		{ domain: ".::1" },
+		{ domain: "2001:db8::1" },
 	]) {
 		assert.equal(browserWouldReject({ ...ok, ...bad }), true, JSON.stringify(bad));
 	}
+	for (const fine of [
+		{ name: "__Http-a", httpOnly: true },
+		{ name: "__Host-Http-a", httpOnly: true },
+		{ name: "__Secure-Http-a" },
+		{ domain: "[::1]" },
+		{ domain: "127.0.0.1" },
+	]) {
+		assert.equal(browserWouldReject({ ...ok, ...fine }), false, JSON.stringify(fine));
+	}
+});
+
+test("addCookiesFailure returns only fixed detail, and survives a hostile error", () => {
+	assert.equal(
+		addCookiesFailure(new Error("browserContext.addCookies: Protocol error (Storage.setCookies): Invalid cookie fields\nCall log: x")),
+		"the browser refused a cookie, and so the whole batch",
+	);
+	assert.equal(addCookiesFailure(new Error("Target page, context or browser has been closed")), "the browser closed unexpectedly");
+	assert.equal(addCookiesFailure(new Error(`browserContext.addCookies: bad ${SENTINEL}`)), undefined);
+	const getter = new Error("x");
+	Object.defineProperty(getter, "message", {
+		get() {
+			throw new Error(SENTINEL);
+		},
+	});
+	assert.equal(addCookiesFailure(getter), undefined);
+	assert.equal(addCookiesFailure({ message: { toString() { throw new Error(SENTINEL); } } }), undefined);
+	assert.equal(addCookiesFailure(undefined), undefined);
+	assert.equal(addCookiesFailure("a string"), undefined);
+});
+
+test("whyNoneLeft's --include-auth hint names the command's verb", () => {
+	const result = { cookies: [], authDropped: [{ name: "SID", domain: "x" }], expiredDropped: 0, matched: 1 };
+	assert.equal(whyNoneLeft(1, result, 0, {}), "every cookie was a sign-in cookie (pass --include-auth to import sign-in cookies)");
+	assert.equal(whyNoneLeft(1, result, 0, { verb: "use" }), "every cookie was a sign-in cookie (pass --include-auth to use sign-in cookies)");
 });
 
 test("filters: expired cookies dropped and counted; session kept", () => {

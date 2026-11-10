@@ -59,8 +59,12 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
       --timeout <ms>       Navigation/selector timeout       (default: 30000)
   -o, --output <file>      Write to a file instead of stdout
   -A, --user-agent <ua>    Override the User-Agent
-      --har <file>         Write a HAR 1.2 network trace to this file
+      --har <file>         Write a HAR 1.2 network trace to this file.
+                            It records cookie headers, values included, for
+                            any fetch that sends cookies (--cookies or
+                            --profile)
       --har-omit-content   Record HAR metadata only, no response bodies
+                            (cookie headers and values are still recorded)
       --executable-path <p>  Chromium binary to use
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
@@ -86,6 +90,17 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
                             $TRAWL_PROFILE_DIR there either). A plain fetch
                             stays isolated (no persistence) unless you pass
                             --profile/$TRAWL_PROFILE_DIR here too.
+      --cookies <file>     Send the cookies from a HAR, a Netscape
+                            cookies.txt or a copy-as-cURL command with this
+                            one fetch; no profile or cookie store is written
+                            (but --har records them). Filtered as cookies
+                            import is (below: same defaults, and --domain,
+                            --allow, --include-auth work here too). Prints
+                            names/domains/expiry to stderr under -S, or when
+                            any were dropped; never values. Not with
+                            --profile/$TRAWL_PROFILE_DIR: use cookies import
+                            to keep them. robots.txt is still fetched
+                            without them.
       --no-auth-check      Skip login-wall detection (see "Auth walls" below)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
@@ -103,6 +118,7 @@ Cookie import (trawl cookies import <file>):
                             refuse are skipped by name. If none are left,
                             nothing is written and the exit code is 1.
                             Delete the source file afterwards.
+                            These three filters also apply to --cookies:
       --domain <host>      Only cookies that would be sent to this host
       --allow <names>      Only these cookie names (comma-separated)
       --include-auth       Keep sign-in cookies too
@@ -120,6 +136,7 @@ trawl https://example.com --screenshot page.png --full-page   # text + a PNG
 trawl login https://example.com --profile ~/.trawl/example    # sign in once
 trawl https://example.com --profile ~/.trawl/example           # reuse the session
 trawl cookies import cookies.txt --profile ~/.trawl/example    # or bring cookies
+trawl https://example.com --cookies cookies.txt                # or just this once
 ```
 
 ### Clicking before extraction
@@ -206,6 +223,13 @@ Response bodies are embedded in the file, so it is self-contained and
 portable. That also makes it large, and means it saves whatever the page
 loaded — `--har-omit-content` keeps the requests and timings but drops the
 bodies.
+
+The trace also records cookies, values included: each request's `Cookie`
+header and parsed cookies, and each response's `Set-Cookie`. So for any
+fetch that sends cookies — with `--cookies` or from a `--profile` — the HAR
+file holds those cookie values in plain text, sign-in cookies too, and
+`--har-omit-content` does not remove them. Treat such a HAR like the cookie
+file itself. `--cookies` together with `--har` prints a warning saying so.
 
 The trace is flushed when the browser context closes, so a run that fails
 mid-navigation (timeout, DNS failure, connection refused) still leaves a
@@ -332,6 +356,48 @@ that is not `trawl` itself: it identifies itself honestly as `trawl/<version>`,
 and some sites bind cookies to the client that received them, so a session
 may not carry over.
 
+#### Cookies for a single fetch
+
+To use exported cookies for one fetch without keeping them anywhere, pass the
+file to `--cookies`. It takes the same three formats and applies the same
+filters as `trawl cookies import` (expired and sign-in cookies dropped unless
+`--include-auth`, cookies the browser would refuse skipped by name,
+`--domain` and `--allow` to narrow it), with two differences:
+
+```sh
+trawl https://example.com/account --cookies ~/Downloads/cookies.txt \
+      --domain example.com
+```
+
+- **No cookie store is written.** The cookies go into the fetch's throwaway
+  browser context and are gone when it closes; no profile, temp file or
+  cookie store is written. So session cookies stay session cookies here:
+  there is no 7-day expiry, because there is no store for them to survive
+  in. The one exception is a file you ask for: `--har` records the cookies
+  it sends, values included, and `--har-omit-content` does not change that
+  (see [HAR capture](#har-capture)). `--cookies` with `--har` warns on
+  stderr, naming the HAR file but no value.
+- **Not together with a profile.** `--cookies` with `--profile` (or with
+  `$TRAWL_PROFILE_DIR` set) is an error, since the profile would keep the
+  cookies; use `trawl cookies import` for that, or unset the variable for
+  the run.
+
+It stays quiet unless something needs saying: the names, domains and expiry
+of the cookies used (never their values) go to stderr under `-S`, or
+whenever a cookie was dropped or skipped, so a sign-in cookie that was left
+behind never goes unnoticed. A file that cannot be read or parsed, or that
+leaves no cookie to use, exits 1 before any request is made, robots.txt
+included, and before a browser starts. If the browser refuses the cookies,
+the error says so without repeating the browser's message. `--domain`,
+`--allow` and `--include-auth` without `--cookies` are an error.
+
+The `robots.txt` check is still made **without** these cookies. A site whose
+`robots.txt` itself needs them (the anonymous request fails with a 5xx or
+times out, which trawl treats as a full disallow) still needs
+`--ignore-robots` for now.
+
+`--cookies` is a CLI flag only: the MCP server's tools take no cookies.
+
 ### As a library
 
 ```js
@@ -353,6 +419,14 @@ rendered page looks like a login wall — pass `{ authCheck: false }` to skip
 the check. Pass `{ profileDir: "<dir>" }` to render through a persistent
 browser profile instead of a fresh one each call, the library equivalent of
 `--profile`.
+
+`{ cookies: [...] }` is the library side of `--cookies`: Playwright cookie
+objects (`name`, `value`, `domain`, `path`, `expires`, `httpOnly`, `secure`),
+already parsed and filtered (`parseCookies`, `filterCookies` and
+`browserWouldReject` in `src/cookies.mjs` do that), added to the context
+before the page loads and passed through unchanged. With `profileDir` as well
+they are written into that profile. If the browser refuses them, `render()`
+rejects with a fixed message that never quotes the browser's error.
 
 `render()` accepts the same click steps as `{ click: [...] }`: each entry is
 a CSS selector string, or `{ selector, waitFor }` for the `--then-wait` form.

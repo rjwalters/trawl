@@ -625,7 +625,9 @@ export async function render(url, options = {}) {
 		return start();
 	};
 
-	const executablePath = resolveExecutablePath(opts.executablePath);
+	const executablePath = resolveExecutablePath(opts.executablePath, {
+		profileDir: opts.profileDir,
+	});
 	// Test seam, deliberately undocumented: lets a test stand in for
 	// Playwright's `chromium` without a real browser.
 	const browserType = opts.browserType ?? chromium;

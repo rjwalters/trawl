@@ -3,11 +3,21 @@
 // browser is needed and these always run.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { findCachedShell } from "../src/browser.mjs";
+import {
+	findCachedFullChromium,
+	findCachedShell,
+	isHeadlessShell,
+	NoHeadedBrowserError,
+	PROFILE_BROWSER_FILE,
+	profileBrowser,
+	recordProfileBrowser,
+	resolveExecutablePath,
+	resolveHeadedExecutablePath,
+} from "../src/browser.mjs";
 
 function tempHome(t) {
 	const dir = mkdtempSync(path.join(tmpdir(), "trawl-browser-"));
@@ -107,4 +117,126 @@ test("returns null when the cache root is missing", (t) => {
 		findCachedShell({ platform: "darwin", arch: "arm64", home }),
 		null,
 	);
+});
+
+// --- headed resolution for `trawl login` (#95) -------------------------------
+
+// Create `<root>/chromium-<rev>/<rel>` and return its path.
+function plantFull(root, rev, rel) {
+	const file = path.join(root, `chromium-${rev}`, rel);
+	mkdirSync(path.dirname(file), { recursive: true });
+	writeFileSync(file, "");
+	return file;
+}
+
+const macRoot = (home) => path.join(home, "Library/Caches/ms-playwright");
+const CFT = "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+// Only files under the fake home "exist", so a real system Chrome on the
+// test host never leaks into these assertions.
+const onlyUnder = (home) => (p) => p.startsWith(home) && existsSync(p);
+
+test("darwin arm64 finds Playwright's Chrome for Testing full build", (t) => {
+	const home = tempHome(t);
+	const bin = plantFull(macRoot(home), 1200, `chrome-mac-arm64/${CFT}`);
+	assert.equal(findCachedFullChromium({ platform: "darwin", arch: "arm64", home }), bin);
+});
+
+test("darwin finds the legacy chrome-mac/Chromium.app layout", (t) => {
+	const home = tempHome(t);
+	const bin = plantFull(macRoot(home), 1100, "chrome-mac/Chromium.app/Contents/MacOS/Chromium");
+	assert.equal(findCachedFullChromium({ platform: "darwin", arch: "arm64", home }), bin);
+});
+
+test("linux x64 finds chrome-linux64/chrome, highest revision first", (t) => {
+	const home = tempHome(t);
+	plantFull(linuxRoot(home), 900, "chrome-linux64/chrome");
+	const bin = plantFull(linuxRoot(home), 1200, "chrome-linux64/chrome");
+	assert.equal(findCachedFullChromium({ platform: "linux", arch: "x64", home }), bin);
+});
+
+test("full-Chromium lookup ignores headless-shell builds", (t) => {
+	const home = tempHome(t);
+	plantShell(linuxRoot(home), 1200, "linux64");
+	assert.equal(findCachedFullChromium({ platform: "linux", arch: "x64", home }), null);
+});
+
+test("isHeadlessShell recognises the shell binary only", () => {
+	assert.equal(isHeadlessShell("/x/chrome-headless-shell-linux64/chrome-headless-shell"), true);
+	assert.equal(isHeadlessShell("C:\\x\\chrome-headless-shell.exe"), true);
+	assert.equal(isHeadlessShell("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), false);
+});
+
+test("headed resolution never returns the headless shell, even when it is the only browser", (t) => {
+	const home = tempHome(t);
+	plantShell(linuxRoot(home), 1200, "linux64");
+	assert.throws(
+		() => resolveHeadedExecutablePath(undefined, { platform: "linux", arch: "x64", home, exists: onlyUnder(home) }),
+		NoHeadedBrowserError,
+	);
+});
+
+test("headed resolution rejects an explicit headless-shell path", (t) => {
+	const home = tempHome(t);
+	const shell = plantShell(linuxRoot(home), 1200, "linux64");
+	assert.throws(
+		() => resolveHeadedExecutablePath(shell, { platform: "linux", arch: "x64", home, exists: onlyUnder(home) }),
+		/cannot open a window/,
+	);
+});
+
+test("headed resolution prefers a system Chrome over the Playwright cache", (t) => {
+	const home = tempHome(t);
+	plantFull(macRoot(home), 1200, `chrome-mac-arm64/${CFT}`);
+	const system = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+	const exists = (p) => p === system || onlyUnder(home)(p);
+	assert.equal(
+		resolveHeadedExecutablePath(undefined, { platform: "darwin", arch: "arm64", home, exists }),
+		system,
+	);
+});
+
+test("headed resolution falls back to the cached full Chromium", (t) => {
+	const home = tempHome(t);
+	const bin = plantFull(macRoot(home), 1200, `chrome-mac-arm64/${CFT}`);
+	assert.equal(
+		resolveHeadedExecutablePath(undefined, { platform: "darwin", arch: "arm64", home, exists: onlyUnder(home) }),
+		bin,
+	);
+});
+
+// --- profile browser marker (#95: version skew between login and fetch) -----
+
+test("a recorded profile browser round-trips", (t) => {
+	const profile = tempHome(t);
+	const exe = path.join(profile, "fake-chrome");
+	writeFileSync(exe, "");
+	recordProfileBrowser(profile, exe);
+	assert.equal(profileBrowser(profile), exe);
+});
+
+test("profileBrowser is null with no marker, a bad marker, or a vanished binary", (t) => {
+	const profile = tempHome(t);
+	assert.equal(profileBrowser(profile), null);
+	assert.equal(profileBrowser(undefined), null);
+	writeFileSync(path.join(profile, PROFILE_BROWSER_FILE), "not json");
+	assert.equal(profileBrowser(profile), null);
+	recordProfileBrowser(profile, path.join(profile, "gone"));
+	assert.equal(profileBrowser(profile), null);
+});
+
+test("fetch resolution uses the profile's recorded browser before the headless shell", (t) => {
+	const profile = tempHome(t);
+	const exe = path.join(profile, "fake-chrome");
+	writeFileSync(exe, "");
+	recordProfileBrowser(profile, exe);
+	const saved = process.env.TRAWL_EXECUTABLE_PATH;
+	delete process.env.TRAWL_EXECUTABLE_PATH;
+	t.after(() => {
+		if (saved !== undefined) process.env.TRAWL_EXECUTABLE_PATH = saved;
+	});
+	assert.equal(resolveExecutablePath(undefined, { profileDir: profile }), exe);
+	// An explicit path still wins.
+	const other = path.join(profile, "other-chrome");
+	writeFileSync(other, "");
+	assert.equal(resolveExecutablePath(other, { profileDir: profile }), other);
 });

@@ -568,15 +568,32 @@ export async function runLogin(argv, deps = {}) {
 	const waitForUser = deps.waitForUser ?? defaultWaitForUser;
 	const stderr = deps.stderr ?? ((s) => process.stderr.write(s));
 
-	const { resolveExecutablePath } = await import("./browser.mjs");
-	const executablePath = resolveExecutablePath(args["--executable-path"]);
+	// Login needs a browser that can draw a window: never the headless shell
+	// that fetches prefer (#95).
+	const resolveHeaded =
+		deps.resolveHeadedExecutablePath ??
+		(await import("./browser.mjs")).resolveHeadedExecutablePath;
+	const executablePath = resolveHeaded(
+		args["--executable-path"] ?? env.TRAWL_EXECUTABLE_PATH,
+	);
 
 	const context = await launch(profileDir, { executablePath, headless: false });
-	const page = await context.newPage();
+	// So later fetches with this profile launch the same browser (#95).
+	const record =
+		deps.recordProfileBrowser ??
+		(await import("./browser.mjs")).recordProfileBrowser;
+	try {
+		record(profileDir, executablePath);
+	} catch (err) {
+		stderr(`trawl: could not record the login browser in ${profileDir}: ${err.message}\n`);
+	}
+	// A persistent context opens with one blank tab; use it, so closing the
+	// sign-in tab really empties the window (#96).
+	const page = context.pages?.()[0] ?? (await context.newPage());
 	await page.goto(origin);
 
 	stderr(
-		`A browser window has opened at ${origin}.\n` +
+		`A browser window has opened at ${origin} (${executablePath}).\n` +
 			"Sign in, then close the browser window (or press Enter here) to save " +
 			`the session to:\n  ${profileDir}\n` +
 			(usedDefaultProfileDir
@@ -803,7 +820,7 @@ export async function runCookiesImport(argv, deps = {}) {
 	const resolveExe =
 		deps.resolveExecutablePath ??
 		(await import("./browser.mjs")).resolveExecutablePath;
-	const executablePath = resolveExe(args["--executable-path"]);
+	const executablePath = resolveExe(args["--executable-path"], { profileDir });
 
 	// 0700 only on a directory trawl creates now; an existing one's mode is
 	// the operator's choice and is left alone.
@@ -895,15 +912,27 @@ async function defaultLaunchPersistentContext(profileDir, options) {
 	return chromium.launchPersistentContext(profileDir, options);
 }
 
-function defaultWaitForUser(context) {
+// Finishes when the browser exits, when the user presses Enter, or when the
+// last page in the context closes. The last is what "close the window" does
+// on macOS, where closing a window leaves the app (and context) running (#96).
+export function defaultWaitForUser(context, stdin = process.stdin) {
 	return new Promise((resolve) => {
+		let done = false;
 		const finish = () => {
-			process.stdin.pause();
+			if (done) return;
+			done = true;
+			stdin.pause();
 			resolve();
 		};
+		const watch = (page) =>
+			page.once("close", () => {
+				if (context.pages().length === 0) finish();
+			});
+		for (const page of context.pages()) watch(page);
+		context.on("page", watch);
 		context.once("close", finish);
-		process.stdin.resume();
-		process.stdin.once("data", finish);
+		stdin.resume();
+		stdin.once("data", finish);
 	});
 }
 

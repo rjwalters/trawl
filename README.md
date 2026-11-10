@@ -311,10 +311,20 @@ by contrast, stays isolated (no persistence) unless you pass
 `--profile <dir>` yourself — pass the same `~/.trawl/profile` path to reuse
 the default session, or a dedicated directory to isolate one site's session.
 
-`trawl login` needs a real, headed-capable Chrome/Chromium —
-`chrome-headless-shell` (the default cached binary) cannot open a window, so
-point `--executable-path` at a system browser if that's all you have
-installed.
+`trawl login` needs a browser that can open a window, so it never uses
+`chrome-headless-shell` (the default cached binary for fetches). It picks
+`--executable-path` or `$TRAWL_EXECUTABLE_PATH` if given, else an installed
+Google Chrome or Chromium (signed, so macOS doesn't prompt), else
+Playwright's full Chromium (`npx playwright install chromium`), and fails
+with install instructions if none exists. Login finishes when you close the
+window, even on macOS where the browser app keeps running.
+
+Login records the browser it used in the profile (`.trawl-browser`), and a
+later `trawl <url> --profile <dir>` (or `trawl cookies import`) with that
+profile launches the same browser headless. A profile written by one
+Chromium version can't always be opened by another, and the cached
+headless shell is usually older than a system Chrome. An explicit
+`--executable-path` or `$TRAWL_EXECUTABLE_PATH` still overrides it.
 
 #### Importing cookies from another browser
 

@@ -372,13 +372,14 @@ function redirectedElsewhere(response, robotsUrl) {
 // would be false, and `{ profile: true }` on the `--profile` path, where the
 // note says no cookie from the profile went along instead. A verdict marked
 // `crossOriginRedirect` (see `checkRobotsAllowed`) gets a fixed hint that the
-// cookies did not follow the redirect. Nothing here ever names a cookie.
+// cookies did not follow the redirect, but only when robots.txt could not be
+// retrieved: a matched rule is a plain disallow and never carries it. Nothing here ever names a cookie.
 export function robotsDenialMessage(verdict, { sentCookies = false, profile = false } = {}) {
 	const override = "Use --ignore-robots to override.";
-	const redirectHint = verdict?.crossOriginRedirect
+	const redirectHint = verdict?.failure && verdict?.crossOriginRedirect
 		? "The robots.txt request was redirected to another origin, and cookies " +
-			"are not sent across a cross-origin redirect; fetching the page from " +
-			"that origin directly may get through. "
+			"are not sent across a cross-origin redirect, so a cookie-gated " +
+			"robots.txt there was requested without them. "
 		: "";
 	const failure = verdict?.failure;
 	if (!failure) {

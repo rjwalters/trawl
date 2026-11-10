@@ -599,9 +599,10 @@ default rather than asking you to promise you will.
   a redirect to another origin (another host or port, or `http` to `https`)
   drops the header, so a cookie-gated `robots.txt` reached through, say, an
   `http`-to-`https` or `example.com`-to-`www.example.com` redirect is
-  refused, and the error adds that the cookies did not follow the redirect
-  (fetch the page from the origin it redirected to, or use
-  `--ignore-robots`); a redirect within the same origin keeps the header; and
+  refused, and when that redirect target answered with a 5xx or a body that
+  failed mid-read the error adds that the cookies did not follow it (not on a
+  timeout or network error before any response, and not when a rule matched;
+  use `--ignore-robots` to override); a redirect within the same origin keeps the header; and
   a `Set-Cookie` on the `robots.txt` response is ignored, not stored in the
   profile. On `--profile` the jar applies the browser's own matching rules,
   `Secure` included, so a `Secure` cookie goes to `http://localhost` and

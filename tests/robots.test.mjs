@@ -724,7 +724,7 @@ test("the plain-path cookie note is byte-identical; --profile gets its own fixed
 // --- #93: a cross-origin redirect drops the Cookie header; say so ---
 
 const REDIRECT_HINT =
-	"The robots.txt request was redirected to another origin, and cookies are not sent across a cross-origin redirect; fetching the page from that origin directly may get through. ";
+	"The robots.txt request was redirected to another origin, and cookies are not sent across a cross-origin redirect, so a cookie-gated robots.txt there was requested without them. ";
 
 // Two local servers (two ports, so two origins). `a` redirects /robots.txt to
 // `to(a, b)`; `b` serves a robots.txt that answers 503 without `gate=open`,
@@ -781,7 +781,7 @@ test("a cookie-carrying robots.txt redirected to another origin is refused with 
 	}
 });
 
-test("the hint also follows a matched-rule denial after a cross-origin redirect", async () => {
+test("a matched-rule denial after a cross-origin redirect carries no hint", async () => {
 	const rig = await redirectRig({ to: (o) => `${o.b}/robots.txt` });
 	try {
 		const v = await checkRobotsAllowed(`${rig.a}/page`, {
@@ -797,7 +797,7 @@ test("the hint also follows a matched-rule denial after a cross-origin redirect"
 		assert.equal(v.crossOriginRedirect, true);
 		assert.equal(
 			robotsDenialMessage(v, { sentCookies: true }),
-			`robots.txt disallows this path (Disallow: /). ${REDIRECT_HINT}Use --ignore-robots to override.`,
+			"robots.txt disallows this path (Disallow: /). Use --ignore-robots to override.",
 		);
 	} finally {
 		await rig.close();

@@ -651,7 +651,7 @@ export async function render(url, options = {}) {
 			} catch (err) {
 				const known = addCookiesFailure(err);
 				throw new Error(
-					`could not add cookies to the browser; nothing was fetched${known ? ` (${known})` : ""}`,
+					`could not add cookies to the browser; the page was not fetched${known ? ` (${known})` : ""}`,
 				);
 			}
 		}

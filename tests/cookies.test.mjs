@@ -305,6 +305,8 @@ test("browserWouldReject mirrors Chromium's cookie checks", () => {
 		{ name: "", value: "__Host-x", secure: false },
 		{ name: "", value: "__Host-x" },
 		{ name: "", value: "__SECURE-x" },
+		{ name: "", value: "__Http-x", secure: false },
+		{ name: "", value: "__http-x", httpOnly: true },
 		{ name: "__Http-a" },
 		{ name: "__HTTP-a", httpOnly: true, secure: false },
 		{ name: "__Host-Http-a" },
@@ -318,7 +320,6 @@ test("browserWouldReject mirrors Chromium's cookie checks", () => {
 	for (const fine of [
 		{ name: "__Http-a", httpOnly: true },
 		{ name: "__Host-Http-a", httpOnly: true },
-		{ name: "", value: "__Http-x", secure: false },
 		{ name: "__Secure-Http-a" },
 		{ domain: "[::1]" },
 		{ domain: "127.0.0.1" },

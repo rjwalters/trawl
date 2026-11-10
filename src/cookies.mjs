@@ -760,9 +760,10 @@ export function browserWouldReject(cookie) {
 	// dot) is refused; the bracketed form (`[::1]`) is accepted.
 	if (isIPv6(domain.replace(/^\.+/, ""))) return true;
 	// Prefixes match case-insensitively. A nameless cookie whose value looks
-	// like `__Host-` / `__Secure-` is refused outright, whatever its flags
-	// (a nameless `__Http-` value is not).
-	if (name === "") return /^__(host|secure)-/i.test(value);
+	// like `__Host-` / `__Secure-` / `__Http-` is refused outright, whatever
+	// its flags (checked against Chromium 156 and 158; older builds such as
+	// 143 accepted a nameless `__Http-` value, so this errs towards refusing).
+	if (name === "") return /^__(host|secure|http)-/i.test(value);
 	const prefixed = name.toLowerCase();
 	if (prefixed.startsWith("__secure-") && !cookie.secure) return true;
 	if (

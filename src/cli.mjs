@@ -95,8 +95,12 @@ Options:
       --timeout <ms>       Navigation/selector timeout       (default: 30000)
   -o, --output <file>      Write to a file instead of stdout
   -A, --user-agent <ua>    Override the User-Agent
-      --har <file>         Write a HAR 1.2 network trace to this file
+      --har <file>         Write a HAR 1.2 network trace to this file.
+                            It records cookie headers, values included, for
+                            any fetch that sends cookies (--cookies or
+                            --profile)
       --har-omit-content   Record HAR metadata only, no response bodies
+                            (cookie headers and values are still recorded)
       --executable-path <p>  Chromium binary to use
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
@@ -124,7 +128,8 @@ Options:
                             --profile/$TRAWL_PROFILE_DIR here too.
       --cookies <file>     Send the cookies from a HAR, a Netscape
                             cookies.txt or a copy-as-cURL command with this
-                            one fetch; nothing is saved. Filtered as cookies
+                            one fetch; no profile or cookie store is written
+                            (but --har records them). Filtered as cookies
                             import is (below: same defaults, and --domain,
                             --allow, --include-auth work here too). Prints
                             names/domains/expiry to stderr under -S, or when
@@ -469,9 +474,10 @@ function loadFetchCookies(args, { profileDir, stderr }) {
 		stderr(dropped.join(""));
 		throw new Error(`no cookies left to use from ${file}: ${why()}`);
 	}
+	const har = args["--har"];
 	if (args["--show-status"] || dropped.length > 0) {
 		stderr(
-			`Using ${plural(summary.kept.length, "cookie")} from ${file} for this fetch only (not saved):\n` +
+			`Using ${plural(summary.kept.length, "cookie")} from ${file} for this fetch only${har ? "" : " (not saved)"}:\n` +
 				summary.kept
 					.map(
 						(c) =>
@@ -481,6 +487,14 @@ function loadFetchCookies(args, { profileDir, stderr }) {
 					)
 					.join("") +
 				dropped.join(""),
+		);
+	}
+	// The HAR is a full network trace: it keeps each request's Cookie header
+	// and parsed cookies, values included (--har-omit-content drops bodies
+	// only). Always said, -S or not; names the HAR file, never a value.
+	if (har) {
+		stderr(
+			`trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies\n`,
 		);
 	}
 	return accepted;

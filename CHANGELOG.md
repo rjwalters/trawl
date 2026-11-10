@@ -26,8 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$TRAWL_PROFILE_DIR`) is required. (#77)
 - **`trawl <url> --cookies <file>`.** Sends the cookies from a HAR,
   `cookies.txt` or copy-as-cURL file with one fetch, without a profile, and
-  saves nothing: no profile, no temp file, and session cookies stay session
-  cookies (no 7-day expiry). Same filtering as `trawl cookies import`
+  writes no cookie store: no profile, no temp file, and session cookies stay
+  session cookies (no 7-day expiry). `--har` still records the cookies it
+  sends, values included (as it does for `--profile`, and
+  `--har-omit-content` does not remove them), so `--cookies` with `--har`
+  prints a warning naming the HAR file; `--help` and the README now say this
+  for both. Same filtering as `trawl cookies import`
   (`--domain`, `--allow` and `--include-auth` now work on a fetch, but only
   next to `--cookies`; without it each is an error). Prints names, domains
   and expiry to stderr under `-S`, or when a cookie was dropped or skipped;
@@ -49,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch) now also catches `__Http-` cookies that are not both `Secure` and
   `HttpOnly`, `__Host-Http-` cookies that are not `HttpOnly`, a bare IPv6
   domain such as `::1` (the bracketed `[::1]` is accepted), and a nameless
-  cookie whose value starts with `__Host-` or `__Secure-`. Each was checked
-  against real Chromium. A browser error whose `message` cannot even be read
+  cookie whose value starts with `__Host-`, `__Secure-` or `__Http-` (any
+  case). Each was checked against the Chromium build playwright-core pins
+  (156) and the one CI installs (158). A browser error whose `message` cannot even be read
   now still gets the fixed message. (#78)
 
 ## [0.3.0] - 2026-11-03

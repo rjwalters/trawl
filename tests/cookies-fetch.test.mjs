@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -192,6 +192,35 @@ test("the summary is quiet unless -S, or something was dropped or skipped", asyn
 	}
 });
 
+test("--cookies with --har warns, with or without -S, naming the HAR but no value", async () => {
+	const dir = tempDir();
+	const clean = writeSource(dir, "clean.txt", netscape([[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", SENTINEL]]));
+	const har = join(dir, "trace.har");
+	const WARNING = `trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies\n`;
+	try {
+		// Quiet otherwise, so the warning is the whole of stderr.
+		let r = await runMain([URL_, "--cookies", clean, "--har", har]);
+		assert.equal(r.code, 0);
+		assert.equal(r.calls[0][1].har, har);
+		assert.equal(r.stderr, WARNING);
+
+		r = await runMain([URL_, "--cookies", clean, "--har", har, "--har-omit-content", "-S"]);
+		assert.equal(r.code, 0);
+		// The summary no longer claims "(not saved)" when a HAR will keep them.
+		assert.match(r.stderr, /^Using 1 cookie from .*clean\.txt for this fetch only:\n {2}pref\t\.example\.com\t\S+\n/);
+		assert.ok(r.stderr.endsWith(WARNING), r.stderr);
+		assert.ok(!r.stderr.includes(SENTINEL) && !r.stdout.includes(SENTINEL));
+
+		// Neither half alone warns.
+		r = await runMain([URL_, "--cookies", clean]);
+		assert.equal(r.stderr, "");
+		r = await runMain([URL_, "--har", har]);
+		assert.equal(r.stderr, "");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("HAR and cURL sources work too", async () => {
 	const dir = tempDir();
 	const har = JSON.stringify({
@@ -369,7 +398,7 @@ test("an addCookies rejection in render() gets a fixed message; everything is cl
 			},
 		});
 		await assert.rejects(render("file:///fixture", { ...LIB, browserType, cookies }), (err) => {
-			assert.equal(err.message, `could not add cookies to the browser; nothing was fetched${detail}`);
+			assert.equal(err.message, `could not add cookies to the browser; the page was not fetched${detail}`);
 			assert.equal(err.cause, undefined);
 			assertNoValue(errorText(err));
 			return true;
@@ -458,31 +487,60 @@ test("--cookies presents the cookie for one fetch only, from every format", brow
 	await new Promise((r) => server.listen(0, "127.0.0.1", r));
 	const origin = `http://127.0.0.1:${server.address().port}`;
 	const env = { HOME: home, TRAWL_PROFILE_DIR: "" };
+	// The browser itself may write into $HOME on any launch (Chromium on Linux
+	// creates .cache and .local), so the bar is a plain fetch's footprint in a
+	// HOME of its own, not an empty directory.
+	const baselineHome = tempDir();
+	const values = { txt: `${SENTINEL}-txt`, har: `${SENTINEL}-har`, curl: `${SENTINEL}-curl` };
 	try {
+		const baseline = await runBin(link, [`${origin}/`, "--no-auth-check", "--no-pacing"], { ...env, HOME: baselineHome });
+		assert.equal(baseline.code, 0, baseline.stderr);
 		const sources = [
-			["cookies.txt", netscape([["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "from_txt", "yes"]]), "from_txt=yes"],
+			["cookies.txt", netscape([["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "from_txt", values.txt]]), `from_txt=${values.txt}`],
 			[
 				"t.har",
-				JSON.stringify({ log: { entries: [{ request: { url: `${origin}/`, headers: [{ name: "Cookie", value: "from_har=yes" }] }, response: { headers: [] } }] } }),
-				"from_har=yes",
+				JSON.stringify({
+					log: { entries: [{ request: { url: `${origin}/`, headers: [{ name: "Cookie", value: `from_har=${values.har}` }] }, response: { headers: [] } }] },
+				}),
+				`from_har=${values.har}`,
 			],
-			["r.curl", `curl '${origin}/' -H 'Cookie: from_curl=yes'`, "from_curl=yes"],
+			["r.curl", `curl '${origin}/' -H 'Cookie: from_curl=${values.curl}'`, `from_curl=${values.curl}`],
 		];
 		for (const [name, body, expected] of sources) {
 			const r = await runBin(link, [`${origin}/`, "--cookies", writeSource(dir, name, body), "--no-auth-check", "--no-pacing"], env);
 			assert.equal(r.code, 0, r.stderr);
 			assert.match(r.stdout, new RegExp(`cookie=\\[${expected}\\]`));
+			assert.ok(!r.stderr.includes(SENTINEL), r.stderr);
 		}
 		const plain = await runBin(link, [`${origin}/`, "--no-auth-check", "--no-pacing"], env);
 		assert.equal(plain.code, 0, plain.stderr);
 		assert.match(plain.stdout, /cookie=\[\]/);
 		// robots.txt stays cookie-blind in this part (#79).
-		assert.ok(robotsCookies.length >= 4 && robotsCookies.every((c) => c === ""), robotsCookies.join("|"));
-		// Nothing saved: no profile under HOME, no new files next to the sources.
-		assert.deepEqual(readdirSync(home), []);
+		assert.ok(robotsCookies.length >= 5 && robotsCookies.every((c) => c === ""), robotsCookies.join("|"));
+		// Nothing saved: HOME holds what a plain fetch leaves and no more (no
+		// profile), no file under it holds a cookie value, and nothing new
+		// appeared next to the sources.
+		assert.deepEqual(readdirSync(home).sort(), readdirSync(baselineHome).sort());
+		for (const file of filesUnder(home)) {
+			const bytes = readFileSync(file);
+			for (const value of Object.values(values)) {
+				assert.ok(!bytes.includes(value), `${file} holds a cookie value`);
+			}
+		}
 		assert.deepEqual(readdirSync(dir).sort(), ["cookies.txt", "r.curl", "t.har"]);
 	} finally {
 		await new Promise((r) => server.close(r));
-		for (const d of [dir, binDir, home]) rmSync(d, { recursive: true, force: true });
+		for (const d of [dir, binDir, home, baselineHome]) rmSync(d, { recursive: true, force: true });
 	}
 });
+
+// Every regular file below `root`, without following symlinks.
+function filesUnder(root) {
+	const out = [];
+	for (const entry of readdirSync(root, { withFileTypes: true })) {
+		const full = join(root, entry.name);
+		if (entry.isDirectory()) out.push(...filesUnder(full));
+		else if (entry.isFile()) out.push(full);
+	}
+	return out;
+}

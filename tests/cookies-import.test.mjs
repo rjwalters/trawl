@@ -596,11 +596,13 @@ test("browserWouldReject agrees with Chromium's addCookies", browserOpts, async 
 		secureInsecure: { name: "__Secure-a", secure: false },
 		secureLowercase: { name: "__secure-a", secure: false },
 		prefixInValue: { name: "", value: "__Host-x", secure: false },
-		// A nameless `__Host-` / `__Secure-` value is refused even when the
-		// prefix's own rules are met; a nameless `__Http-` value is not.
+		// A nameless `__Host-` / `__Secure-` / `__Http-` value is refused even
+		// when the prefix's own rules are met.
 		hostPrefixInValueOk: { name: "", value: "__Host-x" },
 		securePrefixInValueOk: { name: "", value: "__secure-x" },
 		httpPrefixInValue: { name: "", value: "__Http-x", secure: false },
+		httpPrefixInValueFlagsMet: { name: "", value: "__Http-x", httpOnly: true },
+		httpPrefixInValueLowercase: { name: "", value: "__http-x" },
 		httpPrefixNoHttpOnly: { name: "__Http-a" },
 		httpPrefixHttpOnly: { name: "__Http-a", httpOnly: true },
 		httpPrefixInsecure: { name: "__Http-a", httpOnly: true, secure: false },

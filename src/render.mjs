@@ -557,9 +557,12 @@ export async function render(url, options = {}) {
 	//   - `profileDir`: Node fetch, with a `Cookie` header built from the
 	//     persistent context's jar (`context.cookies`), so the browser launches
 	//     first (see `checkRobots` in the `try` below).
+	// Either way the header is trawl's, not the browser's: a cross-origin
+	// redirect drops it (Node fetch), a `Set-Cookie` on the robots.txt
+	// response is not stored, and the request is not in a `--har`.
 	const robotsCheck = !opts.ignoreRobots && isHttpUrl(url);
 	const robotsViaProfile = robotsCheck && Boolean(opts.profileDir);
-	const checkRobots = async ({ fetch, cookie, sentCookies }) => {
+	const checkRobots = async ({ fetch, cookie, sentCookies, profile = false }) => {
 		const verdict = await checkRobotsAllowed(url, {
 			userAgent,
 			// Deliberately NOT coupled to `opts.timeout`. Playwright's convention
@@ -583,7 +586,7 @@ export async function render(url, options = {}) {
 			}),
 		});
 		if (!verdict.allowed) {
-			throw new Error(robotsDenialMessage(verdict, { sentCookies }));
+			throw new Error(robotsDenialMessage(verdict, { sentCookies, profile }));
 		}
 		navCrawlDelayMs = crawlDelayMs(verdict.crawlDelay);
 		// Without pacing, honoring `Crawl-delay` means spacing the two requests
@@ -724,16 +727,19 @@ export async function render(url, options = {}) {
 				);
 			}
 		}
-		// The `profileDir` path's robots check, through the context so the
-		// profile's cookies go with it: after `addCookies`, so it uses the jar
-		// the page will. A denial, or an error from the pacing/cooldown gate,
-		// throws from here and the `finally` closes the context.
+		// The `profileDir` path's robots check, with the profile's cookies:
+		// after `addCookies`, so it uses the jar the page will. A denial, or an
+		// error from the pacing/cooldown gate, throws from here and the
+		// `finally` closes the context.
 		if (robotsViaProfile) {
 			// The jar's cookies for robots.txt as a plain header, so they go out
-			// as the same UTF-8 bytes the page request sends.
+			// as the same UTF-8 bytes the page request sends. `context.cookies`
+			// already applied the browser's URL rules (its loopback `Secure`
+			// exception included), so `jar: true` leaves `Secure` to it; a
+			// partitioned cookie goes only if its partition is this site's own.
 			const robotsUrl = `${new URL(url).origin}/robots.txt`;
-			const cookie = cookieHeaderFor(await context.cookies(robotsUrl), robotsUrl);
-			await checkRobots({ fetch: opts.fetch, cookie, sentCookies: Boolean(cookie) });
+			const cookie = cookieHeaderFor(await context.cookies(robotsUrl), robotsUrl, { jar: true });
+			await checkRobots({ fetch: opts.fetch, cookie, sentCookies: Boolean(cookie), profile: true });
 		}
 		page = await context.newPage();
 		page.on("response", onResponse);

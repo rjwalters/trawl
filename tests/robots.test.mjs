@@ -485,7 +485,7 @@ test("each retrieval failure names robots.txt, its cause, cookies, and the overr
 	}
 });
 
-// --- the Cookie header and the context.request adapter (#79) ---
+// --- the Cookie header (#79) ---
 
 test("a cookie string is sent as the Cookie header, and only when given", async () => {
 	const seen = [];
@@ -697,4 +697,174 @@ test("without a cookie the error is described as before (cookie-less runs unchan
 			assert.equal(v.failure.detail, detail);
 		}
 	}
+});
+
+// --- #93: the cookie note on --profile, and the plain wording pinned ---
+
+test("the plain-path cookie note is byte-identical; --profile gets its own fixed note", () => {
+	const verdict = { allowed: false, rule: null, failure: { url: "https://e.com/robots.txt", kind: "server-error", status: 503 } };
+	const head = "robots.txt is unreachable: https://e.com/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. ";
+	assert.equal(
+		robotsDenialMessage(verdict),
+		`${head}The robots.txt request sends no browser-profile cookies, so a cookie-gated robots.txt can fail here even when the page itself would load. Use --ignore-robots to override.`,
+	);
+	assert.equal(
+		robotsDenialMessage(verdict, { profile: true }),
+		`${head}No cookie from the profile matched robots.txt, so the request carried none, and a cookie-gated robots.txt can fail here even when the page itself would load. Use --ignore-robots to override.`,
+	);
+	// With cookies sent there is no note on either path.
+	assert.equal(robotsDenialMessage(verdict, { sentCookies: true, profile: true }), `${head}Use --ignore-robots to override.`);
+	// A matched rule never had a note.
+	assert.equal(
+		robotsDenialMessage({ allowed: false, rule: "Disallow: /" }, { profile: true }),
+		"robots.txt disallows this path (Disallow: /). Use --ignore-robots to override.",
+	);
+});
+
+// --- #93: a cross-origin redirect drops the Cookie header; say so ---
+
+const REDIRECT_HINT =
+	"The robots.txt request was redirected to another origin, and cookies are not sent across a cross-origin redirect; fetching the page from that origin directly may get through. ";
+
+// Two local servers (two ports, so two origins). `a` redirects /robots.txt to
+// `to(a, b)`; `b` serves a robots.txt that answers 503 without `gate=open`,
+// or `body` with it. Records each robots request's Cookie header.
+async function redirectRig({ to, body = "User-agent: *\nDisallow:\n" }) {
+	const seen = [];
+	const handler = (name) => (req, res) => {
+		seen.push({ at: name, url: req.url, cookie: req.headers.cookie ?? null });
+		if (name === "a" && req.url === "/robots.txt") {
+			res.writeHead(301, { location: to(origins) });
+			return res.end();
+		}
+		const open = (req.headers.cookie ?? "").split("; ").includes("gate=open");
+		res.writeHead(open ? 200 : 503, { "content-type": "text/plain" });
+		res.end(open ? body : "busy");
+	};
+	const a = createServer(handler("a"));
+	const b = createServer(handler("b"));
+	await Promise.all([a, b].map((s) => new Promise((r) => s.listen(0, "127.0.0.1", r))));
+	const origins = { a: `http://127.0.0.1:${a.address().port}`, b: `http://127.0.0.1:${b.address().port}` };
+	return {
+		...origins,
+		seen,
+		close: () => Promise.all([a, b].map((s) => new Promise((r) => s.close(r)))),
+	};
+}
+
+test("a cookie-carrying robots.txt redirected to another origin is refused with a fixed hint", async () => {
+	const rig = await redirectRig({ to: (o) => `${o.b}/robots.txt` });
+	try {
+		const v = await checkRobotsAllowed(`${rig.a}/page`, { userAgent: UA, cookie: "gate=open" });
+		// The second hop went without the header (Node fetch), so the gate shut.
+		assert.deepEqual(
+			rig.seen.map((s) => [s.at, s.cookie]),
+			[["a", "gate=open"], ["b", null]],
+		);
+		assert.deepEqual(v, {
+			allowed: false,
+			rule: null,
+			crawlDelay: null,
+			failure: { url: `${rig.a}/robots.txt`, kind: "server-error", status: 503 },
+			crossOriginRedirect: true,
+		});
+		const message = robotsDenialMessage(v, { sentCookies: true });
+		assert.equal(
+			message,
+			`robots.txt is unreachable: ${rig.a}/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. ${REDIRECT_HINT}Use --ignore-robots to override.`,
+		);
+		// Fixed text: the final URL is not named.
+		assert.ok(!message.includes(rig.b), message);
+		assert.equal(robotsDenialMessage(v, { sentCookies: true, profile: true }), message);
+	} finally {
+		await rig.close();
+	}
+});
+
+test("the hint also follows a matched-rule denial after a cross-origin redirect", async () => {
+	const rig = await redirectRig({ to: (o) => `${o.b}/robots.txt` });
+	try {
+		const v = await checkRobotsAllowed(`${rig.a}/page`, {
+			userAgent: UA,
+			cookie: "x=1",
+			fetch: async (url, init) => {
+				const r = await fetch(url, init);
+				// The real redirect's `redirected` and `url`, with a disallowing
+				// robots.txt in place of `b`'s 503.
+				return { ok: true, status: 200, redirected: r.redirected, url: r.url, text: async () => "User-agent: *\nDisallow: /\n" };
+			},
+		});
+		assert.equal(v.crossOriginRedirect, true);
+		assert.equal(
+			robotsDenialMessage(v, { sentCookies: true }),
+			`robots.txt disallows this path (Disallow: /). ${REDIRECT_HINT}Use --ignore-robots to override.`,
+		);
+	} finally {
+		await rig.close();
+	}
+});
+
+test("no hint without a Cookie header: the verdict and message are as before", async () => {
+	const rig = await redirectRig({ to: (o) => `${o.b}/robots.txt` });
+	try {
+		for (const cookie of [undefined, ""]) {
+			const v = await checkRobotsAllowed(`${rig.a}/page`, { userAgent: UA, ...(cookie !== undefined && { cookie }) });
+			assert.deepEqual(v, {
+				allowed: false,
+				rule: null,
+				crawlDelay: null,
+				failure: { url: `${rig.a}/robots.txt`, kind: "server-error", status: 503 },
+			});
+			assert.doesNotMatch(robotsDenialMessage(v), /redirected/);
+		}
+	} finally {
+		await rig.close();
+	}
+});
+
+test("a same-origin redirect keeps the Cookie header and gets no hint", async () => {
+	const rig = await redirectRig({ to: (o) => `${o.a}/real-robots.txt`, body: "User-agent: *\nDisallow: /page\n" });
+	try {
+		const v = await checkRobotsAllowed(`${rig.a}/page`, { userAgent: UA, cookie: "gate=open" });
+		assert.deepEqual(
+			rig.seen.map((s) => [s.at, s.url, s.cookie]),
+			[
+				["a", "/robots.txt", "gate=open"],
+				["a", "/real-robots.txt", "gate=open"],
+			],
+		);
+		assert.deepEqual(v, { allowed: false, rule: "Disallow: /page", crawlDelay: null });
+		// Allowed through a cross-origin redirect: nothing to hint at.
+		const ok2 = await checkRobotsAllowed(`${rig.a}/other`, { userAgent: UA, cookie: "gate=open" });
+		assert.deepEqual(ok2, { allowed: true, rule: null, crawlDelay: null });
+	} finally {
+		await rig.close();
+	}
+});
+
+test("the redirect check reads defensively: odd or throwing responses get no hint", async () => {
+	const responses = [
+		{ ok: false, status: 503, text: async () => "" },
+		{ ok: false, status: 503, redirected: true, text: async () => "" },
+		{ ok: false, status: 503, redirected: true, url: "", text: async () => "" },
+		{ ok: false, status: 503, redirected: true, url: "not a url", text: async () => "" },
+		{ ok: false, status: 503, redirected: "yes", url: "https://other.example/robots.txt", text: async () => "" },
+		{ ok: false, status: 503, redirected: true, url: "https://example.com/elsewhere", text: async () => "" },
+		Object.defineProperty({ ok: false, status: 503, text: async () => "" }, "redirected", {
+			get() {
+				throw new Error("k=s3cr3t");
+			},
+		}),
+	];
+	for (const response of responses) {
+		const v = await checkRobotsAllowed("https://example.com/", { cookie: "k=1", fetch: async () => response });
+		assert.equal(v.allowed, false);
+		assert.equal(v.crossOriginRedirect, undefined);
+	}
+	// http -> https on the same host is another origin.
+	const v = await checkRobotsAllowed("http://example.com/", {
+		cookie: "k=1",
+		fetch: async () => ({ ok: false, status: 503, redirected: true, url: "https://example.com/robots.txt", text: async () => "" }),
+	});
+	assert.equal(v.crossOriginRedirect, true);
 });

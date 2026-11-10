@@ -100,8 +100,8 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
                             names/domains/expiry to stderr under -S, or when
                             any were dropped; never values. Not with
                             --profile/$TRAWL_PROFILE_DIR: use cookies import
-                            to keep them. robots.txt is still fetched
-                            without them.
+                            to keep them. The robots.txt request carries
+                            the ones that match it.
       --no-auth-check      Skip login-wall detection (see "Auth walls" below)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
@@ -232,6 +232,10 @@ file holds those cookie values in plain text, sign-in cookies too, and
 `--har-omit-content` does not remove them. Treat such a HAR like the cookie
 file itself. `--cookies` together with `--har` prints a warning saying so (omitted
 when `--har-redact` is also given).
+The `robots.txt` request is not in the HAR on either path: with `--cookies`
+it is made outside the browser, and with `--profile` it goes through the
+browser context's own request client, which Playwright's HAR recorder does
+not capture.
 
 Pass `--har-redact` before sharing one: it replaces the values of those, plus
 `Authorization` and `Proxy-Authorization` headers, with `[redacted]` (names
@@ -401,10 +405,14 @@ included, and before a browser starts. If the browser refuses the cookies,
 the error says so without repeating the browser's message. `--domain`,
 `--allow` and `--include-auth` without `--cookies` are an error.
 
-The `robots.txt` check is still made **without** these cookies. A site whose
-`robots.txt` itself needs them (the anonymous request fails with a 5xx or
-times out, which trawl treats as a full disallow) still needs
-`--ignore-robots` for now.
+The `robots.txt` request carries the cookies that match it, so a site whose
+`robots.txt` itself answers a 5xx to a cookie-less client (which trawl treats
+as a full disallow) no longer needs `--ignore-robots`. "Match" is what a
+browser would send to `<origin>/robots.txt`: a host-only cookie only for its
+exact host, a `.example.com` cookie for that domain and its subdomains, a
+path of `/` or `/robots.txt`, a `Secure` cookie only over `https`, nothing
+expired. If none match, the request has no `Cookie` header at all. A redirect
+to another origin does not carry the header along.
 
 `--cookies` is a CLI flag only: the MCP server's tools take no cookies.
 
@@ -530,9 +538,15 @@ default rather than asking you to promise you will.
   HTTP 503 (server error)` — rather than naming a rule. A 4xx (404, 410, 429,
   …) means there is no `robots.txt` to obey, so the path is allowed.
   Redirects are followed and the final response decides. The `robots.txt`
-  request sends trawl's `User-Agent` but no browser-profile cookies, so a
-  site that serves an interstitial to cookie-less clients can block `trawl`
-  here even when `--profile` would get the page itself through.
+  request sends trawl's `User-Agent`, and the cookies a fetch would present:
+  with `--cookies`, the ones that match `<origin>/robots.txt` (see
+  [Cookies for a single fetch](#cookies-for-a-single-fetch)); with
+  `--profile`, it goes through that profile's browser context, so the
+  profile's cookies go with it by the browser's own rules, and a
+  `Set-Cookie` on the `robots.txt` response is kept in the profile as any
+  response's would be. On that path the browser starts before the
+  `robots.txt` check. A plain fetch sends no cookies, so a site that serves
+  an interstitial to cookie-less clients can still block it here.
 - **`--ignore-robots` overrides it**, because there are legitimate reasons:
   your own staging site, a page you are authenticated to, a `robots.txt`
   that blocks all bots but permits the human reading the same URL, or one

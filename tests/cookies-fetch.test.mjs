@@ -14,7 +14,8 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { resolveExecutablePath } from "../src/browser.mjs";
 import { main, runLogin } from "../src/cli.mjs";
-import { render } from "../src/render.mjs";
+import { createCooldownStore } from "../src/cooldown.mjs";
+import { CooldownError, render } from "../src/render.mjs";
 
 let haveBrowser = true;
 try {
@@ -281,7 +282,7 @@ test("bad input and zero survivors fail before render(), robots.txt or a browser
 
 // --- render() itself: a fake browser through the browserType seam ---
 
-function fakeBrowser({ addCookies } = {}) {
+function fakeBrowser({ addCookies, request } = {}) {
 	const events = [];
 	const page = {
 		on: () => {},
@@ -307,6 +308,15 @@ function fakeBrowser({ addCookies } = {}) {
 		close: async () => {
 			events.push("context.close");
 		},
+		// Playwright's APIRequestContext: `get` gets (events, url, options).
+		...(request && {
+			request: {
+				get: async (url, options) => {
+					events.push(["request.get", url]);
+					return request(events, url, options);
+				},
+			},
+		}),
 	};
 	const browserType = {
 		launch: async () => {
@@ -426,6 +436,154 @@ test("with profileDir too (library only), cookies go into the persistent context
 	}
 });
 
+// --- the --profile path's robots.txt request goes through context.request (#79) ---
+
+const PROFILE_URL = "http://127.0.0.1:1/page";
+
+function robotsResponse(status, body = "User-agent: *\nDisallow:\n") {
+	return {
+		ok: () => status >= 200 && status <= 299,
+		status: () => status,
+		text: async () => body,
+		dispose: async () => {},
+	};
+}
+
+// render() on the profile path, with Node fetch replaced by a spy that fails
+// the test if it is ever called.
+async function renderProfile({ request, extra = {} } = {}) {
+	const dir = tempDir();
+	const { events, browserType } = fakeBrowser({ request });
+	let fetchCalls = 0;
+	const fetch = async () => {
+		fetchCalls++;
+		throw new Error("Node fetch must not be used with a profile");
+	};
+	try {
+		const result = render(PROFILE_URL, {
+			...LIB,
+			browserType,
+			fetch,
+			profileDir: join(dir, "p"),
+			userAgent: "trawl/9.9.9 (+test)",
+			...extra,
+		});
+		return { result: await result.then((r) => ({ r }), (e) => ({ e })), events, fetchCalls: () => fetchCalls };
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+test("profileDir: robots.txt goes through context.request, after launch and before the page", async () => {
+	const seen = [];
+	const { result, events, fetchCalls } = await renderProfile({
+		request: (_events, url, options) => {
+			seen.push([url, options]);
+			return robotsResponse(200);
+		},
+	});
+	assert.equal(result.e, undefined, result.e?.stack);
+	assert.equal(fetchCalls(), 0);
+	assert.deepEqual(events, [
+		"launchPersistentContext",
+		["request.get", "http://127.0.0.1:1/robots.txt"],
+		"newPage",
+		"goto",
+		"context.close",
+	]);
+	// trawl's User-Agent, set explicitly, and no other header.
+	assert.deepEqual(seen[0][1].headers, { "User-Agent": "trawl/9.9.9 (+test)" });
+});
+
+test("profileDir with cookies (library): addCookies runs before the robots request", async () => {
+	const cookies = [{ name: "a", value: "v", domain: "127.0.0.1", path: "/", expires: -1, httpOnly: false, secure: false }];
+	const seen = [];
+	const { result, events } = await renderProfile({
+		request: (_events, _url, options) => {
+			seen.push(options.headers);
+			return robotsResponse(200);
+		},
+		extra: { cookies },
+	});
+	assert.equal(result.e, undefined);
+	assert.deepEqual(events.slice(0, 4), [
+		"launchPersistentContext",
+		["addCookies", cookies],
+		["request.get", "http://127.0.0.1:1/robots.txt"],
+		"newPage",
+	]);
+	// The jar carries them; no hand-built Cookie header on this path.
+	assert.equal("Cookie" in seen[0], false);
+});
+
+test("profileDir: a disallow closes the context and never opens a page", async () => {
+	const { result, events, fetchCalls } = await renderProfile({
+		request: () => robotsResponse(200, "User-agent: *\nDisallow: /\n"),
+	});
+	assert.equal(result.e?.message, "robots.txt disallows this path (Disallow: /). Use --ignore-robots to override.");
+	assert.equal(fetchCalls(), 0);
+	assert.deepEqual(events, ["launchPersistentContext", ["request.get", "http://127.0.0.1:1/robots.txt"], "context.close"]);
+});
+
+test("profileDir: an unreachable robots.txt is refused as today, minus the 'no cookies' note", async () => {
+	const secret = "SENTINEL-pr0f1le-err";
+	const cases = [
+		[() => robotsResponse(503), /returned HTTP 503 \(server error\)/],
+		[
+			() => {
+				throw new Error(`apiRequestContext.get: getaddrinfo ENOTFOUND; cookie=${secret}`, { cause: secret });
+			},
+			/could not be fetched \(network error: request failed\)/,
+		],
+	];
+	for (const [request, cause] of cases) {
+		const { result, events } = await renderProfile({ request });
+		assert.match(result.e?.message, /^robots\.txt is unreachable: http:\/\/127\.0\.0\.1:1\/robots\.txt /);
+		assert.match(result.e.message, cause);
+		assert.doesNotMatch(result.e.message, /browser-profile cookies/);
+		assert.match(result.e.message, /Use --ignore-robots to override\.$/);
+		assert.equal(result.e.cause, undefined);
+		assert.ok(!errorText(result.e).some((t) => t.includes(secret)));
+		assert.ok(events.includes("context.close") && !events.includes("newPage") && !events.includes("goto"));
+	}
+});
+
+test("profileDir: a cooldown seen at the robots gate closes the context", async () => {
+	const dir = tempDir();
+	try {
+		const stateDir = join(dir, "state");
+		const { events, browserType } = fakeBrowser({ request: () => robotsResponse(200) });
+		const launch = browserType.launchPersistentContext;
+		// Another process records a 503 cooldown while the browser starts:
+		// admit() passed before the launch, and the gate's re-check refuses.
+		browserType.launchPersistentContext = async (...args) => {
+			const other = createCooldownStore({ stateDir });
+			other.recordFailure("http://127.0.0.1:1", { status: 503, retryAfter: "120" });
+			await other.flush();
+			return launch(...args);
+		};
+		await assert.rejects(
+			render(PROFILE_URL, { ...LIB, browserType, pacing: true, minIntervalMs: 0, stateDir, profileDir: join(dir, "p") }),
+			CooldownError,
+		);
+		assert.deepEqual(events, ["launchPersistentContext", "context.close"]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("profileDir with ignoreRobots makes no robots request", async () => {
+	const { result, events, fetchCalls } = await renderProfile({
+		request: () => {
+			throw new Error("no robots request expected");
+		},
+		extra: { ignoreRobots: true },
+	});
+	assert.equal(result.e, undefined);
+	assert.equal(fetchCalls(), 0);
+	assert.deepEqual(events, ["launchPersistentContext", "newPage", "goto", "context.close"]);
+});
+
 // --- redaction across real processes (stdout + stderr) ---
 
 function runCli(args, env = {}) {
@@ -521,8 +679,9 @@ test("--cookies presents the cookie for one fetch only, from every format", brow
 		const plain = await runBin(link, [`${origin}/`, "--no-auth-check", "--no-pacing"], env);
 		assert.equal(plain.code, 0, plain.stderr);
 		assert.match(plain.stdout, /cookie=\[\]/);
-		// robots.txt stays cookie-blind in this part (#79).
-		assert.ok(robotsCookies.length >= 5 && robotsCookies.every((c) => c === ""), robotsCookies.join("|"));
+		// The robots.txt request carries the cookies that match it (#79): one
+		// per source, and none on the two cookie-less runs.
+		assert.deepEqual(robotsCookies, ["", ...sources.map(([, , expected]) => expected), ""]);
 		// Nothing saved: HOME holds what a plain fetch leaves and no more (no
 		// profile), no file under it holds a cookie value, and nothing new
 		// appeared next to the sources.
@@ -550,3 +709,85 @@ function filesUnder(root) {
 	}
 	return out;
 }
+
+// #79 end to end: a robots.txt that answers 503 unless the site's own cookie
+// comes with it, fetched without --ignore-robots via --cookies and via an
+// imported --profile, through a symlinked bin and a real browser.
+test("a cookie-gated robots.txt lets the fetch through with --cookies or an imported --profile", browserOpts, async () => {
+	const dir = tempDir();
+	const binDir = tempDir();
+	const home = tempDir();
+	const link = join(binDir, "trawl");
+	symlinkSync(CLI_PATH, link);
+	const robots = [];
+	const server = createServer((req, res) => {
+		if (req.url === "/robots.txt") {
+			robots.push({ cookie: req.headers.cookie ?? "", ua: req.headers["user-agent"] ?? "" });
+			const open = (req.headers.cookie ?? "").split("; ").includes("gate=open");
+			res.writeHead(open ? 200 : 503, { "content-type": "text/plain" });
+			res.end(open ? "User-agent: *\nDisallow:\n" : "busy");
+			return;
+		}
+		res.writeHead(200, { "content-type": "text/html" });
+		res.end(`<!doctype html><title>echo</title><pre>cookie=[${req.headers.cookie ?? ""}]</pre>`);
+	});
+	await new Promise((r) => server.listen(0, "127.0.0.1", r));
+	const origin = `http://127.0.0.1:${server.address().port}`;
+	const env = { HOME: home, TRAWL_PROFILE_DIR: "" };
+	const common = ["--no-auth-check", "--no-pacing"];
+	const file = writeSource(
+		dir,
+		"cookies.txt",
+		netscape([
+			["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "gate", "open"],
+			// Secure, so never sent over http; and a cookie for another host.
+			["127.0.0.1", "FALSE", "/", "TRUE", String(FUTURE), "sec", SENTINEL],
+			[".other.org", "TRUE", "/", "FALSE", String(FUTURE), "far", `${SENTINEL}-far`],
+		]),
+	);
+	try {
+		// (a) No cookie: refused, as before.
+		const plain = await runBin(link, [`${origin}/`, ...common], env);
+		assert.equal(plain.code, 1, plain.stderr);
+		assert.match(plain.stderr, /robots\.txt is unreachable: .* returned HTTP 503 \(server error\)\..*no browser-profile cookies/);
+		assert.deepEqual(robots.at(-1).cookie, "");
+
+		// (b) --cookies: only the matching cookie goes to robots.txt.
+		const viaCookies = await runBin(link, [`${origin}/`, "--cookies", file, ...common], env);
+		assert.equal(viaCookies.code, 0, viaCookies.stderr);
+		// (Chromium treats 127.0.0.1 as secure, so the page also gets `sec`;
+		// trawl's own robots request applies the plain http rule and does not.)
+		assert.match(viaCookies.stdout, /cookie=\[gate=open[;\]]/);
+		assert.equal(robots.at(-1).cookie, "gate=open");
+		assert.match(robots.at(-1).ua, /^trawl\//);
+		assert.ok(!viaCookies.stderr.includes(SENTINEL), viaCookies.stderr);
+
+		// (c) An imported profile: robots.txt via the context, with its jar.
+		const profile = join(dir, "profile");
+		const imported = await runBin(link, ["cookies", "import", file, "--profile", profile], env);
+		assert.equal(imported.code, 0, imported.stderr);
+		const har = join(dir, "trace.har");
+		const before = robots.length;
+		const viaProfile = await runBin(link, [`${origin}/`, "--profile", profile, "--har", har, ...common], env);
+		assert.equal(viaProfile.code, 0, viaProfile.stderr);
+		assert.match(viaProfile.stdout, /cookie=\[gate=open[;\]]/);
+		assert.equal(robots.length, before + 1);
+		// The jar's own (browser) rules apply here, so `sec` may go along on
+		// 127.0.0.1, which Chromium counts as secure; the other host's never.
+		const sent = robots.at(-1).cookie.split("; ");
+		assert.ok(sent.includes("gate=open"), robots.at(-1).cookie);
+		assert.ok(!sent.some((c) => c.startsWith("far=")), robots.at(-1).cookie);
+		assert.match(robots.at(-1).ua, /^trawl\//);
+		// The HAR records the page, not the robots.txt request: Playwright's
+		// HAR recorder on a browser context does not subscribe to that
+		// context's own `context.request` calls (checked in playwright-core
+		// 1.64.1 and 1.65.0). If an upgrade starts recording it, this fails,
+		// and the README's HAR note needs updating with it.
+		const urls = JSON.parse(readFileSync(har, "utf8")).log.entries.map((e) => e.request.url);
+		assert.ok(urls.includes(`${origin}/`), urls.join(" "));
+		assert.ok(!urls.includes(`${origin}/robots.txt`), urls.join(" "));
+	} finally {
+		await new Promise((r) => server.close(r));
+		for (const d of [dir, binDir, home]) rmSync(d, { recursive: true, force: true });
+	}
+});

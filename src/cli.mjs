@@ -136,8 +136,8 @@ Options:
                             names/domains/expiry to stderr under -S, or when
                             any were dropped; never values. Not with
                             --profile/$TRAWL_PROFILE_DIR: use cookies import
-                            to keep them. robots.txt is still fetched
-                            without them.
+                            to keep them. The robots.txt request carries
+                            the ones that match it.
       --no-auth-check      Skip login-wall detection (see exit code 3 below)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help

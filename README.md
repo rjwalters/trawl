@@ -242,7 +242,9 @@ the browser, with the cookies that match it (from `--cookies`, or from the
 
 Pass `--har-redact` before sharing one: it replaces the values of those, plus
 `Authorization` and `Proxy-Authorization` headers, with `[redacted]` (names
-are kept). URL query tokens and request bodies are not touched. If the
+are kept). URL query tokens, request bodies and response bodies are not
+touched, so a page that echoes a cookie or token in its own content still has
+it in the HAR (`--har-omit-content` drops response bodies). If the
 redaction fails, the HAR file is deleted and the run exits non-zero rather
 than leaving an unredacted trace. `--har-redact` needs a `.json`/`.har` path,
 not `.zip` (Playwright writes a zip archive for `.zip`). Without the flag,

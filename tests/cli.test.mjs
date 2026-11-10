@@ -733,3 +733,36 @@ test("login creates a new profile directory 0700", async () => {
 	const mkdirCall = mkdirCalls.find((c) => c[0] !== "launch");
 	assert.deepEqual(mkdirCall, ["/tmp/p", { recursive: true, mode: 0o700 }]);
 });
+
+test("login warns once when the profile's browser marker will be ignored", async () => {
+	const seen = [];
+	for (const reason of ["/tmp/p", "/tmp/p/.trawl-browser", null]) {
+		const { deps, stderrLines } = fakeLoginDeps({ profileDir: "/tmp/p" });
+		deps.markerIgnoredReason = (dir) => {
+			seen.push(dir);
+			return reason;
+		};
+		const code = await runLogin(["https://example.com", "--profile", "/tmp/p"], deps);
+		assert.equal(code, 0);
+		const warnings = stderrLines.filter((l) => l.includes("warning"));
+		if (reason === null) assert.equal(warnings.length, 0);
+		else {
+			assert.equal(warnings.length, 1);
+			assert.ok(warnings[0].includes(reason));
+			assert.match(warnings[0], reason === "/tmp/p" ? /chmod 700 \/tmp\/p\n/ : /chmod 600 \/tmp\/p\/\.trawl-browser\n/);
+		}
+	}
+	assert.deepEqual(seen, ["/tmp/p", "/tmp/p", "/tmp/p"]);
+});
+
+test("login does not check the marker when recording failed", async () => {
+	const { deps, stderrLines } = fakeLoginDeps({ profileDir: "/tmp/p" });
+	deps.recordProfileBrowser = () => {
+		throw new Error("disk full");
+	};
+	deps.markerIgnoredReason = () => {
+		throw new Error("must not be called");
+	};
+	assert.equal(await runLogin(["https://example.com", "--profile", "/tmp/p"], deps), 0);
+	assert.equal(stderrLines.filter((l) => l.includes("could not record")).length, 1);
+});

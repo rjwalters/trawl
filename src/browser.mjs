@@ -278,6 +278,34 @@ function ownedPrivately(st, uid, plat) {
 	return st.uid === uid && (st.mode & 0o022) === 0;
 }
 
+// The path (marker, else its directory) that makes profileBrowser ignore the
+// marker for ownership or mode, or null. The one rule behind both
+// profileBrowser and markerIgnoredReason. A 0600 marker in a group-writable
+// directory can still be replaced by the group, hence the directory.
+function untrustedPath(profileDir, markerPath, markerStat, fs, uid, plat) {
+	if (!ownedPrivately(markerStat, uid, plat)) return markerPath;
+	if (!ownedPrivately(fs.statSync(profileDir), uid, plat)) return profileDir;
+	return null;
+}
+
+// For `trawl login`: when a marker exists but profileBrowser would ignore it
+// for ownership or mode, the offending path (the marker or the profile
+// directory); otherwise null. Never throws.
+export function markerIgnoredReason(
+	profileDir,
+	fs = { statSync },
+	{ uid = process.getuid?.(), plat = platform() } = {},
+) {
+	try {
+		const marker = path.join(profileDir, PROFILE_BROWSER_FILE);
+		const st = fs.statSync(marker);
+		if (!st.isFile()) return null;
+		return untrustedPath(profileDir, marker, st, fs, uid, plat);
+	} catch {
+		return null;
+	}
+}
+
 export function profileBrowser(
 	profileDir,
 	fs = { readFileSync, statSync, realpathSync, accessSync },
@@ -291,11 +319,8 @@ export function profileBrowser(
 		if (!st.isFile() || st.size > MAX_MARKER_BYTES) return null;
 		// Someone else could have chosen this browser: ignore the marker if it,
 		// or the profile directory holding it, belongs to another user or is
-		// writable by group or others. A 0600 marker in a group-writable
-		// directory can still be replaced by the group, hence the directory.
-		if (!ownedPrivately(st, uid, plat) || !ownedPrivately(fs.statSync(profileDir), uid, plat)) {
-			return null;
-		}
+		// writable by group or others.
+		if (untrustedPath(profileDir, marker, st, fs, uid, plat) !== null) return null;
 		({ executablePath } = JSON.parse(fs.readFileSync(marker, "utf8")));
 	} catch {
 		return null;

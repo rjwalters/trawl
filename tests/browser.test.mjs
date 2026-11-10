@@ -24,6 +24,7 @@ import {
 	isHeadlessShell,
 	isLaunchableBrowser,
 	launchableBrowser,
+	markerIgnoredReason,
 	NoHeadedBrowserError,
 	PROFILE_BROWSER_FILE,
 	profileBrowser,
@@ -457,4 +458,27 @@ test("a marker not privately owned falls back silently to main's resolution", (t
 	const uid = process.getuid();
 	assert.equal(profileBrowser(profile, undefined, { uid: uid + 1 }), null, "owned by another user");
 	assert.equal(profileBrowser(profile, undefined, { uid: uid + 1, plat: "win32" }), exe, "no ownership check on win32");
+});
+
+test("markerIgnoredReason names what makes profileBrowser ignore the marker", (t) => {
+	if (process.platform === "win32") return t.skip("no POSIX ownership on Windows");
+	const profile = tempHome(t);
+	chmodSync(profile, 0o700);
+	assert.equal(markerIgnoredReason(profile), null, "no marker");
+	const exe = fakeBrowser(profile);
+	recordProfileBrowser(profile, exe);
+	const marker = path.join(profile, PROFILE_BROWSER_FILE);
+	assert.equal(markerIgnoredReason(profile), null, "0600 marker in a 0700 dir");
+
+	chmodSync(profile, 0o775);
+	assert.equal(markerIgnoredReason(profile), profile, "group-writable dir");
+	chmodSync(profile, 0o700);
+
+	chmodSync(marker, 0o620);
+	assert.equal(markerIgnoredReason(profile), marker, "group-writable marker");
+	chmodSync(marker, 0o600);
+
+	const uid = process.getuid();
+	assert.equal(markerIgnoredReason(profile, undefined, { uid: uid + 1 }), marker, "another user's");
+	assert.equal(markerIgnoredReason(profile, undefined, { uid: uid + 1, plat: "win32" }), null, "win32");
 });

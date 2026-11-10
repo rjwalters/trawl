@@ -488,6 +488,83 @@ test("still writes a valid HAR when navigation throws", opts, async () => {
 	readHar(file);
 });
 
+// A server that sets a sentinel cookie on every response. The first response
+// plants it, so the browser sends it back as a request `Cookie` on the
+// /style.css subresource: both the Set-Cookie and Cookie sides land in the HAR.
+const COOKIE_SENTINEL = "s3cr3t-live-sentinel";
+async function startCookieServer() {
+	const server = createServer((req, res) => {
+		const headers = { "set-cookie": `sid=${COOKIE_SENTINEL}; Path=/` };
+		if (req.url === "/style.css") {
+			res.writeHead(200, { ...headers, "content-type": "text/css" });
+			res.end(STYLESHEET);
+			return;
+		}
+		res.writeHead(200, { ...headers, "content-type": "text/html" });
+		res.end(PAGE_WITH_SUBRESOURCE);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	return {
+		url: `http://127.0.0.1:${port}/`,
+		close: () => new Promise((resolve) => server.close(resolve)),
+	};
+}
+
+test("flag off: the HAR holds the cookie sentinel (the test can see a leak)", opts, async () => {
+	const server = await startCookieServer();
+	const file = harPath();
+	try {
+		await render(server.url, { har: file });
+	} finally {
+		await server.close();
+	}
+	const raw = readFileSync(file, "utf8");
+	assert.ok(raw.includes(COOKIE_SENTINEL), "sentinel should be present without harRedact");
+	assert.match(raw, /"name":\s*"[Cc]ookie"/, "the request Cookie header was recorded");
+});
+
+test("harRedact removes cookie values from a real HAR but keeps names", opts, async () => {
+	const server = await startCookieServer();
+	const file = harPath();
+	try {
+		await render(server.url, { har: file, harRedact: true });
+	} finally {
+		await server.close();
+	}
+	const raw = readFileSync(file, "utf8");
+	assert.equal(raw.includes(COOKIE_SENTINEL), false, "sentinel must not survive redaction");
+	const { log } = readHar(file);
+	const names = log.entries.flatMap((e) => [
+		...e.request.headers.map((h) => h.name.toLowerCase()),
+		...e.response.headers.map((h) => h.name.toLowerCase()),
+		...e.response.cookies.map((c) => c.name),
+	]);
+	assert.ok(names.includes("set-cookie"), "Set-Cookie header name kept");
+	assert.ok(names.includes("sid"), "cookie name kept");
+});
+
+test("harRedact: a failed navigation still leaves a valid, redacted HAR", opts, async () => {
+	// Serve one request so the cookie is planted, then navigate to a dead port.
+	const live = await startCookieServer();
+	const dead = await startServer();
+	const deadUrl = dead.url;
+	await dead.close();
+	const file = harPath();
+	try {
+		await assert.rejects(
+			() => render(deadUrl, { har: file, harRedact: true, timeout: 5000, ignoreRobots: true }),
+			/ERR_CONNECTION_REFUSED|net::/,
+		);
+	} finally {
+		await live.close();
+	}
+	assert.ok(existsSync(file), "redacted HAR exists after the failure");
+	const raw = readFileSync(file, "utf8");
+	assert.equal(raw.includes(COOKIE_SENTINEL), false);
+	readHar(file);
+});
+
 test("surfaces a HAR that could not be written", opts, async () => {
 	// The HAR is flushed on context.close(), so an unwritable path only fails
 	// during teardown — after an otherwise-successful render. That failure must

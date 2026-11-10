@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { chromium } from "playwright-core";
 import TurndownService from "turndown";
 import { resolveExecutablePath } from "./browser.mjs";
+import { addCookiesFailure } from "./cookies.mjs";
 import {
 	COOLDOWN_STATUSES,
 	CooldownError,
@@ -54,7 +55,7 @@ export function redactHar(har) {
 // Rewrite a HAR file in place with credentials redacted. Fails closed: if the
 // file cannot be read, parsed or rewritten it is deleted and the error thrown,
 // so a requested redaction never leaves an unredacted HAR behind.
-function redactHarFile(path) {
+export function redactHarFile(path) {
 	try {
 		const har = redactHar(JSON.parse(readFileSync(path, "utf8")));
 		writeFileSync(path, JSON.stringify(har, null, 2));
@@ -595,6 +596,9 @@ export async function render(url, options = {}) {
 	};
 
 	const executablePath = resolveExecutablePath(opts.executablePath);
+	// Test seam, deliberately undocumented: lets a test stand in for
+	// Playwright's `chromium` without a real browser.
+	const browserType = opts.browserType ?? chromium;
 
 	const contextOptions = {
 		viewport: opts.viewport,
@@ -666,14 +670,31 @@ export async function render(url, options = {}) {
 	try {
 		if (opts.profileDir) {
 			mkdirSync(opts.profileDir, { recursive: true });
-			context = await chromium.launchPersistentContext(opts.profileDir, {
+			context = await browserType.launchPersistentContext(opts.profileDir, {
 				executablePath,
 				headless: true,
 				...contextOptions,
 			});
 		} else {
-			browser = await chromium.launch({ executablePath, headless: true });
+			browser = await browserType.launch({ executablePath, headless: true });
 			context = await browser.newContext(contextOptions);
+		}
+		// `cookies`: an already-parsed, already-filtered list (src/cookies.mjs),
+		// added before the first page exists, so the first request carries
+		// them. On the ephemeral path they die with the context; with
+		// `profileDir` too they are written to that profile. Passed as-is:
+		// session cookies (`expires: -1`) stay session cookies. A rejection is
+		// reported with a fixed message only, never the browser's text, which
+		// can quote the cookie; the `finally` still closes everything.
+		if (opts.cookies?.length > 0) {
+			try {
+				await context.addCookies(opts.cookies);
+			} catch (err) {
+				const known = addCookiesFailure(err);
+				throw new Error(
+					`could not add cookies to the browser; the page was not fetched${known ? ` (${known})` : ""}`,
+				);
+			}
 		}
 		page = await context.newPage();
 		page.on("response", onResponse);

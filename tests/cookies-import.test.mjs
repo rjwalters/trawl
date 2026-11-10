@@ -139,9 +139,9 @@ test("rejects options that belong to a fetch, and valued flags with no value", (
 	assert.throws(() => parseCookiesImportArgs(["f", "--include-auth=yes"]), /Unknown option/);
 });
 
-test("the new flags stay unknown to a plain fetch (purely additive)", async () => {
-	await assert.rejects(() => main(["https://example.com", "--domain", "x"]), /Unknown option: --domain/);
-	await assert.rejects(() => main(["https://example.com", "--include-auth"]), /Unknown option: --include-auth/);
+test("the import filters still fail on a plain fetch, now asking for --cookies", async () => {
+	await assert.rejects(() => main(["https://example.com", "--domain", "x"]), /^Error: --domain requires --cookies$/);
+	await assert.rejects(() => main(["https://example.com", "--include-auth"]), /^Error: --include-auth requires --cookies$/);
 });
 
 test("main() dispatches `trawl cookies import`", async () => {
@@ -596,6 +596,28 @@ test("browserWouldReject agrees with Chromium's addCookies", browserOpts, async 
 		secureInsecure: { name: "__Secure-a", secure: false },
 		secureLowercase: { name: "__secure-a", secure: false },
 		prefixInValue: { name: "", value: "__Host-x", secure: false },
+		// A nameless `__Host-` / `__Secure-` / `__Http-` value is refused even
+		// when the prefix's own rules are met.
+		hostPrefixInValueOk: { name: "", value: "__Host-x" },
+		securePrefixInValueOk: { name: "", value: "__secure-x" },
+		httpPrefixInValue: { name: "", value: "__Http-x", secure: false },
+		httpPrefixInValueFlagsMet: { name: "", value: "__Http-x", httpOnly: true },
+		httpPrefixInValueLowercase: { name: "", value: "__http-x" },
+		httpPrefixNoHttpOnly: { name: "__Http-a" },
+		httpPrefixHttpOnly: { name: "__Http-a", httpOnly: true },
+		httpPrefixInsecure: { name: "__Http-a", httpOnly: true, secure: false },
+		httpPrefixLowercase: { name: "__http-a" },
+		hostHttpPrefixNoHttpOnly: { name: "__Host-Http-a" },
+		hostHttpPrefixHttpOnly: { name: "__Host-Http-a", httpOnly: true },
+		hostHttpPrefixDotDomain: { name: "__Host-Http-a", httpOnly: true, domain: ".example.com" },
+		hostHttpPrefixLowercase: { name: "__host-http-a" },
+		secureHttpPrefix: { name: "__Secure-Http-a" },
+		ipv6Loopback: { domain: "::1", secure: false },
+		ipv6LoopbackDot: { domain: ".::1", secure: false },
+		ipv6Other: { domain: "2001:db8::1", secure: false },
+		ipv6Bracketed: { domain: "[::1]", secure: false },
+		hostWithPort: { domain: "example.com:8080", secure: false },
+		ipv4: { domain: "127.0.0.1", secure: false },
 		emptyDomain: { domain: "" },
 	};
 	const context = await chromium.launchPersistentContext(join(dir, "p"), {

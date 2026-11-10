@@ -4,6 +4,8 @@
 // Pure module: no I/O, no spawning, no eval. Nothing here ever puts a cookie
 // value into an error message or a summary.
 
+import { isIPv6 } from "node:net";
+
 /**
  * Single source of truth for cookies treated as authentication/session
  * credentials. They are dropped by default (see `filterCookies`), like
@@ -754,8 +756,15 @@ export function browserWouldReject(cookie) {
 	if (name === "" && value === "") return true;
 	if (bytes(name) + bytes(value) > 4096) return true;
 	if (!path.startsWith("/") || path.includes(";") || bytes(path) > 1024) return true;
-	// With no name, the value is what the prefix rules read as the name.
-	const prefixed = (name === "" ? value : name).toLowerCase();
+	// A bare IPv6 literal (`::1`, `2001:db8::1`, with or without a leading
+	// dot) is refused; the bracketed form (`[::1]`) is accepted.
+	if (isIPv6(domain.replace(/^\.+/, ""))) return true;
+	// Prefixes match case-insensitively. A nameless cookie whose value looks
+	// like `__Host-` / `__Secure-` / `__Http-` is refused outright, whatever
+	// its flags (checked against Chromium 156 and 158; older builds such as
+	// 143 accepted a nameless `__Http-` value, so this errs towards refusing).
+	if (name === "") return /^__(host|secure|http)-/i.test(value);
+	const prefixed = name.toLowerCase();
 	if (prefixed.startsWith("__secure-") && !cookie.secure) return true;
 	if (
 		prefixed.startsWith("__host-") &&
@@ -763,7 +772,80 @@ export function browserWouldReject(cookie) {
 	) {
 		return true;
 	}
+	// `__Http-` needs Secure and HttpOnly; `__Host-Http-` needs HttpOnly on top
+	// of the `__Host-` rules above (which already demand Secure).
+	if (prefixed.startsWith("__http-") && (!cookie.secure || !cookie.httpOnly)) return true;
+	if (prefixed.startsWith("__host-http-") && !cookie.httpOnly) return true;
 	return false;
+}
+
+// Why a list of cookies came out empty, naming the filter that actually
+// removed them (and the flag that would keep sign-in ones). `verb` finishes
+// the --include-auth hint: "import" for `trawl cookies import`, "use" for a
+// fetch with --cookies.
+export function whyNoneLeft(parsedCount, result, refusedCount, { domain, allow, verb = "import" }) {
+	if (parsedCount === 0) return "the file holds no cookies";
+	const flags = [domain && "--domain", allow && "--allow"].filter(Boolean).join(" and ");
+	if (result.matched === 0) return `no cookie matched ${flags}`;
+	const causes = [];
+	if (result.expiredDropped > 0) causes.push("expired");
+	if (result.authDropped.length > 0) causes.push("a sign-in cookie");
+	if (refusedCount > 0) causes.push("one the browser would refuse");
+	const scope = flags ? `cookie that matched ${flags}` : "cookie";
+	const list =
+		causes.length > 1 ? `${causes.slice(0, -1).join(", ")} or ${causes.at(-1)}` : causes[0];
+	return (
+		`every ${scope} was ${list}` +
+		(result.authDropped.length > 0 ? ` (pass --include-auth to ${verb} sign-in cookies)` : "")
+	);
+}
+
+// Names and domains come from the input file: strip control characters so a
+// crafted file cannot drive the terminal.
+export function printable(s) {
+	return String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+}
+
+export function describeExpiry(expires) {
+	return new Date(expires * 1000).toISOString().replace(/\.000Z$/, "Z");
+}
+
+export function plural(n, word) {
+	return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+// Browser errors never reach the user once cookies are involved: Playwright's
+// messages can quote the cookie they reject, raw or encoded, and no substring
+// test can prove an arbitrary message value-free. Each line below is an exact
+// `addCookies` first line known to quote nothing, matched by equality and
+// replaced by our own text; anything else gets the caller's fixed message
+// alone.
+const KNOWN_WRITE_ERRORS = new Map([
+	[
+		"browserContext.addCookies: Protocol error (Storage.setCookies): Invalid cookie fields",
+		"the browser refused a cookie, and so the whole batch",
+	],
+	[
+		"browserContext.addCookies: Target page, context or browser has been closed",
+		"the browser closed unexpectedly",
+	],
+	["Target page, context or browser has been closed", "the browser closed unexpectedly"],
+]);
+
+/**
+ * The value-free detail for an `addCookies` rejection, or `undefined`. Never
+ * returns any of the error's own text: only one of our fixed strings, picked
+ * by exact match on its first line. Reading the error is guarded too, since a
+ * throwing `message` getter (or `toString`) must not escape carrying a value.
+ */
+export function addCookiesFailure(err) {
+	let line;
+	try {
+		line = String(err?.message ?? "").split("\n")[0];
+	} catch {
+		return undefined;
+	}
+	return KNOWN_WRITE_ERRORS.get(line);
 }
 
 // Explicit field pick (never spread) so a field added to cookies later cannot

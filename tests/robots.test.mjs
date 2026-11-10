@@ -13,6 +13,8 @@ import {
 	parseRobotsTxt,
 	productToken,
 	robotsDenialMessage,
+	SAFE_ERROR_CODES,
+	safeErrorCode,
 	selectGroup,
 } from "../src/robots.mjs";
 
@@ -567,4 +569,140 @@ test("without sentCookies the cookie note is kept verbatim", () => {
 		robotsDenialMessage(verdict, { sentCookies: true }),
 		"robots.txt is unreachable: https://e.com/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. Use --ignore-robots to override.",
 	);
+});
+
+// --- #87: with a Cookie header sent, a failure is a code or fixed text ---
+
+// Every character JSON or URL encoding rewrites, so an echo in any encoding
+// differs from the raw value; any 6-character run of it counts as a leak.
+const AWKWARD = 'aw"KW\\rd/V4l+u3=Zq-77Xk';
+
+function assertNoValue(haystacks, value = AWKWARD) {
+	const forms = [value, encodeURIComponent(value), JSON.stringify(value)];
+	for (let i = 0; i + 6 <= value.length; i++) forms.push(value.slice(i, i + 6));
+	for (const h of haystacks) {
+		for (const f of forms) assert.ok(!h.includes(f), `leaked ${JSON.stringify(f)} in ${JSON.stringify(h)}`);
+	}
+}
+
+// Errors that quote the header everywhere an error can carry text.
+function quotingErrors(header) {
+	const quoted = `Headers.append: "${header}" is an invalid header value.`;
+	const withStack = new TypeError(quoted);
+	withStack.stack = `TypeError: ${quoted}\n    at ${header}`;
+	return [
+		new TypeError(quoted),
+		withStack,
+		new TypeError("fetch failed", { cause: new Error(quoted) }),
+		new TypeError("fetch failed", { cause: quoted }),
+		Object.assign(new TypeError("fetch failed"), { header, headers: { cookie: header }, code: header }),
+		Object.assign(new TypeError("fetch failed"), { cause: { code: header, message: header } }),
+		// A code that contains an allowlisted one is not that code.
+		Object.assign(new TypeError("fetch failed"), { cause: { code: `ECONNREFUSED ${header}` } }),
+		header, // a thrown string
+		{ message: header, toString: () => header },
+	];
+}
+
+test("with a cookie sent, the failure detail is fixed text, whatever the error says", async () => {
+	const header = `k=${AWKWARD}`;
+	for (const err of quotingErrors(header)) {
+		for (const where of ["fetch", "body"]) {
+			const fetch =
+				where === "fetch"
+					? async () => {
+							throw err;
+						}
+					: async () => ({ ok: true, status: 200, text: async () => Promise.reject(err) });
+			const v = await checkRobotsAllowed("https://example.com/", { cookie: header, fetch });
+			assert.equal(v.allowed, false);
+			assert.equal(v.failure.kind, where === "fetch" ? "network-error" : "read-error");
+			assert.equal(v.failure.detail, "request failed");
+			const message = robotsDenialMessage(v, { sentCookies: true });
+			assert.ok(message.includes("(network error: request failed)") || message.includes("failed (request failed)"), message);
+			assertNoValue([JSON.stringify(v), message]);
+		}
+	}
+});
+
+test("with a cookie sent, an allowlisted code is kept, read from cause first", async () => {
+	const header = `k=${AWKWARD}`;
+	const run = (err) =>
+		checkRobotsAllowed("https://example.com/", {
+			cookie: header,
+			fetch: async () => {
+				throw err;
+			},
+		});
+	const cases = [
+		[new TypeError(`fetch failed ${header}`, { cause: Object.assign(new Error(header), { code: "ECONNREFUSED" }) }), "ECONNREFUSED"],
+		[Object.assign(new Error(header), { code: "UND_ERR_SOCKET" }), "UND_ERR_SOCKET"],
+		[Object.assign(new Error(header), { code: "ENOTFOUND", cause: { code: "ECONNRESET" } }), "ECONNRESET"],
+		// cause.code not allowlisted: falls through to err.code.
+		[Object.assign(new Error(header), { code: "EAI_AGAIN", cause: { code: header } }), "EAI_AGAIN"],
+	];
+	for (const [err, code] of cases) {
+		const v = await run(err);
+		assert.equal(v.failure.detail, code);
+		const message = robotsDenialMessage(v, { sentCookies: true });
+		assert.ok(message.includes(`(network error: ${code})`), message);
+		assertNoValue([JSON.stringify(v), message]);
+	}
+});
+
+test("safeErrorCode reads defensively: throwing getters and odd shapes are no code", () => {
+	const throwing = (key) =>
+		Object.defineProperty(new Error("x"), key, {
+			get() {
+				throw new Error(`getter k=${AWKWARD}`);
+			},
+		});
+	assert.equal(safeErrorCode(throwing("code")), undefined);
+	assert.equal(safeErrorCode(throwing("cause")), undefined);
+	const causeThrows = Object.assign(throwing("cause"), { code: "ECONNRESET" });
+	assert.equal(safeErrorCode(causeThrows), "ECONNRESET");
+	const proxy = new Proxy({}, { get() { throw new Error(AWKWARD); } });
+	assert.equal(safeErrorCode(proxy), undefined);
+	for (const odd of [undefined, null, 0, "ECONNREFUSED", { code: 1 }, { code: ["ECONNREFUSED"] }, { code: "econnrefused" }]) {
+		assert.equal(safeErrorCode(odd), undefined);
+	}
+	assert.ok(SAFE_ERROR_CODES.has("ECONNREFUSED") && SAFE_ERROR_CODES.has("UND_ERR_SOCKET"));
+	for (const code of SAFE_ERROR_CODES) assert.match(code, /^[A-Z][A-Z0-9_]+$/);
+});
+
+test("with a cookie sent, a throwing getter on the error does not escape", async () => {
+	for (const key of ["message", "cause", "code"]) {
+		const err = Object.defineProperty(new Error("x"), key, {
+			get() {
+				throw new Error(`getter k=${AWKWARD}`);
+			},
+		});
+		const v = await checkRobotsAllowed("https://example.com/", {
+			cookie: `k=${AWKWARD}`,
+			fetch: async () => {
+				throw err;
+			},
+		});
+		assert.equal(v.failure.detail, "request failed");
+	}
+});
+
+test("without a cookie the error is described as before (cookie-less runs unchanged)", async () => {
+	const cases = [
+		[new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) }), "ECONNREFUSED"],
+		[new TypeError("fetch failed", { cause: new Error("bad port") }), "bad port"],
+		[Object.assign(new Error("boom"), { code: "NOT_ALLOWLISTED" }), "NOT_ALLOWLISTED"],
+		[new Error("boom"), "boom"],
+	];
+	for (const cookie of [undefined, ""]) {
+		for (const [err, detail] of cases) {
+			const v = await checkRobotsAllowed("https://example.com/", {
+				...(cookie !== undefined && { cookie }),
+				fetch: async () => {
+					throw err;
+				},
+			});
+			assert.equal(v.failure.detail, detail);
+		}
+	}
 });

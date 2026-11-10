@@ -592,7 +592,11 @@ export async function render(url, options = {}) {
 		if (!pacer && navCrawlDelayMs > 0) await sleep(navCrawlDelayMs);
 	};
 	if (robotsCheck && !robotsViaProfile) {
-		// A secret: it goes into the request header and nowhere else.
+		// A secret: it goes into the request header and nowhere else. Always a
+		// value Node's fetch accepts (cookies that cannot go in a header are left
+		// out, non-ASCII is sent as the same UTF-8 bytes Chromium sends), and
+		// with it set a failure is described by an allowlisted code or fixed
+		// text only, never the error's message.
 		const cookie =
 			opts.cookies?.length > 0
 				? cookieHeaderFor(opts.cookies, `${new URL(url).origin}/robots.txt`)

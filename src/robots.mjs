@@ -177,6 +177,58 @@ export function cookieHeaderBytes(header) {
 	return Buffer.from(header, "utf8").toString("latin1");
 }
 
+// Error codes that may be named in a diagnostic when the request carried
+// cookies. Only a code is ever taken from such an error, and only one equal to
+// an entry here: an error's message, and anything else on it, can quote the
+// request's headers (Node's fetch puts an invalid `Cookie` value in its
+// message whole). Matched by equality, so a code that merely contains one of
+// these, or anything else, falls back to fixed text.
+export const SAFE_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"ECONNABORTED",
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"ETIMEDOUT",
+	"EHOSTUNREACH",
+	"ENETUNREACH",
+	"EHOSTDOWN",
+	"ENETDOWN",
+	"EPIPE",
+	"EPROTO",
+	"ERR_INVALID_CHAR",
+	"ERR_TLS_CERT_ALTNAME_INVALID",
+	"CERT_HAS_EXPIRED",
+	"DEPTH_ZERO_SELF_SIGNED_CERT",
+	"SELF_SIGNED_CERT_IN_CHAIN",
+	"UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+	"UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+	"UND_ERR_SOCKET",
+	"UND_ERR_CLOSED",
+	"UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_HEADERS_TIMEOUT",
+	"UND_ERR_BODY_TIMEOUT",
+	"UND_ERR_HEADERS_OVERFLOW",
+	"UND_ERR_RES_CONTENT_LENGTH_MISMATCH",
+]);
+
+// The fixed detail used when no allowlisted code is available.
+const REQUEST_FAILED = "request failed";
+
+// `err.cause.code`, else `err.code`, when it is an allowlisted code; else
+// `undefined`. Reads defensively: a getter that throws counts as no code.
+export function safeErrorCode(err) {
+	for (const read of [() => err?.cause?.code, () => err?.code]) {
+		try {
+			const code = read();
+			if (typeof code === "string" && SAFE_ERROR_CODES.has(code)) return code;
+		} catch {
+			// Not a code we can use.
+		}
+	}
+	return undefined;
+}
+
 // Fetch `<origin>/robots.txt` and evaluate it for `url`.
 //
 // Per RFC 9309 §2.3.1.3–4:
@@ -193,7 +245,10 @@ export function cookieHeaderBytes(header) {
 // Chromium's page request (`cookieHeaderBytes`). Node's fetch drops the
 // header on a cross-origin redirect, and a robots `Set-Cookie` is not stored:
 // both are fine for a robots.txt probe (fewer cookies leave the origin).
-// The `--profile` path builds the same header from the context's jar.
+// The `--profile` path builds the same header from the context's jar. When a
+// `Cookie` header was sent, a failure's `detail` is an allowlisted error code
+// (SAFE_ERROR_CODES) or the fixed "request failed", never text taken from the
+// error; without one it is described as it always was.
 //
 // `gate`, if given, wraps the moment the request is sent: it is called with a
 // `start` function and must call it (once) and return its result. This is how
@@ -222,6 +277,9 @@ export async function checkRobotsAllowed(url, options = {}) {
 	// Built from the origin, so userinfo in the page URL (which Node's fetch
 	// refuses outright) is neither sent nor echoed into a diagnostic.
 	const robotsUrl = `${target.origin}/robots.txt`;
+	const sendsCookie = typeof cookie === "string" && cookie !== "";
+	const detailOf = (err) =>
+		sendsCookie ? (safeErrorCode(err) ?? REQUEST_FAILED) : describeError(err);
 	const controller = new AbortController();
 	let timer;
 	let started = false;
@@ -230,7 +288,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 		started = true;
 		timer = setTimeout(() => controller.abort(), timeout);
 		const headers = userAgent ? { "User-Agent": userAgent } : {};
-		if (typeof cookie === "string" && cookie) headers.Cookie = cookieHeaderBytes(cookie);
+		if (sendsCookie) headers.Cookie = cookieHeaderBytes(cookie);
 		return fetchImpl(robotsUrl, {
 			headers,
 			redirect: "follow",
@@ -248,7 +306,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 			if (controller.signal.aborted) return timedOut();
 			return unreachable(robotsUrl, {
 				kind: "network-error",
-				detail: describeError(err),
+				detail: detailOf(err),
 			});
 		}
 		if (!response) {
@@ -273,7 +331,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 			return unreachable(robotsUrl, {
 				kind: "read-error",
 				status,
-				detail: describeError(err),
+				detail: detailOf(err),
 			});
 		}
 	} finally {

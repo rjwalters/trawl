@@ -847,3 +847,174 @@ test("a cookie-gated robots.txt lets the fetch through with --cookies or an impo
 		for (const d of [dir, binDir, home]) rmSync(d, { recursive: true, force: true });
 	}
 });
+
+// --- #87: the robots.txt Cookie header is always one fetch accepts ---
+
+// A local server recording each request's raw Cookie header bytes (Node's
+// parser hands header values over as latin-1, one character per byte).
+async function bytesServer({ robots = "allow" } = {}) {
+	const seen = [];
+	const server = createServer((req, res) => {
+		const i = req.rawHeaders.findIndex((h) => h.toLowerCase() === "cookie");
+		const raw = i >= 0 ? req.rawHeaders[i + 1] : null;
+		seen.push({ url: req.url, cookie: raw === null ? null : Buffer.from(raw, "latin1") });
+		if (req.url === "/robots.txt") {
+			if (robots === "destroy") return req.socket.destroy();
+			res.writeHead(200, { "content-type": "text/plain" });
+			return res.end("User-agent: *\nDisallow:\n");
+		}
+		res.writeHead(200, { "content-type": "text/html" });
+		res.end("<!doctype html><title>loaded</title><p>page loaded</p>");
+	});
+	await new Promise((r) => server.listen(0, "127.0.0.1", r));
+	return {
+		origin: `http://127.0.0.1:${server.address().port}`,
+		seen,
+		close: () => new Promise((r) => server.close(r)),
+	};
+}
+
+// The cookies of a raw header, as byte strings, in no particular order.
+const cookieSet = (buf) => (buf ? buf.toString("latin1").split("; ").sort() : []);
+
+const libCookie = (name, value) => ({ name, value, domain: "127.0.0.1", path: "/", expires: -1, httpOnly: false, secure: false });
+
+test("render(): a CR/LF, NUL or control-character cookie is left out of robots.txt; the fetch goes on", async () => {
+	const srv = await bytesServer();
+	try {
+		const { events, browserType } = fakeBrowser();
+		const cookies = [
+			libCookie("lib", "LIBLEAK\r\nX-Injected: 1"),
+			libCookie("nul", `${AWKWARD}\u0000`),
+			libCookie("ctl", `${AWKWARD}\u0001`),
+			libCookie("ok", "1"),
+		];
+		const result = await render(`${srv.origin}/page`, { ...LIB, browserType, cookies });
+		assert.equal(result.body, "Fixture");
+		const robots = srv.seen.filter((s) => s.url === "/robots.txt");
+		assert.equal(robots.length, 1);
+		// Only the sendable cookie, and nothing injected: one Cookie header.
+		assert.equal(robots[0].cookie.toString("latin1"), "ok=1");
+		assert.ok(events.includes("goto"));
+		// None sendable: robots.txt goes with no Cookie header at all.
+		const only = await render(`${srv.origin}/page`, { ...LIB, browserType: fakeBrowser().browserType, cookies: cookies.slice(0, 1) });
+		assert.equal(only.body, "Fixture");
+		assert.equal(srv.seen.at(-1).url, "/robots.txt");
+		assert.equal(srv.seen.at(-1).cookie, null);
+	} finally {
+		await srv.close();
+	}
+});
+
+test("render(): an injected fetch whose error quotes the Cookie header leaks none of it", async () => {
+	const cookies = [libCookie("k", AWKWARD), libCookie("k2", `${AWKWARD}-2`)];
+	const throwers = [
+		(h) => new TypeError(`Headers.append: "${h}" is an invalid header value.`),
+		(h) => Object.assign(new TypeError("fetch failed"), { stack: `TypeError: ${h}` }),
+		(h) => new TypeError("fetch failed", { cause: Object.assign(new Error(h), { code: h, header: h }) }),
+		(h) => Object.assign(new TypeError("fetch failed"), { cookie: h, request: { headers: { Cookie: h } } }),
+		(h) => new TypeError("fetch failed", { cause: Object.assign(new Error(h), { code: "ECONNREFUSED" }) }),
+	];
+	for (const make of throwers) {
+		const { events, browserType } = fakeBrowser();
+		let sent;
+		const fetch = async (_url, init) => {
+			sent = init.headers.Cookie;
+			throw make(sent);
+		};
+		const err = await render("http://127.0.0.1:1/page", { ...LIB, browserType, cookies, fetch }).catch((e) => e);
+		assert.ok(sent?.includes(AWKWARD), "the header was sent");
+		assert.match(err.message, /^robots\.txt is unreachable: http:\/\/127\.0\.0\.1:1\/robots\.txt could not be fetched \(network error: (request failed|ECONNREFUSED)\)\./);
+		assert.equal(err.cause, undefined);
+		assertNoValue(errorText(err));
+		// Refused before any browser work.
+		assert.deepEqual(events, []);
+	}
+});
+
+test("CLI: a robots.txt failure with cookies sent prints no cookie content", async () => {
+	const srv = await bytesServer({ robots: "destroy" });
+	const dir = tempDir();
+	try {
+		const file = writeSource(
+			dir,
+			"cookies.txt",
+			netscape([
+				["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "pref", "snow☃man"],
+				["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "awk", AWKWARD],
+			]),
+		);
+		const r = await runCli([`${srv.origin}/`, "--cookies", file, "-S", "--no-pacing"], { TRAWL_PROFILE_DIR: "" });
+		assert.equal(r.code, 1, r.stderr);
+		assert.match(r.stderr, /robots\.txt is unreachable: .* could not be fetched \(network error: ([A-Z_]+|request failed)\)\./);
+		assertNoValue([r.stdout, r.stderr]);
+		assertNoValue([r.stdout, r.stderr], "snow☃man");
+		// The cookie went, UTF-8 encoded, as the browser would send it.
+		assert.deepEqual(cookieSet(srv.seen[0].cookie), [`awk=${AWKWARD}`, "pref=snowâ\u0098\u0083man"].sort());
+	} finally {
+		await srv.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// The issue's reproduction, through a symlinked bin and a real browser: a
+// cookie above U+00FF used to fail robots.txt with Node's error text. Now
+// the page loads, and robots.txt and the page see the very same bytes for
+// every cookie, non-ASCII included (Chromium sends UTF-8).
+test("--cookies with non-ASCII values: the page loads, robots.txt and page get the same bytes", browserOpts, async () => {
+	const srv = await bytesServer();
+	const dir = tempDir();
+	const binDir = tempDir();
+	const home = tempDir();
+	const link = join(binDir, "trawl");
+	symlinkSync(CLI_PATH, link);
+	try {
+		const file = writeSource(
+			dir,
+			"cookies.txt",
+			netscape([
+				["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "pref", "snow☃man"],
+				["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "cafe", "café"],
+				["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "awk", AWKWARD],
+				["127.0.0.1", "FALSE", "/", "FALSE", String(FUTURE), "plain", "1"],
+			]),
+		);
+		const r = await runBin(link, [`${srv.origin}/`, "--cookies", file, "-S", "--no-auth-check", "--no-pacing", "-f", "text"], {
+			HOME: home,
+			TRAWL_PROFILE_DIR: "",
+		});
+		assert.equal(r.code, 0, r.stderr);
+		assert.match(r.stdout, /page loaded/);
+		assert.match(r.stderr, /Using 4 cookies from /);
+		assertNoValue([r.stdout, r.stderr]);
+		assert.ok(!r.stderr.includes("snow") && !r.stderr.includes("café"), r.stderr);
+		const robots = srv.seen.find((s) => s.url === "/robots.txt");
+		const page = srv.seen.find((s) => s.url === "/");
+		const expected = ["awk=" + AWKWARD, "cafe=cafÃ©", "plain=1", "pref=snowâ\u0098\u0083man"].sort();
+		assert.deepEqual(cookieSet(robots.cookie), expected);
+		assert.deepEqual(cookieSet(page.cookie), expected);
+	} finally {
+		await srv.close();
+		for (const d of [dir, binDir, home]) rmSync(d, { recursive: true, force: true });
+	}
+});
+
+// The issue's library reproduction against real Chromium: robots.txt now
+// goes without the CR/LF cookie, and Chromium itself refuses it, with
+// trawl's fixed message; no part of the value appears anywhere.
+test("render() with a CR/LF cookie value and a real browser: fixed message, no leak", browserOpts, async () => {
+	const srv = await bytesServer();
+	try {
+		const err = await render(`${srv.origin}/`, {
+			format: "title",
+			pacing: false,
+			authCheck: false,
+			cookies: [libCookie("lib", "LIBLEAK\r\nX-Injected: 1")],
+		}).catch((e) => e);
+		assert.match(err.message, /^could not add cookies to the browser; the page was not fetched/);
+		for (const t of errorText(err)) assert.ok(!t.includes("LIBLEAK") && !t.includes("Injected"), t);
+		assert.deepEqual(srv.seen.map((s) => [s.url, s.cookie]), [["/robots.txt", null]]);
+	} finally {
+		await srv.close();
+	}
+});

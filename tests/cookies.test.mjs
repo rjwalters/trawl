@@ -10,6 +10,7 @@ import {
 	isAuthCookie,
 	MAX_EXPIRES,
 	parseCookies,
+	robotsCookieHeader,
 	sourceUserAgent,
 	summarize,
 	whyNoneLeft,
@@ -683,4 +684,72 @@ test("cookieHeaderFor: no match, empty or junk input is undefined", () => {
 	assert.equal(cookieHeaderFor(undefined, ROBOTS), undefined);
 	assert.equal(cookieHeaderFor([ck("a", "1", "other.org")], ROBOTS), undefined);
 	assert.equal(cookieHeaderFor([ck("a", "1", "example.com")], "not a url"), undefined);
+});
+
+// --- #87: only ever a header value Node's fetch accepts ---
+
+// Node's own check, not a copy of its rule: `Headers.append` throws on any
+// value fetch would refuse (on Node 22, 24 and 26 alike: NUL, CR, LF and
+// anything above U+00FF).
+function fetchAccepts(value) {
+	try {
+		new Headers().append("cookie", value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Every code unit up to U+02FF, the ends of the BMP, both surrogate halves
+// alone, and astral characters.
+const PROBES = [
+	...Array.from({ length: 0x300 }, (_, c) => String.fromCharCode(c)),
+	" ", "☃", "﻿", "￿", "\ud800", "\udfff", "\u{1f600}", "\u{10ffff}",
+];
+
+test("cookieHeaderFor: every character, in a name or a value, yields a value fetch accepts", () => {
+	for (const ch of PROBES) {
+		for (const cookie of [ck("n", `a${ch}b`, "example.com"), ck(`n${ch}m`, "v", "example.com"), ck("", `${ch}x`, "example.com")]) {
+			const header = cookieHeaderFor([cookie, ck("ok", "1", "example.com")], ROBOTS);
+			assert.ok(fetchAccepts(header), `U+${ch.codePointAt(0).toString(16)} gave an unacceptable header`);
+			// The other cookie always goes, whatever happened to this one.
+			assert.match(header, /(^|; )ok=1$/);
+		}
+	}
+});
+
+test("cookieHeaderFor: a control character leaves that cookie out, by name or value", () => {
+	const controls = [...Array.from({ length: 0x20 }, (_, c) => String.fromCharCode(c)), "\u007f"];
+	for (const ch of controls) {
+		const list = [ck("v", `SECRET${ch}x`, "example.com"), ck(`n${ch}`, "SECRET2", "example.com"), ck("ok", "1", "example.com")];
+		const { header, omitted } = robotsCookieHeader(list, ROBOTS);
+		assert.equal(header, "ok=1", `U+${ch.charCodeAt(0).toString(16)}`);
+		assert.deepEqual(omitted, ["v", `n${ch}`]);
+	}
+	// None left: no header at all, and the names say why.
+	const crlf = robotsCookieHeader([ck("lib", "LIBLEAK\r\nX-Injected: 1", "example.com")], ROBOTS);
+	assert.deepEqual(crlf, { header: undefined, omitted: ["lib"] });
+	assert.equal(cookieHeaderFor([ck("lib", "a\u0000b", "example.com")], ROBOTS), undefined);
+	// Only cookies that would have been sent are reported.
+	assert.deepEqual(robotsCookieHeader([ck("far", "a\nb", "other.org")], ROBOTS).omitted, []);
+});
+
+test("cookieHeaderFor: non-ASCII goes as its UTF-8 bytes, as Chromium sends it on the page request", () => {
+	// Chromium 156 sends these exact bytes for these values (see the README):
+	// `café` is 63 61 66 c3 a9 on the page request, not latin-1's single e9.
+	const cases = [
+		["café", "636166c3a9"],
+		["ÿ\u0080x", "c3bfc28078"],
+		["snow☃man", "736e6f77e298836d616e"],
+		["e\u{1f600}", "65f09f9880"],
+		["a\ud800b", "61efbfbd62"],
+	];
+	for (const [value, hex] of cases) {
+		const header = cookieHeaderFor([ck("k", value, "example.com")], ROBOTS);
+		assert.equal(Buffer.from(header, "latin1").toString("hex"), Buffer.from("k=", "latin1").toString("hex") + hex);
+		assert.ok(fetchAccepts(header));
+	}
+	// Names too; ASCII-only headers are unchanged byte for byte.
+	assert.equal(cookieHeaderFor([ck("né", "1", "example.com")], ROBOTS), "nÃ©=1");
+	assert.equal(cookieHeaderFor([ck("a", '"q"%20', "example.com")], ROBOTS), 'a="q"%20');
 });

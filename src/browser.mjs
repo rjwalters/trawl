@@ -3,7 +3,17 @@
 // `playwright install chromium --only-shell` drops into the standard
 // ms-playwright cache, then fall back to a full Chrome/Chromium install.
 
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	accessSync,
+	chmodSync,
+	constants,
+	existsSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { arch, homedir, platform } from "node:os";
 import path from "node:path";
 
@@ -196,27 +206,79 @@ export class NoBrowserError extends Error {
 // that use the profile then launch the same browser, headless.
 export const PROFILE_BROWSER_FILE = ".trawl-browser";
 
-export function recordProfileBrowser(profileDir, executablePath, fs = { writeFileSync }) {
+// Holds only the browser path and when it was recorded, no user data; 0600
+// like the rest of a profile's private state.
+export function recordProfileBrowser(
+	profileDir,
+	executablePath,
+	fs = { writeFileSync, chmodSync },
+) {
+	const marker = path.join(profileDir, PROFILE_BROWSER_FILE);
 	fs.writeFileSync(
-		path.join(profileDir, PROFILE_BROWSER_FILE),
+		marker,
 		`${JSON.stringify({ executablePath, recordedAt: new Date().toISOString() })}\n`,
+		{ mode: 0o600 },
 	);
+	// `mode` only applies when the file is created; tighten a pre-existing one.
+	fs.chmodSync(marker, 0o600);
 }
 
-// The recorded browser for `profileDir`, or null when there is none, the
-// marker is unreadable, or the binary has since gone away.
-export function profileBrowser(profileDir, fs = { readFileSync, existsSync }) {
-	if (!profileDir) return null;
+// Binary names a recorded browser may have: the Chrome/Chromium builds this
+// module itself resolves. This guards against accidents (a stray or stale
+// marker), not attackers: any executable can be named `chrome`, so a profile
+// directory is trusted input, like $TRAWL_EXECUTABLE_PATH.
+const CHROMIUM_BINARY =
+	/^(google[ -]chrome([ -](stable|beta|dev|canary|for testing))?|chrom(e|ium)(-browser)?|chrome-headless-shell)(\.exe)?$/i;
+
+// A marker holds one path and a timestamp; anything bigger is not ours.
+const MAX_MARKER_BYTES = 4096;
+
+// The real path trawl may launch for a recorded `p`, or null. `p` must be an
+// absolute path without NUL or line breaks; symlinks are resolved first, and
+// the *resolved* file must be an executable regular file named like a
+// Chrome/Chromium binary, so a link named `chrome` to /bin/sh is refused.
+// Callers launch the returned resolved path, never `p` itself.
+export function launchableBrowser(
+	p,
+	fs = { realpathSync, statSync, accessSync },
+	plat = platform(),
+) {
+	if (typeof p !== "string" || !path.isAbsolute(p) || /[\0\r\n]/.test(p)) return null;
 	try {
-		const { executablePath } = JSON.parse(
-			fs.readFileSync(path.join(profileDir, PROFILE_BROWSER_FILE), "utf8"),
-		);
-		return typeof executablePath === "string" && fs.existsSync(executablePath)
-			? executablePath
-			: null;
+		const real = fs.realpathSync(p);
+		if (!CHROMIUM_BINARY.test(path.basename(real))) return null;
+		if (!fs.statSync(real).isFile()) return null;
+		// Windows has no execute bit; a regular file is as far as we can check.
+		if (plat !== "win32") fs.accessSync(real, constants.X_OK);
+		return real;
 	} catch {
 		return null;
 	}
+}
+
+export function isLaunchableBrowser(p, fs, plat) {
+	return launchableBrowser(p, fs, plat) !== null;
+}
+
+// The browser recorded for `profileDir` (resolved real path), or null when
+// there is no usable marker: none, a directory, unreadable, oversized,
+// malformed, or a path launchableBrowser refuses. Every null falls back to
+// the default resolution unchanged.
+export function profileBrowser(
+	profileDir,
+	fs = { readFileSync, statSync, realpathSync, accessSync },
+) {
+	if (!profileDir) return null;
+	let executablePath;
+	try {
+		const marker = path.join(profileDir, PROFILE_BROWSER_FILE);
+		const st = fs.statSync(marker);
+		if (!st.isFile() || st.size > MAX_MARKER_BYTES) return null;
+		({ executablePath } = JSON.parse(fs.readFileSync(marker, "utf8")));
+	} catch {
+		return null;
+	}
+	return launchableBrowser(executablePath, fs);
 }
 
 // `profileDir`, when given, lets a profile's recorded browser (see

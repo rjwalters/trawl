@@ -562,7 +562,9 @@ export async function runLogin(argv, deps = {}) {
 	const profileDir = explicitProfileDir ?? defaultProfileDir();
 
 	const mkdir = deps.mkdirSync ?? mkdirSync;
-	mkdir(profileDir, { recursive: true });
+	// 0700 for directories created now, as `cookies import` does: a profile
+	// holds sessions and decides which browser later fetches launch.
+	mkdir(profileDir, { recursive: true, mode: 0o700 });
 
 	const launch = deps.launchPersistentContext ?? defaultLaunchPersistentContext;
 	const waitForUser = deps.waitForUser ?? defaultWaitForUser;

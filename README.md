@@ -319,12 +319,29 @@ Playwright's full Chromium (`npx playwright install chromium`), and fails
 with install instructions if none exists. Login finishes when you close the
 window, even on macOS where the browser app keeps running.
 
-Login records the browser it used in the profile (`.trawl-browser`), and a
-later `trawl <url> --profile <dir>` (or `trawl cookies import`) with that
-profile launches the same browser headless. A profile written by one
-Chromium version can't always be opened by another, and the cached
-headless shell is usually older than a system Chrome. An explicit
-`--executable-path` or `$TRAWL_EXECUTABLE_PATH` still overrides it.
+Login records the browser it used in the profile (`.trawl-browser`, mode
+0600, holding only that path and a timestamp), and a later
+`trawl <url> --profile <dir>` (or `trawl cookies import`) with that profile
+launches the same browser headless. A profile written by one Chromium
+version can't always be opened by another, and the cached headless shell is
+usually older than a system Chrome. An explicit `--executable-path` or
+`$TRAWL_EXECUTABLE_PATH` still overrides it.
+
+trawl uses a recorded path only if it is absolute and, after following
+symlinks, an executable regular file named like a Chrome/Chromium binary
+(`Google Chrome`, `Chromium`, `chrome`, `chrome-headless-shell`, …). It
+launches that resolved file. Any other marker (missing, unreadable,
+oversized, malformed, stale, or pointing elsewhere) is ignored, and the
+browser is chosen exactly as without one. `trawl cookies import` reuses a
+recorded browser but never writes a marker; on a profile without one it
+uses the default headless shell.
+
+**A profile directory is trusted input.** The name check guards against
+accidents, not attackers: any program can be named `chrome`. Whoever can
+write to a profile directory can choose the browser trawl launches for it,
+just as whoever sets `$TRAWL_EXECUTABLE_PATH` can. Keep profiles in
+directories only you can write to (`trawl login` and `trawl cookies import`
+create them `0700`).
 
 #### Importing cookies from another browser
 

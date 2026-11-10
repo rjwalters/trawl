@@ -721,3 +721,10 @@ test("login still succeeds when the browser cannot be recorded", async () => {
 	assert.equal(code, 0);
 	assert.match(stderrLines.join(""), /could not record the login browser/);
 });
+
+test("login creates a new profile directory 0700", async () => {
+	const { deps, mkdirCalls } = fakeLoginDeps({ profileDir: "/tmp/p" });
+	await runLogin(["https://example.com", "--profile", "/tmp/p"], deps);
+	const mkdirCall = mkdirCalls.find((c) => c[0] !== "launch");
+	assert.deepEqual(mkdirCall, ["/tmp/p", { recursive: true, mode: 0o700 }]);
+});

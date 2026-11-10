@@ -91,10 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--executable-path` / `$TRAWL_EXECUTABLE_PATH`, then a system Chrome or
   Chromium, then Playwright's full Chromium. It never uses the headless shell,
   and fails with install instructions when nothing headed exists. Login
-  records that browser in the profile (`.trawl-browser`), and fetches and
-  cookie imports with that profile launch it headless, because the older
-  headless shell crashes on a profile a newer Chrome wrote. An explicit path
-  still wins. (#95)
+  records that browser in the profile (`.trawl-browser`, 0600, path and
+  timestamp only), and fetches and cookie imports with that profile launch
+  it headless, because the older headless shell crashes on a profile a newer
+  Chrome wrote. This changes which browser `--profile` fetches use for a
+  login-written profile. A recorded path is used only if it is absolute and,
+  after following symlinks, an executable regular file named like a
+  Chrome/Chromium binary; trawl launches the resolved file. Any other marker
+  is ignored and the browser is chosen exactly as before. An explicit path or
+  `$TRAWL_EXECUTABLE_PATH` still wins. `trawl login` now creates new profile
+  directories `0700`, as `cookies import` already did. A profile directory
+  is trusted input (README). (#95)
 - **`trawl login` finishes when the window closes on macOS.** Closing a
   window there leaves the browser app running, so login waited forever. It
   now also finishes when the last page closes, and reuses the initial blank

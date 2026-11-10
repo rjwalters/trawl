@@ -4,10 +4,10 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
+import { cookieHeaderFor } from "../src/cookies.mjs";
 import {
 	MAX_CRAWL_DELAY_MS,
 	checkRobotsAllowed,
-	cookieHeaderBytes,
 	crawlDelayMs,
 	evaluateRobots,
 	parseRobotsTxt,
@@ -527,17 +527,9 @@ test("a cookie never reaches the verdict or the denial message", async () => {
 	}
 });
 
-// --- the Cookie header goes out as UTF-8 bytes (#89) ---
+// --- the Cookie header goes out as UTF-8 bytes, encoded once (#89) ---
 
-test("cookieHeaderBytes: ASCII is unchanged, non-ASCII becomes one char per UTF-8 byte", () => {
-	assert.equal(cookieHeaderBytes("a=1; b=2"), "a=1; b=2");
-	assert.equal(cookieHeaderBytes("p=caf\u00e9"), "p=caf\u00c3\u00a9");
-	assert.equal(cookieHeaderBytes("p=snow\u2603man"), "p=snow\u00e2\u0098\u0083man");
-	// Every char is now <= U+00FF, which Node's fetch accepts.
-	assert.ok(![...cookieHeaderBytes("p=snow\u2603man")].some((c) => c.codePointAt(0) > 0xff));
-});
-
-test("checkRobotsAllowed sends non-ASCII cookie values as UTF-8 bytes and does not throw", async () => {
+test("checkRobotsAllowed sends a ready byte-string cookie header unchanged and does not throw", async () => {
 	let raw;
 	const server = createServer((req, res) => {
 		raw = req.rawHeaders;
@@ -552,7 +544,7 @@ test("checkRobotsAllowed sends non-ASCII cookie values as UTF-8 bytes and does n
 			["caf\u00e9", "636166c3a9"],
 		]) {
 			raw = undefined;
-			const v = await checkRobotsAllowed(url, { cookie: `p=${value}` });
+			const v = await checkRobotsAllowed(url, { cookie: cookieHeaderFor([{ name: "p", value, domain: "127.0.0.1", path: "/" }], `${new URL(url).origin}/robots.txt`) });
 			assert.deepEqual(v, { allowed: true, rule: null, crawlDelay: null });
 			const header = raw[raw.findIndex((h) => h.toLowerCase() === "cookie") + 1];
 			assert.equal(Buffer.from(header, "latin1").toString("hex"), `703d${hex}`);

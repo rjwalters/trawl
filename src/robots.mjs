@@ -169,14 +169,6 @@ function describeError(err) {
 	);
 }
 
-// Node's fetch (undici) rejects a header value above U+00FF and sends each
-// char as one byte, so a cookie Chromium would send as UTF-8 (`snow☃man`)
-// throws, and `café` would go out as latin-1. Re-express the UTF-8 bytes one
-// char per byte so they reach the wire unchanged.
-export function cookieHeaderBytes(header) {
-	return Buffer.from(header, "utf8").toString("latin1");
-}
-
 // Error codes that may be named in a diagnostic when the request carried
 // cookies. Only a code is ever taken from such an error, and only one equal to
 // an entry here: an error's message, and anything else on it, can quote the
@@ -241,8 +233,9 @@ export function safeErrorCode(err) {
 // The request carries the User-Agent and, when `cookie` is given, that string
 // as its `Cookie` header: a ready header (src/cookies.mjs `cookieHeaderFor`),
 // never a cookie list, so this module stays cookie-agnostic. It is a secret
-// and goes nowhere but the header; it goes out as UTF-8 bytes, like
-// Chromium's page request (`cookieHeaderBytes`). Node's fetch drops the
+// and goes nowhere but the header, as given: `cookieHeaderFor` has already
+// put non-ASCII in as UTF-8 bytes, one per char, like Chromium's page request,
+// so it must not be encoded again here. Node's fetch drops the
 // header on a cross-origin redirect, and a robots `Set-Cookie` is not stored:
 // both are fine for a robots.txt probe (fewer cookies leave the origin).
 // The `--profile` path builds the same header from the context's jar. When a
@@ -288,7 +281,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 		started = true;
 		timer = setTimeout(() => controller.abort(), timeout);
 		const headers = userAgent ? { "User-Agent": userAgent } : {};
-		if (sendsCookie) headers.Cookie = cookieHeaderBytes(cookie);
+		if (sendsCookie) headers.Cookie = cookie;
 		return fetchImpl(robotsUrl, {
 			headers,
 			redirect: "follow",

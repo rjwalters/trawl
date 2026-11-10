@@ -491,7 +491,7 @@ test("profileDir: robots.txt is fetched with the jar's cookies, after launch and
 		"goto",
 		"context.close",
 	]);
-	// UTF-8 bytes, one char per byte (see cookieHeaderBytes).
+	// UTF-8 bytes, one char per byte (see robotsCookieHeader).
 	assert.deepEqual(fetchCalls[0][1].headers, {
 		"User-Agent": "trawl/9.9.9 (+test)",
 		Cookie: "a=1; b=snow\u00e2\u0098\u0083man",

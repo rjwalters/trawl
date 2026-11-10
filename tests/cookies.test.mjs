@@ -5,6 +5,7 @@ import {
 	AUTH_COOKIES,
 	browserWouldReject,
 	CookieParseError,
+	cookieHeaderFor,
 	filterCookies,
 	isAuthCookie,
 	MAX_EXPIRES,
@@ -589,4 +590,97 @@ test("sourceUserAgent is null for cookies.txt and for anything unparseable", () 
 	assert.equal(sourceUserAgent('{"log": {}}'), null);
 	assert.equal(sourceUserAgent(""), null);
 	assert.equal(sourceUserAgent(undefined), null);
+});
+
+// --- cookieHeaderFor (#79): the Cookie header for the robots.txt request ---
+
+const ck = (name, value, domain, extra = {}) => ({
+	name,
+	value,
+	domain,
+	path: "/",
+	expires: -1,
+	httpOnly: false,
+	secure: false,
+	...extra,
+});
+const ROBOTS = "https://example.com/robots.txt";
+
+test("cookieHeaderFor: host-only vs leading-dot domains", () => {
+	const hostOnly = [ck("h", "1", "example.com")];
+	const dotted = [ck("d", "2", ".example.com")];
+	assert.equal(cookieHeaderFor(hostOnly, ROBOTS), "h=1");
+	assert.equal(cookieHeaderFor(hostOnly, "https://www.example.com/robots.txt"), undefined);
+	assert.equal(cookieHeaderFor(dotted, ROBOTS), "d=2");
+	assert.equal(cookieHeaderFor(dotted, "https://www.example.com/robots.txt"), "d=2");
+	assert.equal(cookieHeaderFor(dotted, "https://a.b.example.com/robots.txt"), "d=2");
+	for (const list of [hostOnly, dotted]) {
+		assert.equal(cookieHeaderFor(list, "https://notexample.com/robots.txt"), undefined);
+		assert.equal(cookieHeaderFor(list, "https://example.com.evil.org/robots.txt"), undefined);
+	}
+	// A subdomain cookie never goes to its parent.
+	assert.equal(cookieHeaderFor([ck("s", "3", ".www.example.com")], ROBOTS), undefined);
+	// Case-insensitive on both sides.
+	assert.equal(cookieHeaderFor([ck("c", "4", ".Example.COM")], "https://WWW.example.com/robots.txt"), "c=4");
+});
+
+test("cookieHeaderFor: single-label domains and IP hosts match exactly only", () => {
+	assert.equal(cookieHeaderFor([ck("a", "1", ".com")], ROBOTS), undefined);
+	assert.equal(cookieHeaderFor([ck("a", "1", ".test")], "http://test/robots.txt"), "a=1");
+	assert.equal(cookieHeaderFor([ck("a", "1", "127.0.0.1")], "http://127.0.0.1:8080/robots.txt"), "a=1");
+	assert.equal(cookieHeaderFor([ck("a", "1", ".0.0.1")], "http://127.0.0.1/robots.txt"), undefined);
+	assert.equal(cookieHeaderFor([ck("a", "1", "127.0.0.1")], "http://127.0.0.10/robots.txt"), undefined);
+});
+
+test("cookieHeaderFor: RFC 6265 path-match", () => {
+	const at = (path) => cookieHeaderFor([ck("p", "1", "example.com", { path })], ROBOTS);
+	assert.equal(at("/"), "p=1");
+	assert.equal(at("/robots.txt"), "p=1");
+	assert.equal(at("/robots"), undefined);
+	assert.equal(at("/foo"), undefined);
+	assert.equal(at("/robots.txt/"), undefined);
+	// Not hard-wired to /robots.txt.
+	const deep = [ck("p", "1", "example.com", { path: "/a/b" })];
+	assert.equal(cookieHeaderFor(deep, "https://example.com/a/b/c"), "p=1");
+	assert.equal(cookieHeaderFor(deep, "https://example.com/a/bc"), undefined);
+	assert.equal(cookieHeaderFor([ck("p", "1", "example.com", { path: "/a/" })], "https://example.com/a/x"), "p=1");
+});
+
+test("cookieHeaderFor: a secure cookie only over https", () => {
+	const list = [ck("s", "1", "example.com", { secure: true }), ck("p", "2", "example.com")];
+	assert.equal(cookieHeaderFor(list, ROBOTS), "s=1; p=2");
+	assert.equal(cookieHeaderFor(list, "http://example.com/robots.txt"), "p=2");
+	// No special case for localhost.
+	assert.equal(cookieHeaderFor([ck("s", "1", "localhost", { secure: true })], "http://localhost/robots.txt"), undefined);
+});
+
+test("cookieHeaderFor: expiry (past, future, session)", () => {
+	const now = NOW;
+	const nowSec = now / 1000;
+	const list = [
+		ck("past", "1", "example.com", { expires: nowSec - 1 }),
+		ck("now", "2", "example.com", { expires: nowSec }),
+		ck("future", "3", "example.com", { expires: nowSec + 60 }),
+		ck("session", "4", "example.com", { expires: -1 }),
+	];
+	assert.equal(cookieHeaderFor(list, ROBOTS, { now }), "future=3; session=4");
+	assert.equal(cookieHeaderFor(list.slice(0, 2), ROBOTS, { now }), undefined);
+});
+
+test("cookieHeaderFor: longer paths first, ties in input order, raw values, nameless cookies", () => {
+	const list = [
+		ck("b", "x=y;z", "example.com"),
+		ck("long", "1", "example.com", { path: "/robots.txt" }),
+		ck("", "bare", ".example.com"),
+		ck("a", '"q"%20', "example.com"),
+		ck("httponly", "h", "example.com", { httpOnly: true, sameSite: "Strict" }),
+	];
+	assert.equal(cookieHeaderFor(list, ROBOTS), 'long=1; b=x=y;z; bare; a="q"%20; httponly=h');
+});
+
+test("cookieHeaderFor: no match, empty or junk input is undefined", () => {
+	assert.equal(cookieHeaderFor([], ROBOTS), undefined);
+	assert.equal(cookieHeaderFor(undefined, ROBOTS), undefined);
+	assert.equal(cookieHeaderFor([ck("a", "1", "other.org")], ROBOTS), undefined);
+	assert.equal(cookieHeaderFor([ck("a", "1", "example.com")], "not a url"), undefined);
 });

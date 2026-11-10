@@ -729,6 +729,68 @@ export function filterCookies(cookies, opts = {}) {
 	return { cookies: list, authDropped, expiredDropped, matched };
 }
 
+// An IPv4 or IPv6 literal (a URL `hostname` keeps the IPv6 brackets).
+function isIpHost(host) {
+	return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":") || host.startsWith("[");
+}
+
+// RFC 6265 5.1.3, stricter than `domainMatches` (a lenient `--domain`
+// filter): a leading dot makes a domain cookie, sent to that host and its
+// subdomains; without one the cookie is host-only, sent to that exact host.
+// A single-label domain (`.com`) and an IP host match only exactly.
+function cookieDomainMatches(cookieDomain, host) {
+	const raw = String(cookieDomain ?? "").trim().toLowerCase();
+	const domain = raw.replace(/^\./, "");
+	if (!domain) return false;
+	if (host === domain) return true;
+	if (!raw.startsWith(".") || isIpHost(host) || !domain.includes(".")) return false;
+	return host.endsWith(`.${domain}`);
+}
+
+// RFC 6265 5.1.4: the cookie path equals the request path, or is a prefix of
+// it that ends in `/` or is followed by a `/` in the request path.
+function cookiePathMatches(cookiePath, requestPath) {
+	const path = cookiePath || "/";
+	if (path === requestPath) return true;
+	if (!requestPath.startsWith(path)) return false;
+	return path.endsWith("/") || requestPath[path.length] === "/";
+}
+
+/**
+ * The `Cookie` header a browser would send with a request to `url`, from an
+ * already-parsed, already-filtered list (the `makeCookie` shape), or
+ * `undefined` when no cookie matches. RFC 6265 5.4: domain (host-only vs
+ * leading dot), path, `secure` only over https, not expired (-1 = session).
+ * `httpOnly` and `sameSite` are ignored: this is a request of trawl's own to
+ * the site's own origin. Longer paths first, ties in input order; a nameless
+ * cookie contributes its value alone. The result is a secret: it belongs in a
+ * request header and nowhere else (no log, no error, no `failure`).
+ */
+export function cookieHeaderFor(cookies, url, { now = Date.now() } = {}) {
+	let target;
+	try {
+		target = new URL(url);
+	} catch {
+		return undefined;
+	}
+	const host = target.hostname.toLowerCase();
+	const https = target.protocol === "https:";
+	const nowSec = now / 1000;
+	const matching = [];
+	for (const c of Array.isArray(cookies) ? cookies : []) {
+		if (!c || !cookieDomainMatches(c.domain, host)) continue;
+		if (!cookiePathMatches(c.path, target.pathname)) continue;
+		if (c.secure && !https) continue;
+		const e = c.expires;
+		if (typeof e === "number" && e !== -1 && !(e > nowSec)) continue;
+		matching.push(c);
+	}
+	if (matching.length === 0) return undefined;
+	// Array.prototype.sort is stable, so equal path lengths keep input order.
+	matching.sort((a, b) => (b.path || "/").length - (a.path || "/").length);
+	return matching.map((c) => (c.name ? `${c.name}=${c.value}` : String(c.value))).join("; ");
+}
+
 // Byte length, as Chromium measures cookie limits.
 function bytes(s) {
 	return Buffer.byteLength(String(s), "utf8");

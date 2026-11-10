@@ -178,9 +178,12 @@ function describeError(err) {
 //     read: complete disallow, reported via `failure` with no matched rule.
 // Redirects are followed (Node fetch's default); the final response decides.
 //
-// The request carries the User-Agent but no browser-profile cookies, so a
-// robots.txt behind a cookie-gated interstitial is "unreachable" here even
-// when a navigation with that profile would get through.
+// The request carries the User-Agent and, when `cookie` is given, that string
+// as its `Cookie` header: a ready header (src/cookies.mjs `cookieHeaderFor`),
+// never a cookie list, so this module stays cookie-agnostic. It is a secret
+// and goes nowhere but the header. Node's fetch drops the header on a
+// cross-origin redirect. To send a browser profile's cookies instead, pass
+// `fetch: requestFetch(context.request)` (below).
 //
 // `gate`, if given, wraps the moment the request is sent: it is called with a
 // `start` function and must call it (once) and return its result. This is how
@@ -195,6 +198,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 		timeout = ROBOTS_TIMEOUT_MS,
 		fetch: fetchImpl = globalThis.fetch,
 		gate = (start) => start(),
+		cookie,
 	} = options;
 
 	let target;
@@ -215,8 +219,10 @@ export async function checkRobotsAllowed(url, options = {}) {
 	const start = () => {
 		started = true;
 		timer = setTimeout(() => controller.abort(), timeout);
+		const headers = userAgent ? { "User-Agent": userAgent } : {};
+		if (typeof cookie === "string" && cookie) headers.Cookie = cookie;
 		return fetchImpl(robotsUrl, {
-			headers: userAgent ? { "User-Agent": userAgent } : {},
+			headers,
 			redirect: "follow",
 			signal: controller.signal,
 		});
@@ -270,12 +276,95 @@ export async function checkRobotsAllowed(url, options = {}) {
 	});
 }
 
+// A `fetch`-shaped function over Playwright's `context.request`, so a robots
+// check made through a browser context (sharing its cookie jar) reuses every
+// status, timeout and read-error rule above instead of duplicating them.
+// - Returns `{ ok, status, text }` as properties, like a fetch Response, and
+//   disposes of the Playwright response once the body is read.
+// - Honours the `AbortSignal` it is given, so checkRobotsAllowed's own timer
+//   still classifies a hang as "timeout". Playwright's own `timeout` is only
+//   a backstop, set a second later so it cannot win that race and be
+//   misreported as a network error.
+// - Never lets the browser's error text out: any failure becomes a fixed
+//   "request failed" (no `cause`), which is all the verdict then reports.
+// - Leaves 4xx/5xx to the caller (no `failOnStatusCode`) and follows up to
+//   20 redirects; Playwright re-attaches the jar's cookies per hop, as a
+//   browser does.
+export function requestFetch(request, { timeout = ROBOTS_TIMEOUT_MS } = {}) {
+	const failed = () => new Error("request failed");
+	const untilAborted = (promise, signal) => {
+		if (!signal) return promise;
+		if (signal.aborted) return Promise.reject(failed());
+		let onAbort;
+		const aborted = new Promise((_, reject) => {
+			onAbort = () => reject(failed());
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
+		return Promise.race([promise, aborted]).finally(() =>
+			signal.removeEventListener("abort", onAbort),
+		);
+	};
+	return async (url, init = {}) => {
+		const { signal } = init;
+		const pending = Promise.resolve().then(() =>
+			request.get(url, {
+				headers: init.headers,
+				maxRedirects: 20,
+				failOnStatusCode: false,
+				timeout: timeout > 0 ? timeout + 1000 : 0,
+			}),
+		);
+		let response;
+		try {
+			response = await untilAborted(pending, signal);
+		} catch {
+			// Abandoned (aborted): dispose of the response should it still arrive.
+			pending.then((r) => r?.dispose?.()).catch(() => {});
+			throw failed();
+		}
+		const dispose = async () => {
+			try {
+				await response?.dispose?.();
+			} catch {
+				// Nothing to report: the body was read or abandoned.
+			}
+		};
+		let ok;
+		let status;
+		try {
+			ok = Boolean(response.ok());
+			status = Number(response.status());
+		} catch {
+			await dispose();
+			throw failed();
+		}
+		return {
+			ok,
+			status,
+			text: async () => {
+				try {
+					return await untilAborted(
+						Promise.resolve().then(() => response.text()),
+						signal,
+					);
+				} catch {
+					throw failed();
+				} finally {
+					await dispose();
+				}
+			},
+		};
+	};
+}
+
 // Turn a denied robots verdict into an error message. A matched rule and a
 // robots.txt that could not be retrieved are different situations and say
-// so: the latter names the cause, says why it is a full disallow, and notes
-// that the robots request carries no browser-profile cookies — the usual
-// reason a site that loads fine in a browser still fails here.
-export function robotsDenialMessage(verdict) {
+// so: the latter names the cause and says why it is a full disallow. When the
+// request carried no cookies it also says so — the usual reason a site that
+// loads fine in a browser still fails here. Pass `{ sentCookies: true }` when
+// it did (a matching --cookies header, or a profile's jar), where that note
+// would be false. Nothing here ever names a cookie.
+export function robotsDenialMessage(verdict, { sentCookies = false } = {}) {
 	const override = "Use --ignore-robots to override.";
 	const failure = verdict?.failure;
 	if (!failure) {
@@ -296,10 +385,13 @@ export function robotsDenialMessage(verdict) {
 		default:
 			cause = `${where} could not be fetched (network error: ${failure.detail})`;
 	}
+	const cookieNote = sentCookies
+		? ""
+		: "The robots.txt request " +
+			"sends no browser-profile cookies, so a cookie-gated robots.txt can " +
+			"fail here even when the page itself would load. ";
 	return (
 		`robots.txt is unreachable: ${cause}. RFC 9309 treats an unreachable ` +
-		"robots.txt as disallowing the whole site. The robots.txt request " +
-		"sends no browser-profile cookies, so a cookie-gated robots.txt can " +
-		`fail here even when the page itself would load. ${override}`
+		`robots.txt as disallowing the whole site. ${cookieNote}${override}`
 	);
 }

@@ -99,9 +99,10 @@ Cookie import (trawl cookies import <file>):
                             Session cookies are kept for 7 days. Expired
                             cookies are dropped, and so are sign-in
                             cookies (best-effort list: AUTH_COOKIES in
-                            src/cookies.mjs). If none are left, nothing is
-                            written and the exit code is 1. Delete the
-                            source file afterwards.
+                            src/cookies.mjs). Cookies the browser would
+                            refuse are skipped by name. If none are left,
+                            nothing is written and the exit code is 1.
+                            Delete the source file afterwards.
       --domain <host>      Only cookies that would be sent to this host
       --allow <names>      Only these cookie names (comma-separated)
       --include-auth       Keep sign-in cookies too
@@ -305,6 +306,11 @@ and reports what it dropped:
   you pass `--include-auth`. The list (`AUTH_COOKIES` in `src/cookies.mjs`) is
   **best-effort**: a site can call its session cookie anything, so treat
   "not dropped" as "not recognised", not as "safe".
+- **Cookies the browser would refuse** (a `;` or control character in the
+  name or value, over 4096 bytes, a `__Host-`/`__Secure-` cookie that breaks
+  its prefix rules, and so on) are skipped and listed by name. Chromium
+  rejects the whole batch over a single bad cookie, so letting one through
+  would import nothing at all.
 - `--domain <host>` keeps only cookies that would be sent to that host, and
   `--allow a,b` only the cookies with those exact names.
 
@@ -312,8 +318,10 @@ and reports what it dropped:
 cookies go through Chromium into the profile's own encrypted store, never into
 a plaintext file, and a profile directory `trawl` creates is made `0700` (an
 existing one keeps its mode). Nothing is written until the file has parsed and
-at least one cookie is left after filtering; otherwise the command exits 1
-and the profile is untouched.
+at least one cookie is left after filtering; otherwise the command exits 1,
+says which filter removed them, and the profile is untouched. If the browser
+then fails to start or refuses the write, nothing is imported; the error says
+so but never repeats the browser's own message, which can quote a cookie.
 
 **Delete the source file once the import is done.** It still holds every
 cookie it was exported with, sign-in cookies included, in plain text; `trawl`

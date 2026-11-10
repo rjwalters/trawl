@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	AUTH_COOKIES,
+	browserWouldReject,
 	CookieParseError,
 	filterCookies,
 	isAuthCookie,
@@ -265,6 +266,44 @@ test("filters: allow is exact-name, applied after domain", () => {
 		r.cookies.map((c) => [c.name, c.domain]),
 		[["keep", "a.test"]],
 	);
+});
+
+test("filters: matched counts what --domain/--allow left, before expiry and auth", () => {
+	const cs = parseCookies(
+		har(harEntry("https://a.test/", "keep=1; SID=2; other=3"), harEntry("https://b.test/", "keep=4")),
+	);
+	assert.equal(filterCookies(cs, { now: NOW }).matched, 4);
+	const r = filterCookies(cs, { domain: "a.test", allow: ["keep", "SID"], now: NOW });
+	assert.equal(r.matched, 2);
+	assert.equal(r.cookies.length, 1);
+	assert.equal(filterCookies(cs, { domain: "c.test", now: NOW }).matched, 0);
+});
+
+test("browserWouldReject mirrors Chromium's cookie checks", () => {
+	const ok = { name: "a", value: 'v"\\/+=', domain: "example.com", path: "/", secure: true };
+	assert.equal(browserWouldReject(ok), false);
+	assert.equal(browserWouldReject({ ...ok, name: "" }), false);
+	assert.equal(browserWouldReject({ ...ok, name: "__Host-a" }), false);
+	for (const bad of [
+		{ value: "x;y" },
+		{ name: "a=b" },
+		{ value: "x\ny" },
+		{ name: "a\u0001" },
+		{ value: " v" },
+		{ name: "", value: "" },
+		{ value: "x".repeat(4096) },
+		{ value: "é".repeat(2048) },
+		{ path: "x" },
+		{ path: "/a;b" },
+		{ path: `/${"p".repeat(1024)}` },
+		{ domain: " " },
+		{ name: "__Secure-a", secure: false },
+		{ name: "__HOST-a", path: "/x" },
+		{ name: "__Host-a", domain: ".example.com" },
+		{ name: "", value: "__Host-x", secure: false },
+	]) {
+		assert.equal(browserWouldReject({ ...ok, ...bad }), true, JSON.stringify(bad));
+	}
 });
 
 test("filters: expired cookies dropped and counted; session kept", () => {

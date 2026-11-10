@@ -691,9 +691,11 @@ function domainMatches(cookieDomain, hostFilter) {
 /**
  * Filter a cookie list. Order: domain, allow, expired, auth.
  * Options: `domain` (host), `allow` (exact names), `includeAuth`, `now` (ms,
- * injectable for tests). Returns `{ cookies, authDropped, expiredDropped }`.
- * `authDropped` holds `{ name, domain }` only, never values. Pass the result
- * to `summarize` for anything meant for display.
+ * injectable for tests). Returns `{ cookies, authDropped, expiredDropped,
+ * matched }`, where `matched` counts the cookies left after `domain`/`allow`
+ * (before the expired and auth steps). `authDropped` holds `{ name, domain }`
+ * only, never values. Pass the result to `summarize` for anything meant for
+ * display.
  */
 export function filterCookies(cookies, opts = {}) {
 	const { domain, allow, includeAuth = false, now = Date.now() } = opts;
@@ -703,6 +705,7 @@ export function filterCookies(cookies, opts = {}) {
 		const names = new Set(allow);
 		list = list.filter((c) => names.has(c.name));
 	}
+	const matched = list.length;
 	const nowSec = now / 1000;
 	let expiredDropped = 0;
 	list = list.filter((c) => {
@@ -721,7 +724,46 @@ export function filterCookies(cookies, opts = {}) {
 			return false;
 		});
 	}
-	return { cookies: list, authDropped, expiredDropped };
+	return { cookies: list, authDropped, expiredDropped, matched };
+}
+
+// Byte length, as Chromium measures cookie limits.
+function bytes(s) {
+	return Buffer.byteLength(String(s), "utf8");
+}
+
+const COOKIE_CONTROL = /[\u0000-\u001f\u007f;]/;
+
+/**
+ * True when Chromium's `Storage.setCookies` would refuse this cookie. One
+ * refused cookie fails the whole `addCookies` batch, so callers set these
+ * aside first and report them by name. Each rule was checked against real
+ * Chromium (playwright-core 1.64): it is a best-effort mirror of its
+ * `CanonicalCookie` checks, not a parser of its own, and Chromium stays the
+ * final word. Looks at the value but returns only a boolean.
+ */
+export function browserWouldReject(cookie) {
+	const name = String(cookie?.name ?? "");
+	const value = String(cookie?.value ?? "");
+	const path = String(cookie?.path ?? "");
+	const domain = String(cookie?.domain ?? "").trim();
+	if (!domain) return true;
+	if (COOKIE_CONTROL.test(name) || COOKIE_CONTROL.test(value)) return true;
+	if (name.includes("=")) return true;
+	if (/^\s|\s$/.test(name) || /^\s|\s$/.test(value)) return true;
+	if (name === "" && value === "") return true;
+	if (bytes(name) + bytes(value) > 4096) return true;
+	if (!path.startsWith("/") || path.includes(";") || bytes(path) > 1024) return true;
+	// With no name, the value is what the prefix rules read as the name.
+	const prefixed = (name === "" ? value : name).toLowerCase();
+	if (prefixed.startsWith("__secure-") && !cookie.secure) return true;
+	if (
+		prefixed.startsWith("__host-") &&
+		(!cookie.secure || path !== "/" || domain.startsWith("."))
+	) {
+		return true;
+	}
+	return false;
 }
 
 // Explicit field pick (never spread) so a field added to cookies later cannot

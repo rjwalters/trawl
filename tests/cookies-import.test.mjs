@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { resolveExecutablePath } from "../src/browser.mjs";
+import { browserWouldReject } from "../src/cookies.mjs";
 import {
 	browserFamily,
 	main,
@@ -356,8 +357,48 @@ test("zero surviving cookies: exit 1, summary printed, no browser, no profile", 
 		const { stderr } = text();
 		assert.match(stderr, /Dropped 1 sign-in cookie \(SID\)/);
 		assert.match(stderr, /Dropped 1 expired cookie/);
-		assert.match(stderr, /no cookies left to import .* was not touched/);
+		assert.match(
+			stderr,
+			/no cookies left to import from .*: every cookie that matched --allow was expired or a sign-in cookie \(pass --include-auth to import sign-in cookies\); .* was not touched/,
+		);
 		assert.doesNotMatch(stderr, /still contains every cookie/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("zero survivors: the message names the filter that removed them", async () => {
+	const dir = tempDir();
+	const profile = join(dir, "profile");
+	const file = writeSource(dir, "cookies.txt", TXT);
+	const run = async (...flags) => {
+		const { deps, calls, text } = fakeDeps({ profileDir: profile });
+		deps.existsSync = existsSync;
+		deps.mkdirSync = mkdirSync;
+		assert.equal(await runCookiesImport([file, "--profile", profile, ...flags], deps), 1);
+		assert.equal(calls.launch.length, 0);
+		return text().stderr;
+	};
+	try {
+		// --allow named only a sign-in cookie: the auth filter removed it, not --allow.
+		let err = await run("--allow", "SID");
+		assert.match(err, /: every cookie that matched --allow was a sign-in cookie \(pass --include-auth to import sign-in cookies\);/);
+
+		err = await run("--domain", "nowhere.test");
+		assert.match(err, /: no cookie matched --domain;/);
+		assert.doesNotMatch(err, /include-auth/);
+
+		err = await run("--domain", "example.com", "--allow", "theme");
+		assert.match(err, /: no cookie matched --domain and --allow;/);
+
+		// No --domain/--allow given: neither is mentioned.
+		const expiredOnly = writeSource(dir, "old.txt", netscape([[".example.com", "TRUE", "/", "FALSE", "1000", "old", "x"]]));
+		const { deps } = fakeDeps({ profileDir: profile });
+		const lines = [];
+		deps.stderr = (s) => lines.push(s);
+		assert.equal(await runCookiesImport([expiredOnly, "--profile", profile], deps), 1);
+		assert.match(lines.join(""), /: every cookie was expired;/);
+		assert.doesNotMatch(lines.join(""), /--domain|--allow|include-auth/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -365,44 +406,215 @@ test("zero surviving cookies: exit 1, summary printed, no browser, no profile", 
 
 // --- the context lifecycle ---
 
-test("the context is closed even when addCookies throws, and the value is not echoed", async () => {
+// A value with every character JSON or URL encoding rewrites, so an echo in
+// any encoding differs from the raw value and a plain `includes` would miss it.
+const AWKWARD = 'aw"KW\\rd/V4l+u3=Zq-77Xk';
+
+// Every form a browser error could carry the value in, and every 6+ character
+// substring of it: none may reach stdout, stderr or the thrown error.
+function assertNoValue(haystacks, value = AWKWARD) {
+	const forms = [value, encodeURIComponent(value), JSON.stringify(value), escape(value), value.slice(0, 8)];
+	for (let i = 0; i + 6 <= value.length; i++) forms.push(value.slice(i, i + 6));
+	for (const h of haystacks) {
+		for (const f of forms) assert.ok(!h.includes(f), `leaked ${JSON.stringify(f)} in ${JSON.stringify(h)}`);
+	}
+}
+
+function errorText(err) {
+	return [String(err?.message), String(err?.stack), String(err?.cause ?? ""), JSON.stringify(err)];
+}
+
+test("the context is closed when addCookies throws, and no form of the value is echoed", async () => {
 	const dir = tempDir();
-	const file = writeSource(dir, "cookies.txt", TXT);
-	const { deps, context, text } = fakeDeps({
-		profileDir: "/p",
-		// Shaped like a Playwright rejection that quotes the offending cookie.
-		addCookies: async (cookies) => {
-			throw new Error(`browserContext.addCookies: Invalid cookie ${JSON.stringify(cookies[0])}`);
-		},
-	});
+	const file = writeSource(dir, "cookies.txt", netscape([[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", AWKWARD]]));
+	const echoes = [
+		(v) => `browserContext.addCookies: bad cookie ${v}`,
+		(v) => `browserContext.addCookies: bad cookie ${encodeURIComponent(v)}`,
+		(v) => `browserContext.addCookies: Invalid cookie ${JSON.stringify({ name: "pref", value: v })}`,
+		(v) => `browserContext.addCookies: bad cookie ${v.slice(0, 8)}...`,
+		// A known message with the value appended is no longer the known message.
+		(v) => `browserContext.addCookies: Protocol error (Storage.setCookies): Invalid cookie fields ${v}`,
+	];
 	try {
-		await assert.rejects(() => runCookiesImport([file, "--profile", "/p"], deps), (err) => {
-			assert.equal(err.message, "could not write cookies to the profile");
-			return true;
-		});
-		assert.equal(context.closed, true);
-		assert.doesNotMatch(text().stdout, /Imported/);
+		for (const echo of echoes) {
+			const { deps, context, text } = fakeDeps({
+				profileDir: "/p",
+				addCookies: async (cookies) => {
+					assert.equal(cookies[0].value, AWKWARD, "fixture lost its value");
+					const err = new Error(`${echo(cookies[0].value)}\nCall log: ${cookies[0].value}`);
+					err.cause = new Error(cookies[0].value);
+					throw err;
+				},
+			});
+			await assert.rejects(() => runCookiesImport([file, "--profile", "/p"], deps), (err) => {
+				assert.equal(err.message, "could not write cookies to /p; nothing was imported");
+				assert.equal(err.cause, undefined);
+				assertNoValue(errorText(err));
+				return true;
+			});
+			assert.equal(context.closed, true);
+			const { stdout, stderr } = text();
+			assert.doesNotMatch(stdout, /Imported/);
+			assertNoValue([stdout, stderr]);
+		}
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-test("an addCookies error that quotes no value keeps its detail", async () => {
+test("only an exact, known value-free addCookies message adds detail", async () => {
 	const dir = tempDir();
 	const file = writeSource(dir, "cookies.txt", TXT);
-	const { deps, context } = fakeDeps({
-		profileDir: "/p",
-		addCookies: async () => {
-			throw new Error("Target page, context or browser has been closed\nCall log: ...");
-		},
+	const cases = [
+		[
+			"browserContext.addCookies: Protocol error (Storage.setCookies): Invalid cookie fields\nCall log: ...",
+			"could not write cookies to /p; nothing was imported (the browser refused a cookie, and so the whole batch)",
+		],
+		[
+			"Target page, context or browser has been closed",
+			"could not write cookies to /p; nothing was imported (the browser closed unexpectedly)",
+		],
+		["Something new and unrecognised", "could not write cookies to /p; nothing was imported"],
+	];
+	try {
+		for (const [thrown, expected] of cases) {
+			const { deps, context } = fakeDeps({
+				profileDir: "/p",
+				addCookies: async () => {
+					throw new Error(thrown);
+				},
+			});
+			await assert.rejects(() => runCookiesImport([file, "--profile", "/p"], deps), (err) => {
+				assert.equal(err.message, expected);
+				return true;
+			});
+			assert.equal(context.closed, true);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("launch and close failures get fixed messages too", async () => {
+	const dir = tempDir();
+	const file = writeSource(dir, "cookies.txt", netscape([[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", AWKWARD]]));
+	try {
+		const launchFail = fakeDeps({ profileDir: "/p" });
+		launchFail.deps.launchPersistentContext = async () => {
+			throw new Error(`launch failed: ${AWKWARD} ${encodeURIComponent(AWKWARD)}`, { cause: AWKWARD });
+		};
+		await assert.rejects(() => runCookiesImport([file, "--profile", "/p"], launchFail.deps), (err) => {
+			assert.match(err.message, /^could not start the browser with profile \/p; nothing was imported/);
+			assertNoValue(errorText(err));
+			return true;
+		});
+
+		const closeFail = fakeDeps({ profileDir: "/p" });
+		closeFail.context.close = async () => {
+			throw new Error(`close failed: ${JSON.stringify(AWKWARD)}`, { cause: AWKWARD });
+		};
+		await assert.rejects(() => runCookiesImport([file, "--profile", "/p"], closeFail.deps), (err) => {
+			assert.match(err.message, /^could not save cookies to \/p: .* the import may be incomplete$/);
+			assertNoValue(errorText(err));
+			return true;
+		});
+		for (const f of [launchFail, closeFail]) assertNoValue(Object.values(f.text()));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// --- cookies Chromium would refuse are skipped, not allowed to sink the batch ---
+
+test("a cookie the browser would refuse is skipped by name; the rest import", async () => {
+	const dir = tempDir();
+	const file = writeSource(
+		dir,
+		"cookies.txt",
+		netscape([
+			[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", SENTINEL],
+			["example.com", "FALSE", "/x", "TRUE", String(FUTURE), "__Host-pathy", `${SENTINEL}-h`],
+			[".example.com", "TRUE", "/", "FALSE", String(FUTURE), "__Secure-plain", `${SENTINEL}-s`],
+			[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "huge", `${SENTINEL}${"x".repeat(5000)}`],
+		]),
+	);
+	try {
+		const { deps, calls, text } = fakeDeps({ profileDir: "/p" });
+		assert.equal(await runCookiesImport([file, "--profile", "/p"], deps), 0);
+		assert.deepEqual(calls.added.map((c) => c.name), ["pref"]);
+		const { stdout, stderr } = text();
+		assert.match(stdout, /Imported 1 cookie into \/p:/);
+		assert.match(stdout, /Skipped 3 cookies the browser would refuse \(__Host-pathy, __Secure-plain, huge\)\./);
+		assert.ok(!stdout.includes(SENTINEL) && !stderr.includes(SENTINEL));
+
+		// Only refused cookies left: exit 1, no browser, and the message says why.
+		const only = writeSource(dir, "bad.txt", netscape([["example.com", "FALSE", "/x", "TRUE", String(FUTURE), "__Host-pathy", "v"]]));
+		const g = fakeDeps({ profileDir: "/p" });
+		assert.equal(await runCookiesImport([only, "--profile", "/p"], g.deps), 1);
+		assert.equal(g.calls.launch.length, 0);
+		assert.match(g.text().stderr, /: every cookie was one the browser would refuse;/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// The pre-check mirrors Chromium; this pins it to the real thing, so a browser
+// that changes its rules fails here rather than in a user's import.
+test("browserWouldReject agrees with Chromium's addCookies", browserOpts, async () => {
+	const { chromium } = await import("playwright-core");
+	const dir = tempDir();
+	const base = { domain: "example.com", path: "/", expires: FUTURE, httpOnly: false, secure: true };
+	const cases = {
+		plain: {},
+		dotDomain: { domain: ".example.com" },
+		awkward: { value: AWKWARD },
+		spaceInside: { value: "x y" },
+		nonAscii: { value: "xé" },
+		emptyName: { name: "" },
+		emptyValue: { value: "" },
+		semicolonValue: { value: "x;y" },
+		semicolonName: { name: "a;b" },
+		equalsName: { name: "a=b" },
+		tabValue: { value: "x\ty" },
+		newlineValue: { value: "x\ny" },
+		controlName: { name: "a\u0001" },
+		delValue: { value: "x\u007f" },
+		leadingSpaceName: { name: " a" },
+		trailingSpaceValue: { value: "v " },
+		bothEmpty: { name: "", value: "" },
+		size4096: { value: "x".repeat(4095) },
+		size4097: { value: "x".repeat(4096) },
+		path1024: { path: `/${"p".repeat(1023)}` },
+		path1025: { path: `/${"p".repeat(1024)}` },
+		pathNoSlash: { path: "x" },
+		pathSemicolon: { path: "/a;b" },
+		hostOk: { name: "__Host-a" },
+		hostDotDomain: { name: "__Host-a", domain: ".example.com" },
+		hostPath: { name: "__Host-a", path: "/x" },
+		hostInsecure: { name: "__Host-a", secure: false },
+		hostLowercase: { name: "__host-a", path: "/x" },
+		secureInsecure: { name: "__Secure-a", secure: false },
+		secureLowercase: { name: "__secure-a", secure: false },
+		prefixInValue: { name: "", value: "__Host-x", secure: false },
+		emptyDomain: { domain: "" },
+	};
+	const context = await chromium.launchPersistentContext(join(dir, "p"), {
+		executablePath: resolveExecutablePath(),
+		headless: true,
 	});
 	try {
-		await assert.rejects(
-			() => runCookiesImport([file, "--profile", "/p"], deps),
-			/^Error: could not write cookies to the profile \(Target page, context or browser has been closed\)$/,
-		);
-		assert.equal(context.closed, true);
+		for (const [label, over] of Object.entries(cases)) {
+			const cookie = { ...base, name: "a", value: "v", ...over };
+			let refused = false;
+			try {
+				await context.addCookies([cookie]);
+			} catch {
+				refused = true;
+			}
+			assert.equal(browserWouldReject(cookie), refused, `${label}: Chromium ${refused ? "refused" : "accepted"} it`);
+		}
 	} finally {
+		await context.close();
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

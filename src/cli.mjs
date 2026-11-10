@@ -12,6 +12,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	AUTH_COOKIES,
+	browserWouldReject,
+	CookieParseError,
 	filterCookies,
 	parseCookies,
 	sourceUserAgent,
@@ -128,8 +130,10 @@ Cookie import (trawl cookies import <file>):
                             Session cookies are kept for 7 days. Expired
                             cookies are dropped, and so are sign-in
                             cookies (best-effort list, e.g. ${AUTH_COOKIES.names.slice(0, 3).join(", ")}:
-                            AUTH_COOKIES in src/cookies.mjs). If none are
-                            left, nothing is written and the exit code is 1.
+                            AUTH_COOKIES in src/cookies.mjs). Cookies the
+                            browser would refuse are skipped by name. If none
+                            are left, nothing is written and the exit code
+                            is 1.
                             Delete the source file afterwards.
       --domain <host>      Only cookies that would be sent to this host
       --allow <names>      Only these cookie names (comma-separated)
@@ -526,13 +530,47 @@ function plural(n, word) {
 	return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-// Fixed text, plus the browser's own message only when it provably contains
-// no cookie value (Playwright errors can echo the rejected cookie).
-function cookieWriteError(err, cookies) {
-	const detail = String(err?.message ?? "").split("\n")[0];
-	const leaks = cookies.some((c) => c.value !== "" && detail.includes(c.value));
+// Browser errors never reach the user during an import: Playwright's messages
+// can quote the cookie they reject, raw or encoded, and no substring test can
+// prove an arbitrary message value-free. Each line below is an exact
+// `addCookies` first line known to quote nothing, matched by equality and
+// replaced by our own text; anything else gets the fixed message alone.
+const KNOWN_WRITE_ERRORS = new Map([
+	[
+		"browserContext.addCookies: Protocol error (Storage.setCookies): Invalid cookie fields",
+		"the browser refused a cookie, and so the whole batch",
+	],
+	[
+		"browserContext.addCookies: Target page, context or browser has been closed",
+		"the browser closed unexpectedly",
+	],
+	["Target page, context or browser has been closed", "the browser closed unexpectedly"],
+]);
+
+function cookieWriteError(err, profileDir) {
+	const line = String(err?.message ?? "").split("\n")[0];
+	const known = KNOWN_WRITE_ERRORS.get(line);
 	return new Error(
-		`could not write cookies to the profile${detail && !leaks ? ` (${detail})` : ""}`,
+		`could not write cookies to ${profileDir}; nothing was imported${known ? ` (${known})` : ""}`,
+	);
+}
+
+// Why an import has nothing left, naming the filter that actually removed the
+// cookies (and the flag that would keep sign-in ones).
+function whyNoneLeft(parsedCount, result, refusedCount, { domain, allow }) {
+	if (parsedCount === 0) return "the file holds no cookies";
+	const flags = [domain && "--domain", allow && "--allow"].filter(Boolean).join(" and ");
+	if (result.matched === 0) return `no cookie matched ${flags}`;
+	const causes = [];
+	if (result.expiredDropped > 0) causes.push("expired");
+	if (result.authDropped.length > 0) causes.push("a sign-in cookie");
+	if (refusedCount > 0) causes.push("one the browser would refuse");
+	const scope = flags ? `cookie that matched ${flags}` : "cookie";
+	const list =
+		causes.length > 1 ? `${causes.slice(0, -1).join(", ")} or ${causes.at(-1)}` : causes[0];
+	return (
+		`every ${scope} was ${list}` +
+		(result.authDropped.length > 0 ? " (pass --include-auth to import sign-in cookies)" : "")
 	);
 }
 
@@ -597,8 +635,15 @@ export async function runCookiesImport(argv, deps = {}) {
 	} catch (err) {
 		throw new Error(`cannot read cookie source ${file}${err?.code ? ` (${err.code})` : ""}`);
 	}
-	// CookieParseError messages are fixed strings that never quote the input.
-	const parsed = parseCookies(text);
+	// CookieParseError messages are fixed strings that never quote the input;
+	// anything else a parser throws might, so it is replaced, not passed on.
+	let parsed;
+	try {
+		parsed = parseCookies(text);
+	} catch (err) {
+		if (err instanceof CookieParseError) throw err;
+		throw new Error(`could not parse cookie source ${file}`);
+	}
 	const now = deps.now ?? Date.now();
 	const result = filterCookies(parsed, {
 		domain,
@@ -606,7 +651,11 @@ export async function runCookiesImport(argv, deps = {}) {
 		includeAuth: args["--include-auth"] === true,
 		now,
 	});
-	const summary = summarize(result);
+	// One cookie Chromium refuses fails the whole batch, so set those aside
+	// before the profile is touched and report them by name.
+	const accepted = result.cookies.filter((c) => !browserWouldReject(c));
+	const refused = result.cookies.filter((c) => browserWouldReject(c));
+	const summary = summarize({ ...result, cookies: accepted });
 
 	const dropped = [];
 	if (summary.authDropped.count > 0) {
@@ -619,11 +668,17 @@ export async function runCookiesImport(argv, deps = {}) {
 	if (summary.expiredDropped > 0) {
 		dropped.push(`Dropped ${plural(summary.expiredDropped, "expired cookie")}.\n`);
 	}
+	if (refused.length > 0) {
+		dropped.push(
+			`Skipped ${plural(refused.length, "cookie")} the browser would refuse ` +
+				`(${refused.map((c) => (c.name === "" ? "(unnamed)" : printable(c.name))).join(", ")}).\n`,
+		);
+	}
 
 	if (summary.kept.length === 0) {
 		stderr(
-			`${dropped.join("")}trawl: no cookies left to import from ${file}` +
-				`${domain || allow ? " after --domain/--allow filtering" : ""}; ` +
+			`${dropped.join("")}trawl: no cookies left to import from ${file}: ` +
+				`${whyNoneLeft(parsed.length, result, refused.length, { domain, allow })}; ` +
 				`${profileDir} was not touched.\n`,
 		);
 		return 1;
@@ -650,23 +705,35 @@ export async function runCookiesImport(argv, deps = {}) {
 	// HAR request header or a cURL line yields is a session cookie, so give
 	// those a short, bounded lifetime instead.
 	const sessionUntil = Math.floor(now / 1000) + SESSION_COOKIE_TTL_S;
-	const payload = result.cookies.map((c) =>
+	const payload = accepted.map((c) =>
 		c.expires === -1 ? { ...c, expires: sessionUntil } : c,
 	);
-	const sessionCount = result.cookies.filter((c) => c.expires === -1).length;
+	const sessionCount = accepted.filter((c) => c.expires === -1).length;
 
+	// As with addCookies below, the browser's own message is never shown.
 	const launch = deps.launchPersistentContext ?? defaultLaunchPersistentContext;
-	const context = await launch(profileDir, { executablePath, headless: true });
+	let context;
+	try {
+		context = await launch(profileDir, { executablePath, headless: true });
+	} catch {
+		throw new Error(
+			`could not start the browser with profile ${profileDir}; nothing was imported ` +
+				"(browser errors are not shown during a cookie import; is the profile open elsewhere?)",
+		);
+	}
 	try {
 		await context.addCookies(payload);
 	} catch (err) {
 		await context.close().catch(() => {});
-		throw cookieWriteError(err, payload);
+		throw cookieWriteError(err, profileDir);
 	}
 	try {
 		await context.close();
-	} catch (err) {
-		throw cookieWriteError(err, payload);
+	} catch {
+		throw new Error(
+			`could not save cookies to ${profileDir}: the browser failed while closing, ` +
+				"so the import may be incomplete",
+		);
 	}
 
 	stdout(

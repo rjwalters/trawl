@@ -417,3 +417,44 @@ test("the marker holds only the path and a timestamp, mode 0600", (t) => {
 	assert.deepEqual(Object.keys(JSON.parse(readFileSync(marker, "utf8"))).sort(), ["executablePath", "recordedAt"]);
 	if (process.platform !== "win32") assert.equal(statSync(marker).mode & 0o777, 0o600);
 });
+
+test("the headless-shell rejection names $TRAWL_EXECUTABLE_PATH only when it is the source", () => {
+	const shell = "/x/chrome-headless-shell-mac-arm64/chrome-headless-shell";
+	const exists = () => true;
+	assert.throws(
+		() => resolveHeadedExecutablePath(shell, { exists, fromEnv: true }),
+		/--executable-path, or unset or change \$TRAWL_EXECUTABLE_PATH, which points at it\./,
+	);
+	assert.throws(
+		() => resolveHeadedExecutablePath(shell, { exists }),
+		(err) => /--executable-path\.$/.test(err.message) && !/TRAWL_EXECUTABLE_PATH/.test(err.message),
+	);
+});
+
+test("a marker not privately owned falls back silently to main's resolution", (t) => {
+	if (process.platform === "win32") return t.skip("no POSIX ownership on Windows");
+	withoutEnvPath(t);
+	const profile = tempHome(t);
+	chmodSync(profile, 0o700);
+	const exe = fakeBrowser(profile);
+	recordProfileBrowser(profile, exe);
+	const marker = path.join(profile, PROFILE_BROWSER_FILE);
+	const expected = mainResolution();
+	assert.equal(profileBrowser(profile), exe, "private marker in a private dir is used");
+
+	chmodSync(marker, 0o620);
+	assert.equal(profileBrowser(profile), null, "group-writable marker");
+	assert.equal(resolutionFor(profile), expected);
+	chmodSync(marker, 0o602);
+	assert.equal(profileBrowser(profile), null, "world-writable marker");
+	chmodSync(marker, 0o600);
+
+	chmodSync(profile, 0o770);
+	assert.equal(profileBrowser(profile), null, "0600 marker in a group-writable profile dir");
+	assert.equal(resolutionFor(profile), expected);
+	chmodSync(profile, 0o700);
+
+	const uid = process.getuid();
+	assert.equal(profileBrowser(profile, undefined, { uid: uid + 1 }), null, "owned by another user");
+	assert.equal(profileBrowser(profile, undefined, { uid: uid + 1, plat: "win32" }), exe, "no ownership check on win32");
+});

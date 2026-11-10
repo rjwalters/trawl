@@ -5,6 +5,7 @@ import {
 	CookieParseError,
 	filterCookies,
 	isAuthCookie,
+	MAX_EXPIRES,
 	parseCookies,
 	summarize,
 } from "../src/cookies.mjs";
@@ -313,5 +314,159 @@ test("redaction: sentinel never appears in summaries or errors", () => {
 		const dump = [err.message, err.stack, JSON.stringify(err), err.cause, ...Object.values(err)].join("|");
 		assert.ok(!dump.includes(SENTINEL), src);
 		assert.equal(err.cause, undefined);
+	}
+});
+
+// --- Regression tests for the Judge review of PR #81 ---------------------
+
+test("auth: __Host-/__Secure- prefixes and case do not defeat the deny list", () => {
+	for (const n of [
+		"__Host-session", "__Host-sessionid", "__Secure-sessionid",
+		"__Host-JSESSIONID", "__Secure-next-auth.session-token",
+		"next-auth.session-token", "jsessionid", "phpsessid",
+		"__SECURE-1PAPISID", "__secure-1PSID", "__host-GAPS", "sid", "Sapisid",
+	]) {
+		assert.ok(isAuthCookie(n), n);
+	}
+	for (const n of ["NID", "AEC", "__Secure-ENID", "__SECURE-ENID", "SIDEBAR", "nid", "sidebar", "theme"]) {
+		assert.ok(!isAuthCookie(n), n);
+	}
+	const cs = parseCookies(
+		har(harEntry("https://a.test/", "__Host-session=1; jsessionid=2; __SECURE-1PAPISID=3; SIDEBAR=4; __Secure-ENID=5")),
+	);
+	const r = filterCookies(cs, { now: NOW });
+	assert.deepEqual(names(r.cookies), ["SIDEBAR", "__Secure-ENID"]);
+	assert.deepEqual(names(r.authDropped), ["__Host-session", "jsessionid", "__SECURE-1PAPISID"]);
+});
+
+test("expiry: epoch, pre-1970 and HAR epoch dates are expired, never session or negative", () => {
+	const cs = parseCookies(
+		har(
+			harEntry("https://a.test/", null, [
+				"pref=deleted; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+				"old=1; Expires=Mon, 01 Jan 1960 00:00:00 GMT",
+				"plain=1",
+			]),
+		),
+	);
+	const byName = Object.fromEntries(cs.map((c) => [c.name, c.expires]));
+	assert.ok(byName.pref > 0, "epoch delete is a positive past stamp");
+	assert.ok(byName.old > 0, "pre-1970 is never negative");
+	assert.equal(byName.plain, -1);
+	const r = filterCookies(cs, { now: NOW });
+	assert.equal(r.expiredDropped, 2);
+	assert.deepEqual(names(r.cookies), ["plain"]);
+
+	const harJson = JSON.stringify({
+		log: {
+			entries: [
+				{
+					startedDateTime: "2026-06-01T00:00:00Z",
+					request: { url: "https://a.test/", headers: [] },
+					response: {
+						headers: [],
+						cookies: [
+							{ name: "z", value: "v", expires: "1970-01-01T00:00:00.000Z" },
+							{ name: "n", value: "v", expires: "1950-01-01T00:00:00.000Z" },
+						],
+					},
+				},
+			],
+		},
+	});
+	const h = filterCookies(parseCookies(harJson), { now: NOW });
+	assert.equal(h.expiredDropped, 2);
+	assert.equal(h.cookies.length, 0);
+});
+
+test("expiry: values above Playwright's maximum are clamped; Netscape 0 is session", () => {
+	assert.equal(MAX_EXPIRES, 253402300799);
+	const ns = parseCookies(
+		[
+			"# Netscape HTTP Cookie File",
+			"a.test\tFALSE\t/\tFALSE\t999999999999\tbig\tv",
+			"a.test\tFALSE\t/\tFALSE\t0\tsess\tv",
+		].join("\n"),
+	);
+	assert.equal(ns[0].expires, MAX_EXPIRES);
+	assert.equal(ns[1].expires, -1);
+	const [age] = parseCookies(
+		har(harEntry("https://a.test/", null, [`m=1; Max-Age=${"9".repeat(400)}`])),
+	);
+	assert.equal(age.expires, MAX_EXPIRES);
+	// Nothing emitted can be rejected by addCookies' expires assertion.
+	for (const c of [...ns, age]) {
+		assert.ok(!(c.expires < 0 && c.expires !== -1) && c.expires <= MAX_EXPIRES, c.name);
+	}
+});
+
+test("expiry: an expiry exactly at now counts as expired", () => {
+	const c = { name: "n", value: "v", domain: "a.test", path: "/", expires: NOW / 1000, httpOnly: false, secure: false };
+	assert.equal(filterCookies([c], { now: NOW }).expiredDropped, 1);
+});
+
+test("expiry: empty or non-numeric Max-Age is ignored, not expired", () => {
+	const cs = parseCookies(
+		har(
+			harEntry("https://a.test/", null, [
+				"e=1; Max-Age=",
+				"f=1; Max-Age=abc; Expires=Wed, 01 Jan 2030 00:00:00 GMT",
+				"g=1; Max-Age=0",
+			]),
+		),
+	);
+	const byName = Object.fromEntries(cs.map((c) => [c.name, c.expires]));
+	assert.equal(byName.e, -1);
+	assert.equal(byName.f, FUTURE_SEC);
+	const r = filterCookies(cs, { now: NOW });
+	assert.deepEqual(names(r.cookies), ["e", "f"]);
+	assert.equal(r.expiredDropped, 1);
+});
+
+test("cURL: value-taking options are never taken as the URL", () => {
+	const domains = (cmd) => parseCookies(cmd).map((c) => c.domain);
+	assert.deepEqual(domains("curl -c jar.txt https://a.test/ -b 'x=1'"), ["a.test"]);
+	assert.deepEqual(domains("curl --cookie-jar jar.txt https://a.test/ -b x=1"), ["a.test"]);
+	for (const opt of ["-D", "-T", "-E", "--key", "--cacert", "--resolve", "-r", "-C", "-U", "-y", "-Y", "-z", "--retry", "--limit-rate"]) {
+		assert.deepEqual(domains(`curl ${opt} some.value https://a.test/ -b x=1`), ["a.test"], opt);
+	}
+	// Bundled short flags ending in a value-taking one, and an attached value.
+	assert.deepEqual(domains("curl -sSc jar.txt https://a.test/ -b x=1"), ["a.test"]);
+	assert.deepEqual(domains("curl -cjar.txt https://a.test/ -b x=1"), ["a.test"]);
+	assert.deepEqual(domains("curl -sb x=1 https://a.test/"), ["a.test"]);
+	// A non-http(s) positional is not a URL; --url may omit the scheme.
+	assert.deepEqual(domains("curl unknown.opt.value https://a.test/ -b x=1"), ["a.test"]);
+	assert.deepEqual(domains("curl --url a.test -b x=1"), ["a.test"]);
+	assert.throws(() => parseCookies("curl -c jar.txt -b x=1"), CookieParseError);
+	assert.throws(() => parseCookies("curl ftp://a.test/ -b x=1"), CookieParseError);
+});
+
+test("authDropped carries names and domains only, never values", () => {
+	const cs = parseCookies(har(harEntry("https://a.test/", `SID=${SENTINEL}`)));
+	const r = filterCookies(cs, { now: NOW });
+	assert.deepEqual(r.authDropped, [{ name: "SID", domain: "a.test" }]);
+	assert.ok(!JSON.stringify(r.authDropped).includes(SENTINEL));
+});
+
+test("filters: example.com does not match a bare public-suffix cookie", () => {
+	const mk = (domain) => ({ name: "n", value: "v", domain, path: "/", expires: -1, httpOnly: false, secure: false });
+	const cs = [mk("com"), mk(".com"), mk("example.com"), mk("localhost")];
+	const got = (domain) => filterCookies(cs, { domain, now: NOW }).cookies.map((c) => c.domain);
+	assert.deepEqual(got("example.com"), ["example.com"]);
+	assert.deepEqual(got("localhost"), ["localhost"]);
+});
+
+test("HAR: Set-Cookie vs request cookie merge is independent of entry order", () => {
+	const setEntry = harEntry("https://www.example.com/", null, ["t=new; Domain=example.com; Secure"]);
+	const reqEntry = harEntry("https://www.example.com/", "t=old");
+	for (const entries of [
+		[setEntry, reqEntry],
+		[reqEntry, setEntry],
+	]) {
+		const cs = parseCookies(har(...entries));
+		assert.deepEqual(
+			cs.map((c) => [c.name, c.domain, c.value]),
+			[["t", ".example.com", "new"]],
+		);
 	}
 });

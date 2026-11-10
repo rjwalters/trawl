@@ -9,10 +9,16 @@
  * credentials. They are dropped by default (see `filterCookies`), like
  * `FORMATS` in render.mjs: derive from this, never re-list it elsewhere.
  *
- * `names` are exact, case-sensitive matches. `patterns` are tested against the
- * cookie name. Conservative on purpose: Google's `NID`, `AEC` and
- * `__Secure-ENID` are preferences/anti-abuse cookies and must survive.
- * Non-Google entries are a documented best-effort set, not a guarantee.
+ * Matching (see `isAuthCookie`) is case-insensitive and prefix-insensitive:
+ * one leading `__Secure-` / `__Host-` is stripped (browsers match those
+ * prefixes case-insensitively), and both the original and the stripped name
+ * are tested against every `names` entry (exact, case-insensitive, compared
+ * prefix-stripped too) and every `patterns` entry (always applied
+ * case-insensitively, whatever flags the literal carries). So `JSESSIONID`
+ * also covers `jsessionid` and `__Host-JSESSIONID`. Conservative on purpose:
+ * Google's `NID`, `AEC` and `__Secure-ENID` are preferences/anti-abuse
+ * cookies and must survive. Non-Google entries are a documented best-effort
+ * set, not a guarantee.
  */
 export const AUTH_COOKIES = {
 	names: [
@@ -52,6 +58,9 @@ export const AUTH_COOKIES = {
 		"sess-at-main",
 		"x-main",
 		"session-token",
+		// NextAuth / Auth.js
+		"next-auth.session-token",
+		"authjs.session-token",
 		// Microsoft
 		"MSPAuth",
 		"MSPProf",
@@ -71,11 +80,30 @@ export const AUTH_COOKIES = {
 	],
 };
 
+const COOKIE_PREFIX = /^__(secure|host)-/i;
+
+// Lower-cased name with one leading `__Secure-` / `__Host-` removed.
+function bareName(name) {
+	return String(name).toLowerCase().replace(COOKIE_PREFIX, "");
+}
+
 export function isAuthCookie(name) {
-	return (
-		AUTH_COOKIES.names.includes(name) ||
-		AUTH_COOKIES.patterns.some((p) => p.test(name))
-	);
+	const raw = String(name);
+	const candidates = [raw, raw.replace(COOKIE_PREFIX, "")];
+	const lowered = new Set(candidates.map((n) => n.toLowerCase()));
+	// Read the constant on every call (no cached copy), so it stays the single
+	// source of truth even if it is mutated at runtime.
+	for (const entry of AUTH_COOKIES.names) {
+		const e = String(entry).toLowerCase();
+		if (lowered.has(e) || lowered.has(bareName(entry))) return true;
+	}
+	return AUTH_COOKIES.patterns.some((p) => {
+		const re = p.flags.includes("i") ? p : new RegExp(p.source, `${p.flags}i`);
+		return candidates.some((n) => {
+			re.lastIndex = 0;
+			return re.test(n);
+		});
+	});
 }
 
 // Fixed message per failure kind. Never interpolate input into these.
@@ -94,6 +122,22 @@ export class CookieParseError extends Error {
 		this.name = "CookieParseError";
 		this.kind = kind;
 	}
+}
+
+// Playwright's `addCookies` rejects `expires` above this (9999-12-31T23:59:59Z)
+// and any negative value other than -1 (session).
+export const MAX_EXPIRES = 253402300799;
+// A past, positive stamp: "already expired", distinct from -1 (session), and
+// accepted by `addCookies` should it ever get that far.
+const EXPIRED = 1;
+
+// Coerce an expiry into something `addCookies` accepts: -1 for a session
+// cookie, otherwise a positive stamp no larger than MAX_EXPIRES.
+function normaliseExpires(expires) {
+	if (expires === -1) return -1;
+	if (Number.isNaN(expires) || typeof expires !== "number") return -1;
+	if (expires <= 0) return EXPIRED;
+	return Math.min(expires, MAX_EXPIRES);
 }
 
 const SAMESITE = { strict: "Strict", lax: "Lax", none: "None" };
@@ -122,7 +166,7 @@ function makeCookie({
 		value,
 		domain: String(domain).trim().toLowerCase(),
 		path: path || "/",
-		expires: Number.isFinite(expires) ? expires : -1,
+		expires: normaliseExpires(expires),
 		httpOnly: Boolean(httpOnly),
 		secure: Boolean(secure),
 	};
@@ -138,9 +182,13 @@ function cookieKey(c) {
 	return `${c.name}\u0000${normaliseDomain(c.domain)}`;
 }
 
+// A real date at or before the epoch (`Expires=Thu, 01 Jan 1970 ...` is the
+// standard way to delete a cookie) is an expired cookie, never a session one;
+// only an unparseable date means session.
 function parseExpiry(text) {
 	const ms = Date.parse(text);
-	return Number.isNaN(ms) ? -1 : ms / 1000;
+	if (Number.isNaN(ms)) return -1;
+	return ms <= 0 ? EXPIRED : ms / 1000;
 }
 
 function parseCookieHeader(header, host, secure) {
@@ -185,13 +233,13 @@ function parseSetCookie(line, host, startedMs) {
 	let expires = -1;
 	if (typeof attrs.expires === "string") expires = parseExpiry(attrs.expires);
 	// Max-Age (relative to when the response was received) wins over Expires.
-	if (typeof attrs["max-age"] === "string") {
+	// A non-numeric (including empty) Max-Age is ignored, per RFC 6265 5.2.2.
+	if (typeof attrs["max-age"] === "string" && /^-?\d+$/.test(attrs["max-age"])) {
 		const age = Number(attrs["max-age"]);
-		if (Number.isFinite(age)) {
-			// A non-positive age means "delete now": keep a past, positive stamp so
-			// it is counted as expired rather than as a session cookie.
-			expires = age <= 0 ? 1 : (startedMs + age * 1000) / 1000;
-		}
+		// A non-positive age means "delete now": keep a past, positive stamp so
+		// it is counted as expired rather than as a session cookie. A huge age
+		// (even Infinity) is clamped by makeCookie.
+		expires = age <= 0 ? EXPIRED : startedMs / 1000 + age;
 	}
 	return makeCookie({
 		name,
@@ -219,6 +267,15 @@ function parseHar(har) {
 	const merged = new Map();
 	const setCookieKeys = new Set();
 	const requestKeys = new Set();
+	// A Set-Cookie supersedes an attribute-less request cookie with the same
+	// name whose host is within the Set-Cookie's domain. Checked in both
+	// directions so the result does not depend on HAR entry order.
+	const supersedes = (set, req) => {
+		if (set.name !== req.name) return false;
+		const sd = normaliseDomain(set.domain);
+		const rd = normaliseDomain(req.domain);
+		return rd === sd || rd.endsWith(`.${sd}`);
+	};
 	for (const entry of har.log.entries) {
 		let url;
 		try {
@@ -253,10 +310,17 @@ function parseHar(har) {
 		}
 		for (const c of requestCookies) {
 			const key = cookieKey(c);
-			if (!setCookieKeys.has(key)) {
-				merged.set(key, c);
-				requestKeys.add(key);
+			if (setCookieKeys.has(key)) continue;
+			let covered = false;
+			for (const sk of setCookieKeys) {
+				if (supersedes(merged.get(sk), c)) {
+					covered = true;
+					break;
+				}
 			}
+			if (covered) continue;
+			merged.set(key, c);
+			requestKeys.add(key);
 		}
 
 		const setLines = headerValues(entry.response?.headers, "set-cookie").flatMap(
@@ -286,14 +350,9 @@ function parseHar(har) {
 			const key = cookieKey(c);
 			setCookieKeys.add(key);
 			merged.set(key, c);
-			// A Set-Cookie also supersedes the attribute-less request cookie it
-			// replaces (same name, host within the Set-Cookie's domain).
-			const cd = normaliseDomain(c.domain);
+			requestKeys.delete(key);
 			for (const rk of requestKeys) {
-				const r = merged.get(rk);
-				if (!r || r.name !== c.name || rk === key) continue;
-				const rd = normaliseDomain(r.domain);
-				if (rd === cd || rd.endsWith(`.${cd}`)) {
+				if (supersedes(c, merged.get(rk))) {
 					merged.delete(rk);
 					requestKeys.delete(rk);
 				}
@@ -421,13 +480,60 @@ function shellWords(text) {
 	return words;
 }
 
-// curl options whose next word is a value we must not mistake for the URL.
+// curl options whose next word is a value we must not mistake for the URL
+// (`-H`, `-b` and `--url` are handled separately). Positional URLs must also
+// parse as http(s), so an option missing from here cannot silently become the
+// cookie domain; it can only cost us the URL.
 const CURL_VALUE_OPTS = new Set([
-	"-X", "--request", "-d", "--data", "--data-raw", "--data-binary",
-	"--data-urlencode", "-A", "--user-agent", "-e", "--referer", "-o",
-	"--output", "-u", "--user", "-x", "--proxy", "-F", "--form", "-m",
-	"--max-time", "--connect-timeout", "-w", "--write-out", "-K", "--config",
+	// short options
+	"-A", "-C", "-D", "-E", "-F", "-K", "-P", "-Q", "-T", "-U", "-X", "-Y",
+	"-c", "-d", "-e", "-m", "-o", "-r", "-t", "-u", "-w", "-x", "-y", "-z",
+	// long options
+	"--abstract-unix-socket", "--alt-svc", "--aws-sigv4", "--cacert",
+	"--capath", "--cert", "--cert-type", "--ciphers", "--config",
+	"--connect-timeout", "--connect-to", "--continue-at", "--cookie-jar",
+	"--crlfile", "--curves", "--data", "--data-ascii", "--data-binary",
+	"--data-raw", "--data-urlencode", "--dns-interface", "--dns-ipv4-addr",
+	"--dns-ipv6-addr", "--dns-servers", "--doh-url", "--dump-header",
+	"--egd-file", "--engine", "--etag-compare", "--etag-save",
+	"--expect100-timeout", "--form", "--form-string", "--ftp-account",
+	"--ftp-alternative-to-user", "--ftp-method", "--ftp-port", "--ftp-ssl-ccc-mode",
+	"--happy-eyeballs-timeout-ms", "--haproxy-clientip", "--hostpubmd5",
+	"--hostpubsha256", "--hsts", "--interface", "--ip-tos", "--json",
+	"--keepalive-time", "--key", "--key-type", "--krb", "--libcurl",
+	"--limit-rate", "--local-port", "--login-options", "--mail-auth",
+	"--mail-from", "--mail-rcpt", "--max-filesize", "--max-redirs",
+	"--max-time", "--netrc-file", "--noproxy", "--oauth2-bearer", "--output",
+	"--output-dir", "--pass", "--pinnedpubkey", "--preproxy", "--proto",
+	"--proto-default", "--proto-redir", "--proxy", "--proxy-cacert",
+	"--proxy-capath", "--proxy-cert", "--proxy-cert-type", "--proxy-ciphers",
+	"--proxy-crlfile", "--proxy-header", "--proxy-key", "--proxy-key-type",
+	"--proxy-pass", "--proxy-pinnedpubkey", "--proxy-service-name",
+	"--proxy-tls13-ciphers", "--proxy-tlsauthtype", "--proxy-tlspassword",
+	"--proxy-tlsuser", "--proxy-user", "--proxy1.0", "--pubkey", "--quote",
+	"--random-file", "--range", "--rate", "--referer", "--request",
+	"--request-target", "--resolve", "--retry", "--retry-delay",
+	"--retry-max-time", "--sasl-authzid", "--service-name", "--socks4",
+	"--socks4a", "--socks5", "--socks5-gssapi-service", "--socks5-hostname",
+	"--speed-limit", "--speed-time", "--stderr", "--telnet-option",
+	"--tftp-blksize", "--time-cond", "--tls-max", "--tls13-ciphers",
+	"--tlsauthtype", "--tlspassword", "--tlsuser", "--trace", "--trace-ascii",
+	"--trace-config", "--unix-socket", "--upload-file", "--url-query",
+	"--user", "--user-agent", "--variable", "--write-out",
 ]);
+
+// Positional URL candidates must be http(s); `--url` may omit the scheme, as
+// curl itself allows.
+function curlUrl(word, fromUrlOpt) {
+	const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(word);
+	if (!hasScheme && !fromUrlOpt) return null;
+	try {
+		const u = new URL(hasScheme ? word : `http://${word}`);
+		return u.protocol === "http:" || u.protocol === "https:" ? u : null;
+	} catch {
+		return null;
+	}
+}
 
 function parseCurl(text) {
 	const words = shellWords(text);
@@ -437,9 +543,20 @@ function parseCurl(text) {
 		const w = words[i];
 		let value = null;
 		let opt = w;
-		if (/^-[Hb]./.test(w)) {
-			opt = w.slice(0, 2);
-			value = w.slice(2);
+		if (/^-[^-]/.test(w)) {
+			// Short options, possibly bundled (`-sSL`, `-sSc jar`, `-bz=9`): the
+			// first value-taking letter consumes the rest of the word as its value,
+			// or the next word when nothing follows it, exactly as curl does.
+			opt = null;
+			for (let k = 1; k < w.length; k++) {
+				const o = `-${w[k]}`;
+				if (o === "-H" || o === "-b" || CURL_VALUE_OPTS.has(o)) {
+					opt = o;
+					value = w.slice(k + 1) || null;
+					break;
+				}
+			}
+			if (opt === null) continue; // only boolean flags
 		}
 		if (opt === "-H" || opt === "--header") {
 			const header = value ?? words[++i] ?? "";
@@ -450,20 +567,16 @@ function parseCurl(text) {
 			// A value without "=" is a cookie-jar filename; we never read files.
 			if (c.includes("=")) cookieStrings.push(c);
 		} else if (opt === "--url") {
-			url = words[++i] ?? url;
+			const u = curlUrl(words[++i] ?? "", true);
+			if (u && !url) url = u;
 		} else if (CURL_VALUE_OPTS.has(opt)) {
-			i++;
-		} else if (!w.startsWith("-") && url === null) {
-			url = w;
+			if (value === null) i++;
+		} else if (!w.startsWith("-") && !url) {
+			url = curlUrl(w, false);
 		}
 	}
-	let parsed;
-	try {
-		if (!url) throw new Error("no url");
-		parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `http://${url}`);
-	} catch {
-		throw new CookieParseError("invalid_curl");
-	}
+	if (!url) throw new CookieParseError("invalid_curl");
+	const parsed = url;
 	const host = parsed.hostname.toLowerCase();
 	const secure = parsed.protocol === "https:";
 	return cookieStrings.flatMap((s) => parseCookieHeader(s, host, secure));
@@ -502,17 +615,24 @@ export function parseCookies(text) {
 	throw new CookieParseError("unrecognised");
 }
 
+// A cookie for a single-label domain (`com`, `test`) is only kept when the
+// filter names exactly that host: browsers never store a cookie on a bare
+// public suffix, so `example.com` must not match a `com` cookie. (Multi-label
+// suffixes such as `co.uk` would need the Public Suffix List; not bundled.)
 function domainMatches(cookieDomain, hostFilter) {
 	const cd = normaliseDomain(cookieDomain);
 	const host = normaliseDomain(hostFilter);
-	return host === cd || host.endsWith(`.${cd}`) || cd.endsWith(`.${host}`);
+	if (host === cd) return true;
+	if (cd.includes(".") && host.endsWith(`.${cd}`)) return true;
+	return cd.endsWith(`.${host}`);
 }
 
 /**
  * Filter a cookie list. Order: domain, allow, expired, auth.
  * Options: `domain` (host), `allow` (exact names), `includeAuth`, `now` (ms,
- * injectable for tests). Returns `{ cookies, authDropped, expiredDropped }`;
- * pass it to `summarize` for anything meant for display.
+ * injectable for tests). Returns `{ cookies, authDropped, expiredDropped }`.
+ * `authDropped` holds `{ name, domain }` only, never values. Pass the result
+ * to `summarize` for anything meant for display.
  */
 export function filterCookies(cookies, opts = {}) {
 	const { domain, allow, includeAuth = false, now = Date.now() } = opts;
@@ -525,7 +645,10 @@ export function filterCookies(cookies, opts = {}) {
 	const nowSec = now / 1000;
 	let expiredDropped = 0;
 	list = list.filter((c) => {
-		const expired = c.expires > 0 && c.expires < nowSec;
+		// Anything that is not a session cookie (-1) and is at or before now is
+		// expired, including 0 and stray negatives from hand-built input.
+		const e = c.expires;
+		const expired = typeof e === "number" && e !== -1 && !(e > nowSec);
 		if (expired) expiredDropped++;
 		return !expired;
 	});
@@ -533,7 +656,7 @@ export function filterCookies(cookies, opts = {}) {
 	if (!includeAuth) {
 		list = list.filter((c) => {
 			if (!isAuthCookie(c.name)) return true;
-			authDropped.push(c);
+			authDropped.push({ name: c.name, domain: c.domain });
 			return false;
 		});
 	}

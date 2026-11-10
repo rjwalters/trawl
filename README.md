@@ -402,7 +402,21 @@ browser would send to `<origin>/robots.txt`: a host-only cookie only for its
 exact host, a `.example.com` cookie for that domain and its subdomains, a
 path of `/` or `/robots.txt`, a `Secure` cookie only over `https`, nothing
 expired. If none match, the request has no `Cookie` header at all. A redirect
-to another origin does not carry the header along.
+to another origin does not carry the header along; a redirect within the
+same origin does, so a cookie scoped to `/robots.txt` can reach another path
+on that host if `robots.txt` redirects there.
+
+A cookie whose name or value holds a control character (CR, LF, NUL, tab,
+...) cannot go in a request header, so it is left out of the `robots.txt`
+request, which goes ahead with the other matching cookies, or with no
+`Cookie` header if none are left. (The browser refuses such a cookie too,
+so `--cookies` skips it by name before this point.) Non-ASCII values are
+sent as the bytes the browser sends on the page request, UTF-8 (`café` is
+`63 61 66 c3 a9` on both requests, checked against Chromium 156). If the
+`robots.txt` request fails after sending cookies, the error names only a
+known error code (`ECONNREFUSED`, `UND_ERR_SOCKET`, `ENOTFOUND`, ...) or says
+`request failed`; it never repeats the underlying error's text, which can
+quote the header.
 
 `--cookies` is a CLI flag only: the MCP server's tools take no cookies.
 
@@ -535,7 +549,13 @@ default rather than asking you to promise you will.
   profile's cookies go with it by the browser's own rules, and a
   `Set-Cookie` on the `robots.txt` response is kept in the profile as any
   response's would be. On that path the browser starts before the
-  `robots.txt` check. A plain fetch sends no cookies, so a site that serves
+  `robots.txt` check, so a run that `robots.txt` refuses still leaves behind
+  the profile directory (created if it did not exist) and, with `--har`, a
+  HAR file with no entries. A failure there is reported as a known error
+  code (`ECONNREFUSED`, `ENOTFOUND`, ...) or `request failed`, never the
+  browser's text; `ERR_INVALID_CHAR` means a cookie in the profile has a
+  character the browser's request client will not put in a header (anything
+  above U+00FF). A plain fetch sends no cookies, so a site that serves
   an interstitial to cookie-less clients can still block it here.
 - **`--ignore-robots` overrides it**, because there are legitimate reasons:
   your own staging site, a page you are authenticated to, a `robots.txt`

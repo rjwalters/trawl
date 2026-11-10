@@ -20,6 +20,7 @@ import {
 	parseCookies,
 	plural,
 	printable,
+	robotsCookieHeader,
 	sourceUserAgent,
 	summarize,
 	whyNoneLeft,
@@ -488,6 +489,13 @@ function loadFetchCookies(args, { profileDir, stderr }) {
 					.join("") +
 				dropped.join(""),
 		);
+		const omitted = robotsOmitted(args, accepted);
+		if (omitted.length > 0) {
+			stderr(
+				`${plural(omitted.length, "cookie")} could not be sent on the robots.txt request ` +
+					`(a character not allowed in a request header): ${omitted.map(printable).join(", ")}\n`,
+			);
+		}
 	}
 	// The HAR is a full network trace: it keeps each request's Cookie header
 	// and parsed cookies, values included (--har-omit-content drops bodies
@@ -498,6 +506,22 @@ function loadFetchCookies(args, { profileDir, stderr }) {
 		);
 	}
 	return accepted;
+}
+
+// Names of the cookies render() will leave out of the robots.txt `Cookie`
+// header (src/cookies.mjs `robotsCookieHeader`); none when robots.txt is not
+// fetched. Today `browserWouldReject` already skips every such cookie, so
+// this only speaks up should the two rules ever drift apart.
+function robotsOmitted(args, cookies) {
+	if (args["--ignore-robots"] === true) return [];
+	let target;
+	try {
+		target = new URL(args._[0]);
+	} catch {
+		return [];
+	}
+	if (target.protocol !== "http:" && target.protocol !== "https:") return [];
+	return robotsCookieHeader(cookies, `${target.origin}/robots.txt`).omitted;
 }
 
 // `trawl login <origin>` — open a *headed* browser against a persistent

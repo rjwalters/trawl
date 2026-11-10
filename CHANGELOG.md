@@ -57,7 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   browser-profile cookies" note in the unreachable-robots.txt error is left
   out when the request did carry cookies. A fetch with neither flag is
   unchanged. The robots.txt request is not recorded by `--har` on either
-  path. (#79)
+  path. The header always holds a value Node's fetch accepts: a cookie
+  whose name or value has a control character (CR, LF, NUL, tab, ...) is
+  left out of it (the fetch goes on with the rest, or no header), and
+  non-ASCII is sent as the UTF-8 bytes Chromium sends on the page request,
+  so a value such as `snow☃man` no longer fails robots.txt. When the
+  request carried cookies, a failure is described only by an allowlisted
+  error code (`ECONNREFUSED`, `UND_ERR_SOCKET`, `ENOTFOUND`, ...) or the
+  fixed `request failed`, never the error's text, which can quote the
+  header; `--profile` reports the same allowlisted codes instead of a bare
+  `request failed`. A same-origin redirect keeps the header. With
+  `--profile`, a robots.txt refusal still leaves the profile directory and,
+  with `--har`, an empty HAR. (#79, #87)
 - **Minimum Node is now 22.** `engines.node` moves from `>=20` to `>=22`,
   matching the versions CI tests (22 and 24) now that Node 20 is end-of-life.
 

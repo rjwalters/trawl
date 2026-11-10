@@ -756,6 +756,41 @@ function cookiePathMatches(cookiePath, requestPath) {
 	return path.endsWith("/") || requestPath[path.length] === "/";
 }
 
+// A name or value that cannot go in the header: a control character. Node's
+// fetch refuses NUL, CR and LF outright (and quotes the whole header in its
+// error) and would send the others, tab included, raw. Chromium refuses all
+// of these cookies (`browserWouldReject`). Everything else is sent as given.
+const HEADER_UNSAFE = /[\u0000-\u001f\u007f]/;
+
+function headerSafe(c) {
+	return !HEADER_UNSAFE.test(String(c.name ?? "")) && !HEADER_UNSAFE.test(String(c.value ?? ""));
+}
+
+/**
+ * The robots.txt `Cookie` header and what had to be left out of it:
+ * `{ header, omitted }`. `header` is as `cookieHeaderFor` describes; `omitted`
+ * holds the *names* (never values) of matching cookies that could not be sent
+ * because a name or value holds a character that cannot go in a header.
+ *
+ * Non-ASCII is sent, not omitted, as the bytes Chromium puts on the page
+ * request: UTF-8 (checked against Chromium 156 for U+0080..U+00FF, U+2603,
+ * an emoji and a lone surrogate, which both sides send as U+FFFD). Node's
+ * fetch takes a header value as a latin-1 "byte string" and refuses anything
+ * above U+00FF, so the header is UTF-8 encoded and handed over one byte per
+ * character; sending `café` as is would put the single byte `e9` on the wire
+ * where the browser sends `c3 a9`.
+ */
+export function robotsCookieHeader(cookies, url, { now = Date.now() } = {}) {
+	const matching = matchingCookies(cookies, url, now);
+	const sendable = matching.filter(headerSafe);
+	const omitted = matching.filter((c) => !headerSafe(c)).map((c) => String(c.name ?? ""));
+	if (sendable.length === 0) return { header: undefined, omitted };
+	const text = sendable
+		.map((c) => (c.name ? `${c.name}=${c.value}` : String(c.value)))
+		.join("; ");
+	return { header: Buffer.from(text, "utf8").toString("latin1"), omitted };
+}
+
 /**
  * The `Cookie` header a browser would send with a request to `url`, from an
  * already-parsed, already-filtered list (the `makeCookie` shape), or
@@ -765,13 +800,23 @@ function cookiePathMatches(cookiePath, requestPath) {
  * the site's own origin. Longer paths first, ties in input order; a nameless
  * cookie contributes its value alone. The result is a secret: it belongs in a
  * request header and nowhere else (no log, no error, no `failure`).
+ *
+ * Always a value Node's fetch accepts: a cookie that cannot go in a header is
+ * left out (see `robotsCookieHeader`, which also says which), and non-ASCII
+ * is UTF-8 encoded into a byte string, so a value with U+0080 or above comes
+ * back as its UTF-8 bytes, one per character.
  */
-export function cookieHeaderFor(cookies, url, { now = Date.now() } = {}) {
+export function cookieHeaderFor(cookies, url, options = {}) {
+	return robotsCookieHeader(cookies, url, options).header;
+}
+
+// The cookies from `cookies` a browser would send to `url`, longest path first.
+function matchingCookies(cookies, url, now) {
 	let target;
 	try {
 		target = new URL(url);
 	} catch {
-		return undefined;
+		return [];
 	}
 	const host = target.hostname.toLowerCase();
 	const https = target.protocol === "https:";
@@ -785,10 +830,8 @@ export function cookieHeaderFor(cookies, url, { now = Date.now() } = {}) {
 		if (typeof e === "number" && e !== -1 && !(e > nowSec)) continue;
 		matching.push(c);
 	}
-	if (matching.length === 0) return undefined;
 	// Array.prototype.sort is stable, so equal path lengths keep input order.
-	matching.sort((a, b) => (b.path || "/").length - (a.path || "/").length);
-	return matching.map((c) => (c.name ? `${c.name}=${c.value}` : String(c.value))).join("; ");
+	return matching.sort((a, b) => (b.path || "/").length - (a.path || "/").length);
 }
 
 // Byte length, as Chromium measures cookie limits.

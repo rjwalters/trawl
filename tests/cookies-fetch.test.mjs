@@ -647,7 +647,7 @@ test("profileDir: a cross-origin robots.txt redirect after sending cookies gets 
 	const { result } = await renderProfile({ onFetch: redirected, jar: [jarCookie("k", AWKWARD)] });
 	assert.equal(
 		result.e?.message,
-		"robots.txt is unreachable: http://127.0.0.1:1/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. The robots.txt request was redirected to another origin, and cookies are not sent across a cross-origin redirect; fetching the page from that origin directly may get through. Use --ignore-robots to override.",
+		"robots.txt is unreachable: http://127.0.0.1:1/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. The robots.txt request was redirected to another origin, and cookies are not sent across a cross-origin redirect, so a cookie-gated robots.txt there was requested without them. Use --ignore-robots to override.",
 	);
 	assertNoValue(errorText(result.e));
 	// No cookie sent: nothing was dropped, so no hint.

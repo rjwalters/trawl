@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--har-redact`.** Opt-in redaction of `--har` output: replaces the values
+  of `Cookie`, `Set-Cookie`, `Authorization` and `Proxy-Authorization`
+  headers and of every `cookies[]` entry with `[redacted]`, keeping names.
+  Fails closed (deletes the HAR and exits non-zero if it cannot redact).
+  Output without the flag is unchanged.
 - **`trawl cookies import <file> --profile <dir>`.** Copies cookies from a
   HAR, a Netscape `cookies.txt` or a copy-as-cURL command into a persistent
   profile, so a later `trawl <url> --profile <dir>` presents them. Prints

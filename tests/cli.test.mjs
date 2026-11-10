@@ -602,3 +602,9 @@ test("two CLI renders space every robots.txt and page request", opts, async () =
 	);
 	assertSpaced(explicit, 1200);
 });
+
+test("treats --har-redact as a boolean", () => {
+	const args = parseArgs(["https://example.com", "--har-redact"]);
+	assert.equal(args["--har-redact"], true);
+	assert.deepEqual(args._, ["https://example.com"]);
+});

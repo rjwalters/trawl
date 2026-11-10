@@ -61,6 +61,7 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
   -A, --user-agent <ua>    Override the User-Agent
       --har <file>         Write a HAR 1.2 network trace to this file
       --har-omit-content   Record HAR metadata only, no response bodies
+      --har-redact         Redact cookie and credential header values in the HAR
       --executable-path <p>  Chromium binary to use
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
@@ -206,6 +207,15 @@ Response bodies are embedded in the file, so it is self-contained and
 portable. That also makes it large, and means it saves whatever the page
 loaded — `--har-omit-content` keeps the requests and timings but drops the
 bodies.
+
+A HAR records cookie values in plain text (request `Cookie`, response
+`Set-Cookie`, and the `cookies[]` entries), whether they came from a
+`--profile` or `--cookies`. Pass `--har-redact` before sharing one: it replaces
+the values of those, plus `Authorization` and `Proxy-Authorization` headers,
+with `[redacted]` (names are kept). URL query tokens and request bodies are
+not touched. If the redaction fails, the HAR file is deleted and the run exits
+non-zero rather than leaving an unredacted trace. Without the flag, HAR output
+is unchanged.
 
 The trace is flushed when the browser context closes, so a run that fails
 mid-navigation (timeout, DNS failure, connection refused) still leaves a

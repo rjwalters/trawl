@@ -92,6 +92,7 @@ Options:
   -A, --user-agent <ua>    Override the User-Agent
       --har <file>         Write a HAR 1.2 network trace to this file
       --har-omit-content   Record HAR metadata only, no response bodies
+      --har-redact         Redact cookie and credential header values in the HAR
       --executable-path <p>  Chromium binary to use
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
@@ -250,6 +251,7 @@ export function parseArgs(argv) {
 			arg === "--version" ||
 			arg === "--show-status" ||
 			arg === "--har-omit-content" ||
+			arg === "--har-redact" ||
 			arg === "--full-page" ||
 			arg === "--ignore-robots" ||
 			arg === "--no-readability" ||
@@ -353,6 +355,7 @@ export async function main(argv) {
 		executablePath: args["--executable-path"],
 		har: args["--har"],
 		harOmitContent: Boolean(args["--har-omit-content"]),
+		harRedact: Boolean(args["--har-redact"]),
 		screenshot: args["--screenshot"],
 		fullPage: !!args["--full-page"],
 		ignoreRobots: args["--ignore-robots"] === true,

@@ -101,10 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executable regular file named like a Chrome/Chromium binary, and on
   macOS/Linux only if the marker and its profile directory are owned by the
   current user and not writable by group or others; trawl launches the
-  resolved file. Any other marker is ignored and the browser is chosen exactly as before. An explicit path or
-  `$TRAWL_EXECUTABLE_PATH` still wins. `trawl login` now creates new profile
-  directories `0700`, as `cookies import` already did. A profile directory
-  is trusted input (README). (#95)
+  resolved file. Any other marker is ignored and the browser is chosen
+  exactly as before. An explicit path or `$TRAWL_EXECUTABLE_PATH` still
+  wins. `trawl login` now creates new profile directories `0700`, as
+  `cookies import` already did. A profile directory is trusted input
+  (README). (#95)
 - **`trawl login` warns when the recorded browser will be ignored.** If the
   profile directory or the `.trawl-browser` marker is group- or
   other-writable (or not yours), fetches skip the marker; login now prints

@@ -2,15 +2,16 @@
 // no network and no browser, so these always run.
 
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { test } from "node:test";
 import {
 	MAX_CRAWL_DELAY_MS,
 	checkRobotsAllowed,
+	cookieHeaderBytes,
 	crawlDelayMs,
 	evaluateRobots,
 	parseRobotsTxt,
 	productToken,
-	requestFetch,
 	robotsDenialMessage,
 	selectGroup,
 } from "../src/robots.mjs";
@@ -524,87 +525,38 @@ test("a cookie never reaches the verdict or the denial message", async () => {
 	}
 });
 
-// A stand-in for Playwright's APIRequestContext / APIResponse.
-function fakeRequest({ status = 200, body = "", get, text } = {}) {
-	const calls = [];
-	const disposed = [];
-	const request = {
-		get: async (url, options) => {
-			calls.push([url, options]);
-			if (get) return get(url, options);
-			return {
-				ok: () => status >= 200 && status <= 299,
-				status: () => status,
-				text: text ?? (async () => body),
-				dispose: async () => {
-					disposed.push(url);
-				},
-			};
-		},
-	};
-	return { request, calls, disposed };
-}
+// --- the Cookie header goes out as UTF-8 bytes (#89) ---
 
-test("requestFetch returns the fetch shape and passes the User-Agent explicitly", async () => {
-	const { request, calls, disposed } = fakeRequest({ body: "User-agent: *\nDisallow: /x\n" });
-	const v = await checkRobotsAllowed("https://example.com/x/y", { userAgent: UA, fetch: requestFetch(request) });
-	assert.deepEqual(v, { allowed: false, rule: "Disallow: /x", crawlDelay: null });
-	assert.equal(calls.length, 1);
-	const [url, options] = calls[0];
-	assert.equal(url, "https://example.com/robots.txt");
-	assert.deepEqual(options.headers, { "User-Agent": UA });
-	assert.equal(options.failOnStatusCode, false);
-	assert.equal(options.maxRedirects, 20);
-	// A backstop only, later than checkRobotsAllowed's own timer.
-	assert.equal(options.timeout, 11000);
-	assert.deepEqual(disposed, ["https://example.com/robots.txt"]);
+test("cookieHeaderBytes: ASCII is unchanged, non-ASCII becomes one char per UTF-8 byte", () => {
+	assert.equal(cookieHeaderBytes("a=1; b=2"), "a=1; b=2");
+	assert.equal(cookieHeaderBytes("p=caf\u00e9"), "p=caf\u00c3\u00a9");
+	assert.equal(cookieHeaderBytes("p=snow\u2603man"), "p=snow\u00e2\u0098\u0083man");
+	// Every char is now <= U+00FF, which Node's fetch accepts.
+	assert.ok(![...cookieHeaderBytes("p=snow\u2603man")].some((c) => c.codePointAt(0) > 0xff));
 });
 
-test("requestFetch keeps the status rules: 4xx allows, 5xx is a server error", async () => {
-	for (const [status, expected] of [
-		[404, { allowed: true, rule: null, crawlDelay: null }],
-		[429, { allowed: true, rule: null, crawlDelay: null }],
-	]) {
-		const { request } = fakeRequest({ status });
-		assert.deepEqual(await checkRobotsAllowed("https://example.com/", { fetch: requestFetch(request) }), expected);
-	}
-	const { request } = fakeRequest({ status: 503 });
-	const v = await checkRobotsAllowed("https://example.com/", { fetch: requestFetch(request) });
-	assert.deepEqual(v.failure, { url: "https://example.com/robots.txt", kind: "server-error", status: 503 });
-});
-
-test("a hung context request is a timeout, not a network error", async () => {
-	const { request } = fakeRequest({ get: () => new Promise(() => {}) });
-	const v = await checkRobotsAllowed("https://example.com/", { timeout: 20, fetch: requestFetch(request) });
-	assert.equal(v.allowed, false);
-	assert.equal(v.failure.kind, "timeout");
-	// A body that hangs, too.
-	const slow = fakeRequest({ text: () => new Promise(() => {}) });
-	const w = await checkRobotsAllowed("https://example.com/", { timeout: 20, fetch: requestFetch(slow.request) });
-	assert.equal(w.failure.kind, "timeout");
-	assert.equal(slow.disposed.length, 1);
-});
-
-test("requestFetch never surfaces the browser's error text", async () => {
-	const secret = "s3cr3t-c00kie-VALUE";
-	const browserError = () => {
-		const err = new Error(`apiRequestContext.get: connect ECONNREFUSED; Cookie: k=${secret}`);
-		err.cause = { code: secret, message: secret };
-		err.code = secret;
-		return err;
-	};
-	const cases = [
-		fakeRequest({ get: () => Promise.reject(browserError()) }),
-		fakeRequest({ get: () => { throw browserError(); } }),
-		fakeRequest({ text: () => Promise.reject(browserError()) }),
-		fakeRequest({ get: async () => ({ ok: () => { throw browserError(); }, status: () => 200, dispose: async () => {} }) }),
-	];
-	for (const { request } of cases) {
-		const v = await checkRobotsAllowed("https://example.com/", { fetch: requestFetch(request) });
-		assert.equal(v.allowed, false);
-		assert.equal(v.failure.detail, "request failed");
-		assert.ok(!JSON.stringify(v).includes(secret));
-		assert.ok(!robotsDenialMessage(v, { sentCookies: true }).includes(secret));
+test("checkRobotsAllowed sends non-ASCII cookie values as UTF-8 bytes and does not throw", async () => {
+	let raw;
+	const server = createServer((req, res) => {
+		raw = req.rawHeaders;
+		res.writeHead(200, { "content-type": "text/plain" });
+		res.end("User-agent: *\nDisallow:\n");
+	});
+	await new Promise((r) => server.listen(0, "127.0.0.1", r));
+	try {
+		const url = `http://127.0.0.1:${server.address().port}/page`;
+		for (const [value, hex] of [
+			["snow\u2603man", "736e6f77e298836d616e"],
+			["caf\u00e9", "636166c3a9"],
+		]) {
+			raw = undefined;
+			const v = await checkRobotsAllowed(url, { cookie: `p=${value}` });
+			assert.deepEqual(v, { allowed: true, rule: null, crawlDelay: null });
+			const header = raw[raw.findIndex((h) => h.toLowerCase() === "cookie") + 1];
+			assert.equal(Buffer.from(header, "latin1").toString("hex"), `703d${hex}`);
+		}
+	} finally {
+		await new Promise((r) => server.close(r));
 	}
 });
 

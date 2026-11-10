@@ -23,7 +23,6 @@ import {
 	ROBOTS_TIMEOUT_MS,
 	checkRobotsAllowed,
 	crawlDelayMs,
-	requestFetch,
 	robotsDenialMessage,
 } from "./robots.mjs";
 
@@ -555,8 +554,8 @@ export async function render(url, options = {}) {
 	//   - `cookies` without `profileDir`: still Node fetch before the launch,
 	//     with a `Cookie` header of just the cookies that match
 	//     `<origin>/robots.txt` (none match: no header at all).
-	//   - `profileDir`: through the persistent context's `context.request`,
-	//     which shares the profile's cookie jar, so the browser launches
+	//   - `profileDir`: Node fetch, with a `Cookie` header built from the
+	//     persistent context's jar (`context.cookies`), so the browser launches
 	//     first (see `checkRobots` in the `try` below).
 	const robotsCheck = !opts.ignoreRobots && isHttpUrl(url);
 	const robotsViaProfile = robotsCheck && Boolean(opts.profileDir);
@@ -668,7 +667,7 @@ export async function render(url, options = {}) {
 	// arrives — before goto() resolves, so a navigation that then times out
 	// waiting for networkidle, or a run that fails later on, still leaves the
 	// cooldown behind. Iframes and subresources are ignored, and robots.txt
-	// is fetched outside the page (Node fetch, or `context.request` with a
+	// is fetched outside the page (Node fetch, with the jar's cookies on a
 	// profile), so neither ever lands here.
 	const seenResponses = new WeakSet();
 	const onResponse = (response) => {
@@ -726,10 +725,11 @@ export async function render(url, options = {}) {
 		// the page will. A denial, or an error from the pacing/cooldown gate,
 		// throws from here and the `finally` closes the context.
 		if (robotsViaProfile) {
-			await checkRobots({
-				fetch: requestFetch(context.request, { timeout: ROBOTS_TIMEOUT_MS }),
-				sentCookies: true,
-			});
+			// The jar's cookies for robots.txt as a plain header, so they go out
+			// as the same UTF-8 bytes the page request sends.
+			const robotsUrl = `${new URL(url).origin}/robots.txt`;
+			const cookie = cookieHeaderFor(await context.cookies(robotsUrl), robotsUrl);
+			await checkRobots({ fetch: opts.fetch, cookie, sentCookies: Boolean(cookie) });
 		}
 		page = await context.newPage();
 		page.on("response", onResponse);

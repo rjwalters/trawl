@@ -232,10 +232,9 @@ file holds those cookie values in plain text, sign-in cookies too, and
 `--har-omit-content` does not remove them. Treat such a HAR like the cookie
 file itself. `--cookies` together with `--har` prints a warning saying so (omitted
 when `--har-redact` is also given).
-The `robots.txt` request is not in the HAR on either path: with `--cookies`
-it is made outside the browser, and with `--profile` it goes through the
-browser context's own request client, which Playwright's HAR recorder does
-not capture.
+The `robots.txt` request is not in the HAR on either path: it is made outside
+the browser, with the cookies that match it (from `--cookies`, or from the
+`--profile` jar).
 
 Pass `--har-redact` before sharing one: it replaces the values of those, plus
 `Authorization` and `Proxy-Authorization` headers, with `[redacted]` (names

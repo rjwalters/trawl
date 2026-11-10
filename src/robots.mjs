@@ -169,6 +169,14 @@ function describeError(err) {
 	);
 }
 
+// Node's fetch (undici) rejects a header value above U+00FF and sends each
+// char as one byte, so a cookie Chromium would send as UTF-8 (`snow☃man`)
+// throws, and `café` would go out as latin-1. Re-express the UTF-8 bytes one
+// char per byte so they reach the wire unchanged.
+export function cookieHeaderBytes(header) {
+	return Buffer.from(header, "utf8").toString("latin1");
+}
+
 // Fetch `<origin>/robots.txt` and evaluate it for `url`.
 //
 // Per RFC 9309 §2.3.1.3–4:
@@ -181,9 +189,11 @@ function describeError(err) {
 // The request carries the User-Agent and, when `cookie` is given, that string
 // as its `Cookie` header: a ready header (src/cookies.mjs `cookieHeaderFor`),
 // never a cookie list, so this module stays cookie-agnostic. It is a secret
-// and goes nowhere but the header. Node's fetch drops the header on a
-// cross-origin redirect. To send a browser profile's cookies instead, pass
-// `fetch: requestFetch(context.request)` (below).
+// and goes nowhere but the header; it goes out as UTF-8 bytes, like
+// Chromium's page request (`cookieHeaderBytes`). Node's fetch drops the
+// header on a cross-origin redirect, and a robots `Set-Cookie` is not stored:
+// both are fine for a robots.txt probe (fewer cookies leave the origin).
+// The `--profile` path builds the same header from the context's jar.
 //
 // `gate`, if given, wraps the moment the request is sent: it is called with a
 // `start` function and must call it (once) and return its result. This is how
@@ -220,7 +230,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 		started = true;
 		timer = setTimeout(() => controller.abort(), timeout);
 		const headers = userAgent ? { "User-Agent": userAgent } : {};
-		if (typeof cookie === "string" && cookie) headers.Cookie = cookie;
+		if (typeof cookie === "string" && cookie) headers.Cookie = cookieHeaderBytes(cookie);
 		return fetchImpl(robotsUrl, {
 			headers,
 			redirect: "follow",
@@ -274,87 +284,6 @@ export async function checkRobotsAllowed(url, options = {}) {
 		userAgent,
 		path: `${target.pathname}${target.search}`,
 	});
-}
-
-// A `fetch`-shaped function over Playwright's `context.request`, so a robots
-// check made through a browser context (sharing its cookie jar) reuses every
-// status, timeout and read-error rule above instead of duplicating them.
-// - Returns `{ ok, status, text }` as properties, like a fetch Response, and
-//   disposes of the Playwright response once the body is read.
-// - Honours the `AbortSignal` it is given, so checkRobotsAllowed's own timer
-//   still classifies a hang as "timeout". Playwright's own `timeout` is only
-//   a backstop, set a second later so it cannot win that race and be
-//   misreported as a network error.
-// - Never lets the browser's error text out: any failure becomes a fixed
-//   "request failed" (no `cause`), which is all the verdict then reports.
-// - Leaves 4xx/5xx to the caller (no `failOnStatusCode`) and follows up to
-//   20 redirects; Playwright re-attaches the jar's cookies per hop, as a
-//   browser does.
-export function requestFetch(request, { timeout = ROBOTS_TIMEOUT_MS } = {}) {
-	const failed = () => new Error("request failed");
-	const untilAborted = (promise, signal) => {
-		if (!signal) return promise;
-		if (signal.aborted) return Promise.reject(failed());
-		let onAbort;
-		const aborted = new Promise((_, reject) => {
-			onAbort = () => reject(failed());
-			signal.addEventListener("abort", onAbort, { once: true });
-		});
-		return Promise.race([promise, aborted]).finally(() =>
-			signal.removeEventListener("abort", onAbort),
-		);
-	};
-	return async (url, init = {}) => {
-		const { signal } = init;
-		const pending = Promise.resolve().then(() =>
-			request.get(url, {
-				headers: init.headers,
-				maxRedirects: 20,
-				failOnStatusCode: false,
-				timeout: timeout > 0 ? timeout + 1000 : 0,
-			}),
-		);
-		let response;
-		try {
-			response = await untilAborted(pending, signal);
-		} catch {
-			// Abandoned (aborted): dispose of the response should it still arrive.
-			pending.then((r) => r?.dispose?.()).catch(() => {});
-			throw failed();
-		}
-		const dispose = async () => {
-			try {
-				await response?.dispose?.();
-			} catch {
-				// Nothing to report: the body was read or abandoned.
-			}
-		};
-		let ok;
-		let status;
-		try {
-			ok = Boolean(response.ok());
-			status = Number(response.status());
-		} catch {
-			await dispose();
-			throw failed();
-		}
-		return {
-			ok,
-			status,
-			text: async () => {
-				try {
-					return await untilAborted(
-						Promise.resolve().then(() => response.text()),
-						signal,
-					);
-				} catch {
-					throw failed();
-				} finally {
-					await dispose();
-				}
-			},
-		};
-	};
 }
 
 // Turn a denied robots verdict into an error message. A matched rule and a

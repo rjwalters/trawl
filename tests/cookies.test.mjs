@@ -7,6 +7,7 @@ import {
 	isAuthCookie,
 	MAX_EXPIRES,
 	parseCookies,
+	sourceUserAgent,
 	summarize,
 } from "../src/cookies.mjs";
 
@@ -469,4 +470,37 @@ test("HAR: Set-Cookie vs request cookie merge is independent of entry order", ()
 			[["t", ".example.com", "new"]],
 		);
 	}
+});
+
+// --- sourceUserAgent (#77) ---
+
+test("sourceUserAgent reads the first request User-Agent from a HAR", () => {
+	const har = JSON.stringify({
+		log: {
+			entries: [
+				{ request: { url: "https://a.example/", headers: [] } },
+				{ request: { url: "https://a.example/x", headers: [{ name: "user-agent", value: " UA/1 " }] } },
+				{ request: { url: "https://a.example/y", headers: [{ name: "User-Agent", value: "UA/2" }] } },
+			],
+		},
+	});
+	assert.equal(sourceUserAgent(har), "UA/1");
+});
+
+test("sourceUserAgent reads -A, --user-agent and -H from a cURL command", () => {
+	assert.equal(sourceUserAgent("curl https://a.example -A 'Fx/1'"), "Fx/1");
+	assert.equal(sourceUserAgent("curl --user-agent \"Fx/2\" https://a.example"), "Fx/2");
+	assert.equal(sourceUserAgent("curl -sSAFx/3 https://a.example"), "Fx/3");
+	assert.equal(sourceUserAgent("curl https://a.example -H 'user-agent: Fx/4' -H 'Accept: */*'"), "Fx/4");
+	// A cookie value that looks like a flag is not mistaken for one.
+	assert.equal(sourceUserAgent("curl https://a.example -b '-A=x' -H 'Cookie: a=-A'"), null);
+	assert.equal(sourceUserAgent("curl https://a.example"), null);
+});
+
+test("sourceUserAgent is null for cookies.txt and for anything unparseable", () => {
+	assert.equal(sourceUserAgent(`# Netscape HTTP Cookie File\n.a.example\tTRUE\t/\tFALSE\t0\tn\t${SENTINEL}\n`), null);
+	assert.equal(sourceUserAgent(`{"log": ${SENTINEL}`), null);
+	assert.equal(sourceUserAgent('{"log": {}}'), null);
+	assert.equal(sourceUserAgent(""), null);
+	assert.equal(sourceUserAgent(undefined), null);
 });

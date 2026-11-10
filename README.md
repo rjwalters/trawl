@@ -35,6 +35,9 @@ trawl <url> [options]
 trawl login <origin>       Open a headed browser to sign in; saves the
                             session to --profile <dir> / $TRAWL_PROFILE_DIR
                             (defaults to ~/.trawl/profile)
+trawl cookies import <file> --profile <dir>
+                            Copy cookies from a HAR, a Netscape cookies.txt
+                            or a copy-as-cURL command into a profile (below)
 trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
 
   -f, --format <fmt>       text | html | links | title | markdown (md)
@@ -87,6 +90,21 @@ trawl mcp                  Serve fetch_page/fetch_links over MCP (stdio)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
   -v, --version            Show version
+
+Cookie import (trawl cookies import <file>):
+                            Writes the file's cookies into --profile <dir>
+                            (or $TRAWL_PROFILE_DIR; required, no default) for
+                            a later "trawl <url> --profile <dir>". Prints
+                            names, domains and expiry only, never values.
+                            Session cookies are kept for 7 days. Expired
+                            cookies are dropped, and so are sign-in
+                            cookies (best-effort list: AUTH_COOKIES in
+                            src/cookies.mjs). If none are left, nothing is
+                            written and the exit code is 1. Delete the
+                            source file afterwards.
+      --domain <host>      Only cookies that would be sent to this host
+      --allow <names>      Only these cookie names (comma-separated)
+      --include-auth       Keep sign-in cookies too
 ```
 
 ```sh
@@ -100,6 +118,7 @@ trawl https://example.com --har trace.har          # + the full network trace
 trawl https://example.com --screenshot page.png --full-page   # text + a PNG
 trawl login https://example.com --profile ~/.trawl/example    # sign in once
 trawl https://example.com --profile ~/.trawl/example           # reuse the session
+trawl cookies import cookies.txt --profile ~/.trawl/example    # or bring cookies
 ```
 
 ### Clicking before extraction
@@ -258,6 +277,52 @@ the default session, or a dedicated directory to isolate one site's session.
 `chrome-headless-shell` (the default cached binary) cannot open a window, so
 point `--executable-path` at a system browser if that's all you have
 installed.
+
+#### Importing cookies from another browser
+
+When signing in through `trawl login` isn't practical, `trawl cookies import`
+copies cookies you exported elsewhere into a profile. It reads a **HAR** (your
+browser's devtools "Save all as HAR", or `trawl --har`), a **Netscape
+`cookies.txt`** (from a cookie-export extension, or `curl -c`), or a
+**copy-as-cURL** command, and works out which from the content:
+
+```sh
+trawl cookies import ~/Downloads/cookies.txt --profile ~/.trawl/example \
+      --domain example.com
+trawl https://example.com --profile ~/.trawl/example   # presents them
+```
+
+It prints each imported cookie's name, domain and expiry, never its value,
+and reports what it dropped:
+
+- **Expired cookies** are dropped.
+- **Session cookies** (no expiry of their own, which is every cookie a HAR
+  request or a cURL command carries) are stored with a 7-day expiry, because
+  a browser profile only keeps cookies that have one.
+- **Sign-in cookies are dropped by default.** Session and account cookies
+  (Google's `SID` family, `PHPSESSID`, GitHub's `user_session`, and so on)
+  are the ones that act as your login, so `trawl` leaves them behind unless
+  you pass `--include-auth`. The list (`AUTH_COOKIES` in `src/cookies.mjs`) is
+  **best-effort**: a site can call its session cookie anything, so treat
+  "not dropped" as "not recognised", not as "safe".
+- `--domain <host>` keeps only cookies that would be sent to that host, and
+  `--allow a,b` only the cookies with those exact names.
+
+`--profile` (or `$TRAWL_PROFILE_DIR`) is required; there is no default. The
+cookies go through Chromium into the profile's own encrypted store, never into
+a plaintext file, and a profile directory `trawl` creates is made `0700` (an
+existing one keeps its mode). Nothing is written until the file has parsed and
+at least one cookie is left after filtering; otherwise the command exits 1
+and the profile is untouched.
+
+**Delete the source file once the import is done.** It still holds every
+cookie it was exported with, sign-in cookies included, in plain text; `trawl`
+reminds you after each import.
+
+When a HAR or cURL source records the browser it came from, `trawl` warns if
+that is not `trawl` itself: it identifies itself honestly as `trawl/<version>`,
+and some sites bind cookies to the client that received them, so a session
+may not carry over.
 
 ### As a library
 

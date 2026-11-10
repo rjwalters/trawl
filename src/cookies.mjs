@@ -615,6 +615,67 @@ export function parseCookies(text) {
 	throw new CookieParseError("unrecognised");
 }
 
+function curlUserAgent(text) {
+	const words = shellWords(text);
+	let agent = null;
+	for (let i = 1; i < words.length; i++) {
+		const w = words[i];
+		let opt = w;
+		let value = null;
+		if (/^-[^-]/.test(w)) {
+			// Same bundled-short-option rule as parseCurl.
+			opt = null;
+			for (let k = 1; k < w.length; k++) {
+				const o = `-${w[k]}`;
+				if (o === "-H" || o === "-b" || CURL_VALUE_OPTS.has(o)) {
+					opt = o;
+					value = w.slice(k + 1) || null;
+					break;
+				}
+			}
+			if (opt === null) continue;
+		}
+		if (opt === "-A" || opt === "--user-agent") {
+			agent = value ?? words[++i] ?? null;
+		} else if (opt === "-H" || opt === "--header") {
+			const m = /^user-agent\s*:(.*)$/is.exec(value ?? words[++i] ?? "");
+			if (m) agent = m[1].trim();
+		} else if (opt === "-b" || opt === "--cookie" || opt === "--url") {
+			if (value === null) i++;
+		} else if (CURL_VALUE_OPTS.has(opt)) {
+			if (value === null) i++;
+		}
+	}
+	return agent || null;
+}
+
+/**
+ * The `User-Agent` the source was captured with, or null when it carries none
+ * (always null for a Netscape cookies.txt, which has no such field). For a HAR,
+ * the first request that sent one; for a cURL command, its `-A` /
+ * `--user-agent` / `-H 'User-Agent: …'` (last one wins, as in curl). Never
+ * throws: unrecognised input simply has no User-Agent.
+ */
+export function sourceUserAgent(text) {
+	if (typeof text !== "string") return null;
+	const trimmed = text.replace(/^﻿/, "").trim();
+	try {
+		if (trimmed.startsWith("{")) {
+			const entries = JSON.parse(trimmed)?.log?.entries;
+			if (!Array.isArray(entries)) return null;
+			for (const entry of entries) {
+				const [ua] = headerValues(entry?.request?.headers, "user-agent");
+				if (ua?.trim()) return ua.trim();
+			}
+			return null;
+		}
+		if (/^curl(\s|$)/.test(trimmed)) return curlUserAgent(trimmed);
+	} catch {
+		// Malformed input: parseCookies reports it; there is no agent to read.
+	}
+	return null;
+}
+
 // A cookie for a single-label domain (`com`, `test`) is only kept when the
 // filter names exactly that host: browsers never store a cookie on a bare
 // public suffix, so `example.com` must not match a `com` cookie. (Multi-label

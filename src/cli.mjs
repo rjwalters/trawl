@@ -1,8 +1,22 @@
 #!/usr/bin/env node
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	AUTH_COOKIES,
+	filterCookies,
+	parseCookies,
+	sourceUserAgent,
+	summarize,
+} from "./cookies.mjs";
 import {
 	DEFAULT_MIN_INTERVAL_MS,
 	MAX_MIN_INTERVAL_MS,
@@ -41,6 +55,9 @@ Usage:
   trawl login <origin>     Open a headed browser to sign in; saves the
                             session to --profile <dir> / TRAWL_PROFILE_DIR
                             (defaults to ~/.trawl/profile)
+  trawl cookies import <file> --profile <dir>
+                            Copy cookies from a HAR, a Netscape cookies.txt
+                            or a copy-as-cURL command into a profile (below)
   trawl mcp                Serve fetch_page/fetch_links over MCP (stdio)
 
 Options:
@@ -103,6 +120,21 @@ Options:
   -h, --help               Show this help
   -v, --version            Show version
 
+Cookie import (trawl cookies import <file>):
+                            Writes the file's cookies into --profile <dir>
+                            (or $TRAWL_PROFILE_DIR; required, no default) for
+                            a later "trawl <url> --profile <dir>". Prints
+                            names, domains and expiry only, never values.
+                            Session cookies are kept for 7 days. Expired
+                            cookies are dropped, and so are sign-in
+                            cookies (best-effort list, e.g. ${AUTH_COOKIES.names.slice(0, 3).join(", ")}:
+                            AUTH_COOKIES in src/cookies.mjs). If none are
+                            left, nothing is written and the exit code is 1.
+                            Delete the source file afterwards.
+      --domain <host>      Only cookies that would be sent to this host
+      --allow <names>      Only these cookie names (comma-separated)
+      --include-auth       Keep sign-in cookies too
+
 Examples:
   trawl https://example.com/spa
   trawl https://example.com -f links
@@ -113,6 +145,8 @@ Examples:
   trawl https://example.com --screenshot page.png --full-page
   trawl login https://example.com --profile ~/.trawl/example
   trawl https://example.com --profile ~/.trawl/example
+  trawl cookies import cookies.txt --profile ~/.trawl/example \\
+        --domain example.com
 
 Cooldowns: when a page answers 429 or 503, trawl records a per-origin
 cooldown in the same state directory — until its Retry-After (seconds or an
@@ -257,6 +291,9 @@ export async function main(argv) {
 	}
 	if (argv[0] === "login") {
 		return await runLogin(argv.slice(1));
+	}
+	if (argv[0] === "cookies") {
+		return await runCookies(argv.slice(1));
 	}
 
 	const args = parseArgs(argv);
@@ -409,6 +446,266 @@ export async function runLogin(argv, deps = {}) {
 	await context.close().catch(() => {});
 
 	stderr(`Session saved to ${profileDir}\n`);
+	return 0;
+}
+
+// `trawl cookies <subcommand>`. Only `import` exists today.
+export async function runCookies(argv, deps = {}) {
+	if (argv[0] === "import") return await runCookiesImport(argv.slice(1), deps);
+	if (argv[0] === "--help" || argv[0] === "-h") {
+		(deps.stdout ?? ((s) => process.stdout.write(s)))(USAGE);
+		return 0;
+	}
+	throw new Error(
+		argv[0] === undefined
+			? "trawl cookies requires a subcommand: trawl cookies import <file> --profile <dir>"
+			: `Unknown cookies subcommand: ${argv[0]} (expected: import)`,
+	);
+}
+
+// Its own small parser, not parseArgs: these flags mean nothing to a fetch,
+// and adding them there would turn today's "Unknown option" for
+// `trawl <url> --domain x` into a silently ignored flag.
+const COOKIES_IMPORT_VALUED = new Set(["--profile", "--domain", "--allow", "--executable-path"]);
+const COOKIES_IMPORT_BOOLEAN = new Set(["--include-auth", "--help"]);
+
+export function parseCookiesImportArgs(argv) {
+	const out = { _: [] };
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i] === "-h" ? "--help" : argv[i];
+		if (!arg.startsWith("-") || arg === "-") {
+			out._.push(arg);
+			continue;
+		}
+		const eq = arg.indexOf("=");
+		const key = eq > -1 ? arg.slice(0, eq) : arg;
+		if (COOKIES_IMPORT_VALUED.has(key)) {
+			const value = eq > -1 ? arg.slice(eq + 1) : argv[++i];
+			if (value === undefined) throw new Error(`${key} requires a value`);
+			out[key] = value;
+			continue;
+		}
+		if (eq < 0 && COOKIES_IMPORT_BOOLEAN.has(arg)) {
+			out[arg] = true;
+			continue;
+		}
+		throw new Error(`Unknown option for trawl cookies import: ${key}`);
+	}
+	return out;
+}
+
+// Browser family of a User-Agent string, for the "your cookies came from a
+// different client" warning. Order matters: Edge and Opera also say Chrome,
+// and Chrome also says Safari.
+export function browserFamily(ua) {
+	const s = String(ua ?? "");
+	if (/\btrawl\//i.test(s)) return "trawl";
+	if (/\bEdg(e|A|iOS)?\//.test(s)) return "Edge";
+	if (/\b(OPR|Opera)\//.test(s)) return "Opera";
+	if (/\b(Firefox|FxiOS)\//.test(s)) return "Firefox";
+	if (/\b(Chrome|Chromium|CriOS)\//.test(s)) return "Chrome";
+	if (/\bSafari\//.test(s)) return "Safari";
+	if (/^curl\//i.test(s)) return "curl";
+	return "another client";
+}
+
+// Names and domains come from the input file: strip control characters so a
+// crafted file cannot drive the terminal.
+function printable(s) {
+	return String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+}
+
+// How long an imported session cookie (no expiry of its own) is kept.
+const SESSION_COOKIE_TTL_S = 7 * 86400;
+
+function describeExpiry(expires) {
+	return new Date(expires * 1000).toISOString().replace(/\.000Z$/, "Z");
+}
+
+function plural(n, word) {
+	return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+// Fixed text, plus the browser's own message only when it provably contains
+// no cookie value (Playwright errors can echo the rejected cookie).
+function cookieWriteError(err, cookies) {
+	const detail = String(err?.message ?? "").split("\n")[0];
+	const leaks = cookies.some((c) => c.value !== "" && detail.includes(c.value));
+	return new Error(
+		`could not write cookies to the profile${detail && !leaks ? ` (${detail})` : ""}`,
+	);
+}
+
+// `trawl cookies import <file> --profile <dir>` — parse a cookie export,
+// filter it, and write what survives into a persistent profile, so a later
+// `trawl <url> --profile <dir>` presents it.
+//
+// Chromium's cookie store is encrypted and not something Node can write, so
+// the write goes through Playwright: launch the profile, addCookies, close.
+// Closing is what flushes the store to disk.
+//
+// Nothing touches the profile (not even mkdir) until the file has parsed and
+// at least one cookie survives filtering; zero survivors is exit 1 with the
+// summary, so a script cannot mistake "imported nothing" for success.
+//
+// No cookie value ever reaches stdout, stderr or an error message: output is
+// built from summarize(), which carries names, domains and expiry only.
+//
+// `deps` mirrors runLogin: the browser lifecycle, filesystem and output are
+// injectable so tests need no Chromium.
+export async function runCookiesImport(argv, deps = {}) {
+	const env = deps.env ?? process.env;
+	const stdout = deps.stdout ?? ((s) => process.stdout.write(s));
+	const stderr = deps.stderr ?? ((s) => process.stderr.write(s));
+	const args = parseCookiesImportArgs(argv);
+
+	if (args["--help"]) {
+		stdout(USAGE);
+		return 0;
+	}
+	const file = args._[0];
+	if (!file) {
+		throw new Error(
+			"trawl cookies import requires a file, e.g. trawl cookies import cookies.txt --profile <dir>",
+		);
+	}
+	if (args._.length > 1) {
+		throw new Error(`Expected one file, got ${args._.length}`);
+	}
+	const profileDir = args["--profile"] ?? env.TRAWL_PROFILE_DIR;
+	if (!profileDir) {
+		throw new Error(
+			"trawl cookies import requires --profile <dir> (or $TRAWL_PROFILE_DIR)",
+		);
+	}
+	let allow;
+	if (args["--allow"] !== undefined) {
+		allow = args["--allow"]
+			.split(",")
+			.map((n) => n.trim())
+			.filter(Boolean);
+		if (allow.length === 0) throw new Error("--allow expects cookie names, e.g. --allow a,b");
+	}
+	const domain = args["--domain"];
+	if (domain !== undefined && !domain.trim()) {
+		throw new Error("--domain expects a host, e.g. --domain example.com");
+	}
+
+	let text;
+	try {
+		text = (deps.readFileSync ?? readFileSync)(file, "utf8");
+	} catch (err) {
+		throw new Error(`cannot read cookie source ${file}${err?.code ? ` (${err.code})` : ""}`);
+	}
+	// CookieParseError messages are fixed strings that never quote the input.
+	const parsed = parseCookies(text);
+	const now = deps.now ?? Date.now();
+	const result = filterCookies(parsed, {
+		domain,
+		allow,
+		includeAuth: args["--include-auth"] === true,
+		now,
+	});
+	const summary = summarize(result);
+
+	const dropped = [];
+	if (summary.authDropped.count > 0) {
+		dropped.push(
+			`Dropped ${plural(summary.authDropped.count, "sign-in cookie")} ` +
+				`(${summary.authDropped.names.map(printable).join(", ")}); ` +
+				"pass --include-auth to import them.\n",
+		);
+	}
+	if (summary.expiredDropped > 0) {
+		dropped.push(`Dropped ${plural(summary.expiredDropped, "expired cookie")}.\n`);
+	}
+
+	if (summary.kept.length === 0) {
+		stderr(
+			`${dropped.join("")}trawl: no cookies left to import from ${file}` +
+				`${domain || allow ? " after --domain/--allow filtering" : ""}; ` +
+				`${profileDir} was not touched.\n`,
+		);
+		return 1;
+	}
+
+	// Resolved before the profile is created, so a missing browser also
+	// leaves no trace.
+	const resolveExe =
+		deps.resolveExecutablePath ??
+		(await import("./browser.mjs")).resolveExecutablePath;
+	const executablePath = resolveExe(args["--executable-path"]);
+
+	// 0700 only on a directory trawl creates now; an existing one's mode is
+	// the operator's choice and is left alone.
+	const exists = deps.existsSync ?? existsSync;
+	if (!exists(profileDir)) {
+		(deps.mkdirSync ?? mkdirSync)(profileDir, { recursive: true, mode: 0o700 });
+		// mkdir's mode is filtered by the umask; set it outright.
+		(deps.chmodSync ?? chmodSync)(profileDir, 0o700);
+	}
+
+	// Chromium never writes session cookies to the profile's store, so a
+	// session cookie imported as-is is gone by the next run. Every cookie a
+	// HAR request header or a cURL line yields is a session cookie, so give
+	// those a short, bounded lifetime instead.
+	const sessionUntil = Math.floor(now / 1000) + SESSION_COOKIE_TTL_S;
+	const payload = result.cookies.map((c) =>
+		c.expires === -1 ? { ...c, expires: sessionUntil } : c,
+	);
+	const sessionCount = result.cookies.filter((c) => c.expires === -1).length;
+
+	const launch = deps.launchPersistentContext ?? defaultLaunchPersistentContext;
+	const context = await launch(profileDir, { executablePath, headless: true });
+	try {
+		await context.addCookies(payload);
+	} catch (err) {
+		await context.close().catch(() => {});
+		throw cookieWriteError(err, payload);
+	}
+	try {
+		await context.close();
+	} catch (err) {
+		throw cookieWriteError(err, payload);
+	}
+
+	stdout(
+		`Imported ${plural(summary.kept.length, "cookie")} into ${profileDir}:\n` +
+			summary.kept
+				.map(
+					(c) =>
+						`  ${printable(c.name)}\t${printable(c.domain)}\t${
+							c.expires === -1
+								? `session, kept until ${describeExpiry(sessionUntil)}`
+								: describeExpiry(c.expires)
+						}\n`,
+				)
+				.join("") +
+			(sessionCount > 0
+				? `${plural(sessionCount, "session cookie")} stored with a ` +
+					`${SESSION_COOKIE_TTL_S / 86400}-day expiry: a profile only keeps ` +
+					"cookies that have one.\n"
+				: "") +
+			dropped.join(""),
+	);
+
+	const agent = sourceUserAgent(text);
+	if (agent) {
+		const family = browserFamily(agent);
+		if (family !== "trawl") {
+			const { defaultUserAgent } = await import("./render.mjs");
+			stderr(
+				`trawl: warning: these cookies were captured by ${family}, but trawl ` +
+					`identifies itself as "${await defaultUserAgent()}" unless you pass ` +
+					"-A/--user-agent. Some sites bind cookies to the client that " +
+					"received them and may reject them from trawl.\n",
+			);
+		}
+	}
+	stderr(
+		`Reminder: ${file} still contains every cookie, including sign-in ` +
+			"cookies. Delete it now that the import is done.\n",
+	);
 	return 0;
 }
 

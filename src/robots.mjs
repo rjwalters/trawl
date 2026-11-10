@@ -169,6 +169,58 @@ function describeError(err) {
 	);
 }
 
+// Error codes that may be named in a diagnostic when the request carried
+// cookies. Only a code is ever taken from such an error, and only one equal to
+// an entry here: an error's message, and anything else on it, can quote the
+// request's headers (Node's fetch puts an invalid `Cookie` value in its
+// message whole). Matched by equality, so a code that merely contains one of
+// these, or anything else, falls back to fixed text.
+export const SAFE_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"ECONNABORTED",
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"ETIMEDOUT",
+	"EHOSTUNREACH",
+	"ENETUNREACH",
+	"EHOSTDOWN",
+	"ENETDOWN",
+	"EPIPE",
+	"EPROTO",
+	"ERR_INVALID_CHAR",
+	"ERR_TLS_CERT_ALTNAME_INVALID",
+	"CERT_HAS_EXPIRED",
+	"DEPTH_ZERO_SELF_SIGNED_CERT",
+	"SELF_SIGNED_CERT_IN_CHAIN",
+	"UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+	"UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+	"UND_ERR_SOCKET",
+	"UND_ERR_CLOSED",
+	"UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_HEADERS_TIMEOUT",
+	"UND_ERR_BODY_TIMEOUT",
+	"UND_ERR_HEADERS_OVERFLOW",
+	"UND_ERR_RES_CONTENT_LENGTH_MISMATCH",
+]);
+
+// The fixed detail used when no allowlisted code is available.
+const REQUEST_FAILED = "request failed";
+
+// `err.cause.code`, else `err.code`, when it is an allowlisted code; else
+// `undefined`. Reads defensively: a getter that throws counts as no code.
+export function safeErrorCode(err) {
+	for (const read of [() => err?.cause?.code, () => err?.code]) {
+		try {
+			const code = read();
+			if (typeof code === "string" && SAFE_ERROR_CODES.has(code)) return code;
+		} catch {
+			// Not a code we can use.
+		}
+	}
+	return undefined;
+}
+
 // Fetch `<origin>/robots.txt` and evaluate it for `url`.
 //
 // Per RFC 9309 §2.3.1.3–4:
@@ -183,7 +235,10 @@ function describeError(err) {
 // never a cookie list, so this module stays cookie-agnostic. It is a secret
 // and goes nowhere but the header. Node's fetch drops the header on a
 // cross-origin redirect. To send a browser profile's cookies instead, pass
-// `fetch: requestFetch(context.request)` (below).
+// `fetch: requestFetch(context.request)` (below). When a `Cookie` header was
+// sent, a failure's `detail` is an allowlisted error code (SAFE_ERROR_CODES)
+// or the fixed "request failed", never text taken from the error; without
+// one it is described as it always was.
 //
 // `gate`, if given, wraps the moment the request is sent: it is called with a
 // `start` function and must call it (once) and return its result. This is how
@@ -212,6 +267,9 @@ export async function checkRobotsAllowed(url, options = {}) {
 	// Built from the origin, so userinfo in the page URL (which Node's fetch
 	// refuses outright) is neither sent nor echoed into a diagnostic.
 	const robotsUrl = `${target.origin}/robots.txt`;
+	const sendsCookie = typeof cookie === "string" && cookie !== "";
+	const detailOf = (err) =>
+		sendsCookie ? (safeErrorCode(err) ?? REQUEST_FAILED) : describeError(err);
 	const controller = new AbortController();
 	let timer;
 	let started = false;
@@ -220,7 +278,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 		started = true;
 		timer = setTimeout(() => controller.abort(), timeout);
 		const headers = userAgent ? { "User-Agent": userAgent } : {};
-		if (typeof cookie === "string" && cookie) headers.Cookie = cookie;
+		if (sendsCookie) headers.Cookie = cookie;
 		return fetchImpl(robotsUrl, {
 			headers,
 			redirect: "follow",
@@ -238,7 +296,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 			if (controller.signal.aborted) return timedOut();
 			return unreachable(robotsUrl, {
 				kind: "network-error",
-				detail: describeError(err),
+				detail: detailOf(err),
 			});
 		}
 		if (!response) {
@@ -263,7 +321,7 @@ export async function checkRobotsAllowed(url, options = {}) {
 			return unreachable(robotsUrl, {
 				kind: "read-error",
 				status,
-				detail: describeError(err),
+				detail: detailOf(err),
 			});
 		}
 	} finally {
@@ -286,12 +344,21 @@ export async function checkRobotsAllowed(url, options = {}) {
 //   a backstop, set a second later so it cannot win that race and be
 //   misreported as a network error.
 // - Never lets the browser's error text out: any failure becomes a fixed
-//   "request failed" (no `cause`), which is all the verdict then reports.
+//   "request failed" (no `cause`), carrying the original's `code` only when
+//   it is allowlisted (SAFE_ERROR_CODES), so the verdict reports that code
+//   (`ECONNREFUSED`, `ENOTFOUND`, ...) or "request failed" and nothing else.
+//   `ERR_INVALID_CHAR` here means a cookie in the profile's jar holds a
+//   character above U+00FF, which Playwright refuses to put in a header.
 // - Leaves 4xx/5xx to the caller (no `failOnStatusCode`) and follows up to
 //   20 redirects; Playwright re-attaches the jar's cookies per hop, as a
 //   browser does.
 export function requestFetch(request, { timeout = ROBOTS_TIMEOUT_MS } = {}) {
-	const failed = () => new Error("request failed");
+	const failed = (err) => {
+		const error = new Error(REQUEST_FAILED);
+		const code = safeErrorCode(err);
+		if (code) error.code = code;
+		return error;
+	};
 	const untilAborted = (promise, signal) => {
 		if (!signal) return promise;
 		if (signal.aborted) return Promise.reject(failed());
@@ -317,10 +384,10 @@ export function requestFetch(request, { timeout = ROBOTS_TIMEOUT_MS } = {}) {
 		let response;
 		try {
 			response = await untilAborted(pending, signal);
-		} catch {
+		} catch (err) {
 			// Abandoned (aborted): dispose of the response should it still arrive.
 			pending.then((r) => r?.dispose?.()).catch(() => {});
-			throw failed();
+			throw failed(err);
 		}
 		const dispose = async () => {
 			try {
@@ -334,9 +401,9 @@ export function requestFetch(request, { timeout = ROBOTS_TIMEOUT_MS } = {}) {
 		try {
 			ok = Boolean(response.ok());
 			status = Number(response.status());
-		} catch {
+		} catch (err) {
 			await dispose();
-			throw failed();
+			throw failed(err);
 		}
 		return {
 			ok,
@@ -347,8 +414,8 @@ export function requestFetch(request, { timeout = ROBOTS_TIMEOUT_MS } = {}) {
 						Promise.resolve().then(() => response.text()),
 						signal,
 					);
-				} catch {
-					throw failed();
+				} catch (err) {
+					throw failed(err);
 				} finally {
 					await dispose();
 				}

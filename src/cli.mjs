@@ -101,6 +101,7 @@ Options:
                             --profile)
       --har-omit-content   Record HAR metadata only, no response bodies
                             (cookie headers and values are still recorded)
+      --har-redact         Redact cookie and credential header values in the HAR
       --executable-path <p>  Chromium binary to use
       --screenshot <file>  Also write a PNG screenshot to this path
       --full-page          Screenshot the whole scroll height
@@ -129,7 +130,7 @@ Options:
       --cookies <file>     Send the cookies from a HAR, a Netscape
                             cookies.txt or a copy-as-cURL command with this
                             one fetch; no profile or cookie store is written
-                            (but --har records them). Filtered as cookies
+                            (--har records them unless --har-redact). Filtered as cookies
                             import is (below: same defaults, and --domain,
                             --allow, --include-auth work here too). Prints
                             names/domains/expiry to stderr under -S, or when
@@ -276,6 +277,7 @@ export function parseArgs(argv) {
 			arg === "--version" ||
 			arg === "--show-status" ||
 			arg === "--har-omit-content" ||
+			arg === "--har-redact" ||
 			arg === "--full-page" ||
 			arg === "--ignore-robots" ||
 			arg === "--no-readability" ||
@@ -366,6 +368,11 @@ export async function main(argv, deps = {}) {
 			: validateMinInterval(args["--min-interval"], "--min-interval");
 	// Same up-front rule for the click list (empty selectors and the like).
 	const click = args.clicks ? normalizeClickSteps(args.clicks) : undefined;
+	// Playwright writes a zip archive for a .zip path; redaction rewrites JSON.
+	if (args["--har-redact"] && !args["--har"]) throw new Error("--har-redact requires --har");
+	if (args["--har-redact"] && /\.zip$/i.test(args["--har"])) {
+		throw new Error("--har-redact does not support a .zip --har path; use a .har or .json file");
+	}
 	const profileDir = args["--profile"] ?? (deps.env ?? process.env).TRAWL_PROFILE_DIR;
 	// And for --cookies: a bad file, or one with nothing usable left, fails
 	// here, before robots.txt, pacing or any browser launch.
@@ -389,6 +396,7 @@ export async function main(argv, deps = {}) {
 		executablePath: args["--executable-path"],
 		har: args["--har"],
 		harOmitContent: Boolean(args["--har-omit-content"]),
+		harRedact: Boolean(args["--har-redact"]),
 		screenshot: args["--screenshot"],
 		fullPage: !!args["--full-page"],
 		ignoreRobots: args["--ignore-robots"] === true,
@@ -492,9 +500,10 @@ function loadFetchCookies(args, { profileDir, stderr }) {
 	// The HAR is a full network trace: it keeps each request's Cookie header
 	// and parsed cookies, values included (--har-omit-content drops bodies
 	// only). Always said, -S or not; names the HAR file, never a value.
-	if (har) {
+	// With --har-redact the values are scrubbed, so the warning would be false.
+	if (har && !args["--har-redact"]) {
 		stderr(
-			`trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies\n`,
+			`trawl: warning: --har records request cookies, values included; ${har} will contain the cookies from --cookies (add --har-redact to redact them)\n`,
 		);
 	}
 	return accepted;

@@ -1,6 +1,6 @@
 // Render a URL in headless Chromium and extract it in a requested shape.
 
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { chromium } from "playwright-core";
 import TurndownService from "turndown";
@@ -28,6 +28,47 @@ import {
 } from "./robots.mjs";
 
 export { CooldownError };
+
+const REDACTED = "[redacted]";
+const REDACT_HEADERS = new Set([
+	"cookie",
+	"set-cookie",
+	"authorization",
+	"proxy-authorization",
+]);
+
+// Blank credential values in a parsed HAR (mutates and returns it): the
+// Cookie / Set-Cookie / Authorization / Proxy-Authorization headers
+// (case-insensitive name) and every request/response cookies[] value. Names
+// are kept so the trace stays readable.
+export function redactHar(har) {
+	for (const entry of har?.log?.entries ?? []) {
+		for (const part of [entry?.request, entry?.response]) {
+			for (const h of part?.headers ?? []) {
+				if (REDACT_HEADERS.has(String(h?.name).toLowerCase())) h.value = REDACTED;
+			}
+			for (const c of part?.cookies ?? []) c.value = REDACTED;
+		}
+	}
+	return har;
+}
+
+// Rewrite a HAR file in place with credentials redacted. Fails closed: if the
+// file cannot be read, parsed or rewritten it is deleted and the error thrown,
+// so a requested redaction never leaves an unredacted HAR behind.
+export function redactHarFile(path) {
+	try {
+		const har = redactHar(JSON.parse(readFileSync(path, "utf8")));
+		writeFileSync(path, JSON.stringify(har, null, 2));
+	} catch (err) {
+		try {
+			rmSync(path, { force: true });
+		} catch {}
+		throw new Error(
+			`could not redact HAR ${path} (file removed): ${err instanceof Error ? err.message : err}`,
+		);
+	}
+}
 
 export const FORMATS = ["text", "html", "links", "title", "markdown"];
 
@@ -815,6 +856,21 @@ export async function render(url, options = {}) {
 		// Only set on the ephemeral (non-`--profile`) path — see the comment
 		// above `context`.
 		if (browser) await browser.close();
-		if (closeError) throw closeError;
+		if (closeError) {
+			// The context failed to close, so the HAR may be partial or absent;
+			// never leave an unredacted one when redaction was requested.
+			if (opts.har && opts.harRedact) rmSync(opts.har, { force: true });
+			throw closeError;
+		}
+		if (opts.har && opts.harRedact && context) {
+			if (ok) redactHarFile(opts.har);
+			else {
+				try {
+					redactHarFile(opts.har);
+				} catch {
+					// An error is already propagating; the unredacted file is gone.
+				}
+			}
+		}
 	}
 }

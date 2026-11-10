@@ -12,12 +12,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	AUTH_COOKIES,
+	addCookiesFailure,
 	browserWouldReject,
 	CookieParseError,
+	describeExpiry,
 	filterCookies,
 	parseCookies,
+	plural,
+	printable,
 	sourceUserAgent,
 	summarize,
+	whyNoneLeft,
 } from "./cookies.mjs";
 import {
 	DEFAULT_MIN_INTERVAL_MS,
@@ -117,6 +122,16 @@ Options:
                             $TRAWL_PROFILE_DIR there either). A plain fetch
                             stays isolated (no persistence) unless you pass
                             --profile/$TRAWL_PROFILE_DIR here too.
+      --cookies <file>     Send the cookies from a HAR, a Netscape
+                            cookies.txt or a copy-as-cURL command with this
+                            one fetch; nothing is saved. Filtered as cookies
+                            import is (below: same defaults, and --domain,
+                            --allow, --include-auth work here too). Prints
+                            names/domains/expiry to stderr under -S, or when
+                            any were dropped; never values. Not with
+                            --profile/$TRAWL_PROFILE_DIR: use cookies import
+                            to keep them. robots.txt is still fetched
+                            without them.
       --no-auth-check      Skip login-wall detection (see exit code 3 below)
   -S, --show-status        Print HTTP status + final URL to stderr
   -h, --help               Show this help
@@ -135,6 +150,7 @@ Cookie import (trawl cookies import <file>):
                             are left, nothing is written and the exit code
                             is 1.
                             Delete the source file afterwards.
+                            These three filters also apply to --cookies:
       --domain <host>      Only cookies that would be sent to this host
       --allow <names>      Only these cookie names (comma-separated)
       --include-auth       Keep sign-in cookies too
@@ -150,6 +166,8 @@ Examples:
   trawl login https://example.com --profile ~/.trawl/example
   trawl https://example.com --profile ~/.trawl/example
   trawl cookies import cookies.txt --profile ~/.trawl/example \\
+        --domain example.com
+  trawl https://example.com/account --cookies cookies.txt \\
         --domain example.com
 
 Cooldowns: when a page answers 429 or 503, trawl records a per-origin
@@ -192,6 +210,9 @@ const VALUED = new Set([
 	"--min-interval",
 	"--click",
 	"--then-wait",
+	"--cookies",
+	"--domain",
+	"--allow",
 ]);
 
 // `--click` repeats, and each `--then-wait` belongs to the `--click` right
@@ -255,7 +276,8 @@ export function parseArgs(argv) {
 			arg === "--no-readability" ||
 			arg === "--no-auth-check" ||
 			arg === "--no-pacing" ||
-			arg === "--ignore-cooldown"
+			arg === "--ignore-cooldown" ||
+			arg === "--include-auth"
 		) {
 			out[arg] = true;
 			continue;
@@ -285,7 +307,9 @@ export function parseViewport(value) {
 	return { width, height };
 }
 
-export async function main(argv) {
+// `deps` (render, env, stderr) is a test seam, as in runLogin; the CLI entry
+// point below never passes it.
+export async function main(argv, deps = {}) {
 	// The subcommands. Checked before parseArgs so the URL path below stays
 	// exactly as it was; a URL can never be the bare string "mcp"/"login"
 	// because every URL trawl accepts carries a scheme.
@@ -337,8 +361,15 @@ export async function main(argv) {
 			: validateMinInterval(args["--min-interval"], "--min-interval");
 	// Same up-front rule for the click list (empty selectors and the like).
 	const click = args.clicks ? normalizeClickSteps(args.clicks) : undefined;
+	const profileDir = args["--profile"] ?? (deps.env ?? process.env).TRAWL_PROFILE_DIR;
+	// And for --cookies: a bad file, or one with nothing usable left, fails
+	// here, before robots.txt, pacing or any browser launch.
+	const cookies = loadFetchCookies(args, {
+		profileDir,
+		stderr: deps.stderr ?? ((s) => process.stderr.write(s)),
+	});
 
-	const result = await render(args._[0], {
+	const result = await (deps.render ?? render)(args._[0], {
 		format,
 		readability: !args["--no-readability"],
 		selector: args["--selector"],
@@ -362,7 +393,8 @@ export async function main(argv) {
 		// the next) unless the caller opts in with --profile/$TRAWL_PROFILE_DIR.
 		// Pass --profile ~/.trawl/profile (the same default `trawl login`
 		// used) to pick the saved session back up.
-		profileDir: args["--profile"] ?? process.env.TRAWL_PROFILE_DIR,
+		profileDir,
+		...(cookies ? { cookies } : {}),
 		authCheck: !args["--no-auth-check"],
 		pacing: !args["--no-pacing"],
 		ignoreCooldown: args["--ignore-cooldown"] === true,
@@ -394,6 +426,66 @@ export async function main(argv) {
 	return result.status && result.status >= 400 ? 22 : 0;
 }
 
+// The flags that only mean something next to --cookies on a fetch.
+const COOKIE_FILTER_FLAGS = ["--domain", "--allow", "--include-auth"];
+
+// `trawl <url> --cookies <file>`: the cookies for this one fetch, or
+// `undefined` without --cookies. Same parsing and filtering as `trawl cookies
+// import` (sign-in cookies dropped unless --include-auth, expired dropped,
+// cookies the browser would refuse skipped by name), but nothing is written
+// anywhere and session cookies keep `expires: -1`: the context is ephemeral,
+// so there is no store for them to fall out of.
+//
+// No value is ever printed: the stderr summary (only under -S/--show-status,
+// or when something was dropped or skipped) carries names, domains and
+// expiry. Zero survivors throws, so main() exits 1 before any request.
+function loadFetchCookies(args, { profileDir, stderr }) {
+	const file = args["--cookies"];
+	if (file === undefined) {
+		const given = COOKIE_FILTER_FLAGS.find((f) => args[f] !== undefined);
+		if (given) throw new Error(`${given} requires --cookies`);
+		return undefined;
+	}
+	// --cookies promises to persist nothing, and a profile would keep them.
+	if (profileDir) {
+		const source = args["--profile"] !== undefined ? "--profile" : "$TRAWL_PROFILE_DIR";
+		throw new Error(
+			`--cookies cannot be combined with ${source}` +
+				(source === "$TRAWL_PROFILE_DIR" ? " (unset it for this run)" : "") +
+				'; to keep cookies in a profile use "trawl cookies import"',
+		);
+	}
+	if (!file) throw new Error("--cookies expects a file, e.g. --cookies cookies.txt");
+	const { allow, domain } = cookieFilterFlags(args);
+	const { parsed } = readCookieSource(file);
+	const { accepted, summary, dropped, why } = selectCookies(parsed, {
+		domain,
+		allow,
+		includeAuth: args["--include-auth"] === true,
+		now: Date.now(),
+		verb: "use",
+	});
+	if (summary.kept.length === 0) {
+		stderr(dropped.join(""));
+		throw new Error(`no cookies left to use from ${file}: ${why()}`);
+	}
+	if (args["--show-status"] || dropped.length > 0) {
+		stderr(
+			`Using ${plural(summary.kept.length, "cookie")} from ${file} for this fetch only (not saved):\n` +
+				summary.kept
+					.map(
+						(c) =>
+							`  ${printable(c.name)}\t${printable(c.domain)}\t${
+								c.expires === -1 ? "session" : describeExpiry(c.expires)
+							}\n`,
+					)
+					.join("") +
+				dropped.join(""),
+		);
+	}
+	return accepted;
+}
+
 // `trawl login <origin>` — open a *headed* browser against a persistent
 // profile directory, let a human sign in, and close. Because the profile is
 // persistent, nothing extra needs to be saved on close: the same directory
@@ -405,6 +497,9 @@ export async function main(argv) {
 export async function runLogin(argv, deps = {}) {
 	const env = deps.env ?? process.env;
 	const args = parseArgs(argv);
+	// parseArgs knows the fetch-only cookie flags; login takes none of them.
+	const fetchOnly = ["--cookies", ...COOKIE_FILTER_FLAGS].find((f) => args[f] !== undefined);
+	if (fetchOnly) throw new Error(`Unknown option: ${fetchOnly}`);
 
 	const origin = args._[0];
 	if (!origin) {
@@ -467,9 +562,9 @@ export async function runCookies(argv, deps = {}) {
 	);
 }
 
-// Its own small parser, not parseArgs: these flags mean nothing to a fetch,
-// and adding them there would turn today's "Unknown option" for
-// `trawl <url> --domain x` into a silently ignored flag.
+// Its own small parser, not parseArgs: the two commands take different flag
+// sets (a fetch's --domain/--allow/--include-auth only work next to
+// --cookies, and --cookies is no import flag).
 const COOKIES_IMPORT_VALUED = new Set(["--profile", "--domain", "--allow", "--executable-path"]);
 const COOKIES_IMPORT_BOOLEAN = new Set(["--include-auth", "--help"]);
 
@@ -513,65 +608,84 @@ export function browserFamily(ua) {
 	return "another client";
 }
 
-// Names and domains come from the input file: strip control characters so a
-// crafted file cannot drive the terminal.
-function printable(s) {
-	return String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
-}
-
-// How long an imported session cookie (no expiry of its own) is kept.
+// How long an imported session cookie (no expiry of its own) is kept. Import
+// only: a one-off --cookies fetch persists nothing, so its session cookies
+// stay session cookies.
 const SESSION_COOKIE_TTL_S = 7 * 86400;
 
-function describeExpiry(expires) {
-	return new Date(expires * 1000).toISOString().replace(/\.000Z$/, "Z");
-}
-
-function plural(n, word) {
-	return `${n} ${word}${n === 1 ? "" : "s"}`;
-}
-
-// Browser errors never reach the user during an import: Playwright's messages
-// can quote the cookie they reject, raw or encoded, and no substring test can
-// prove an arbitrary message value-free. Each line below is an exact
-// `addCookies` first line known to quote nothing, matched by equality and
-// replaced by our own text; anything else gets the fixed message alone.
-const KNOWN_WRITE_ERRORS = new Map([
-	[
-		"browserContext.addCookies: Protocol error (Storage.setCookies): Invalid cookie fields",
-		"the browser refused a cookie, and so the whole batch",
-	],
-	[
-		"browserContext.addCookies: Target page, context or browser has been closed",
-		"the browser closed unexpectedly",
-	],
-	["Target page, context or browser has been closed", "the browser closed unexpectedly"],
-]);
-
 function cookieWriteError(err, profileDir) {
-	const line = String(err?.message ?? "").split("\n")[0];
-	const known = KNOWN_WRITE_ERRORS.get(line);
+	const known = addCookiesFailure(err);
 	return new Error(
 		`could not write cookies to ${profileDir}; nothing was imported${known ? ` (${known})` : ""}`,
 	);
 }
 
-// Why an import has nothing left, naming the filter that actually removed the
-// cookies (and the flag that would keep sign-in ones).
-function whyNoneLeft(parsedCount, result, refusedCount, { domain, allow }) {
-	if (parsedCount === 0) return "the file holds no cookies";
-	const flags = [domain && "--domain", allow && "--allow"].filter(Boolean).join(" and ");
-	if (result.matched === 0) return `no cookie matched ${flags}`;
-	const causes = [];
-	if (result.expiredDropped > 0) causes.push("expired");
-	if (result.authDropped.length > 0) causes.push("a sign-in cookie");
-	if (refusedCount > 0) causes.push("one the browser would refuse");
-	const scope = flags ? `cookie that matched ${flags}` : "cookie";
-	const list =
-		causes.length > 1 ? `${causes.slice(0, -1).join(", ")} or ${causes.at(-1)}` : causes[0];
-	return (
-		`every ${scope} was ${list}` +
-		(result.authDropped.length > 0 ? " (pass --include-auth to import sign-in cookies)" : "")
-	);
+// --domain / --allow, validated the same way for an import and a fetch.
+function cookieFilterFlags(args) {
+	let allow;
+	if (args["--allow"] !== undefined) {
+		allow = args["--allow"]
+			.split(",")
+			.map((n) => n.trim())
+			.filter(Boolean);
+		if (allow.length === 0) throw new Error("--allow expects cookie names, e.g. --allow a,b");
+	}
+	const domain = args["--domain"];
+	if (domain !== undefined && !domain.trim()) {
+		throw new Error("--domain expects a host, e.g. --domain example.com");
+	}
+	return { allow, domain };
+}
+
+// Read and parse a cookie source; no message ever quotes the file.
+// CookieParseError messages are fixed strings that never quote the input;
+// anything else a parser throws might, so it is replaced, not passed on.
+function readCookieSource(file, read = readFileSync) {
+	let text;
+	try {
+		text = read(file, "utf8");
+	} catch (err) {
+		throw new Error(`cannot read cookie source ${file}${err?.code ? ` (${err.code})` : ""}`);
+	}
+	let parsed;
+	try {
+		parsed = parseCookies(text);
+	} catch (err) {
+		if (err instanceof CookieParseError) throw err;
+		throw new Error(`could not parse cookie source ${file}`);
+	}
+	return { text, parsed };
+}
+
+// Filter a parsed list, then set aside what Chromium would refuse: one
+// refused cookie fails the whole addCookies batch. `dropped` is the
+// value-free report of what was removed; `verb` finishes its --include-auth
+// hint ("import" / "use").
+function selectCookies(parsed, { domain, allow, includeAuth, now, verb }) {
+	const result = filterCookies(parsed, { domain, allow, includeAuth, now });
+	const accepted = result.cookies.filter((c) => !browserWouldReject(c));
+	const refused = result.cookies.filter((c) => browserWouldReject(c));
+	const summary = summarize({ ...result, cookies: accepted });
+
+	const dropped = [];
+	if (summary.authDropped.count > 0) {
+		dropped.push(
+			`Dropped ${plural(summary.authDropped.count, "sign-in cookie")} ` +
+				`(${summary.authDropped.names.map(printable).join(", ")}); ` +
+				`pass --include-auth to ${verb} them.\n`,
+		);
+	}
+	if (summary.expiredDropped > 0) {
+		dropped.push(`Dropped ${plural(summary.expiredDropped, "expired cookie")}.\n`);
+	}
+	if (refused.length > 0) {
+		dropped.push(
+			`Skipped ${plural(refused.length, "cookie")} the browser would refuse ` +
+				`(${refused.map((c) => (c.name === "" ? "(unnamed)" : printable(c.name))).join(", ")}).\n`,
+		);
+	}
+	const why = () => whyNoneLeft(parsed.length, result, refused.length, { domain, allow, verb });
+	return { accepted, summary, dropped, why };
 }
 
 // `trawl cookies import <file> --profile <dir>` — parse a cookie export,
@@ -616,70 +730,23 @@ export async function runCookiesImport(argv, deps = {}) {
 			"trawl cookies import requires --profile <dir> (or $TRAWL_PROFILE_DIR)",
 		);
 	}
-	let allow;
-	if (args["--allow"] !== undefined) {
-		allow = args["--allow"]
-			.split(",")
-			.map((n) => n.trim())
-			.filter(Boolean);
-		if (allow.length === 0) throw new Error("--allow expects cookie names, e.g. --allow a,b");
-	}
-	const domain = args["--domain"];
-	if (domain !== undefined && !domain.trim()) {
-		throw new Error("--domain expects a host, e.g. --domain example.com");
-	}
+	const { allow, domain } = cookieFilterFlags(args);
 
-	let text;
-	try {
-		text = (deps.readFileSync ?? readFileSync)(file, "utf8");
-	} catch (err) {
-		throw new Error(`cannot read cookie source ${file}${err?.code ? ` (${err.code})` : ""}`);
-	}
-	// CookieParseError messages are fixed strings that never quote the input;
-	// anything else a parser throws might, so it is replaced, not passed on.
-	let parsed;
-	try {
-		parsed = parseCookies(text);
-	} catch (err) {
-		if (err instanceof CookieParseError) throw err;
-		throw new Error(`could not parse cookie source ${file}`);
-	}
+	const { text, parsed } = readCookieSource(file, deps.readFileSync);
 	const now = deps.now ?? Date.now();
-	const result = filterCookies(parsed, {
+	// Set aside before the profile is touched, and reported by name.
+	const { accepted, summary, dropped, why } = selectCookies(parsed, {
 		domain,
 		allow,
 		includeAuth: args["--include-auth"] === true,
 		now,
+		verb: "import",
 	});
-	// One cookie Chromium refuses fails the whole batch, so set those aside
-	// before the profile is touched and report them by name.
-	const accepted = result.cookies.filter((c) => !browserWouldReject(c));
-	const refused = result.cookies.filter((c) => browserWouldReject(c));
-	const summary = summarize({ ...result, cookies: accepted });
-
-	const dropped = [];
-	if (summary.authDropped.count > 0) {
-		dropped.push(
-			`Dropped ${plural(summary.authDropped.count, "sign-in cookie")} ` +
-				`(${summary.authDropped.names.map(printable).join(", ")}); ` +
-				"pass --include-auth to import them.\n",
-		);
-	}
-	if (summary.expiredDropped > 0) {
-		dropped.push(`Dropped ${plural(summary.expiredDropped, "expired cookie")}.\n`);
-	}
-	if (refused.length > 0) {
-		dropped.push(
-			`Skipped ${plural(refused.length, "cookie")} the browser would refuse ` +
-				`(${refused.map((c) => (c.name === "" ? "(unnamed)" : printable(c.name))).join(", ")}).\n`,
-		);
-	}
 
 	if (summary.kept.length === 0) {
 		stderr(
 			`${dropped.join("")}trawl: no cookies left to import from ${file}: ` +
-				`${whyNoneLeft(parsed.length, result, refused.length, { domain, allow })}; ` +
-				`${profileDir} was not touched.\n`,
+				`${why()}; ${profileDir} was not touched.\n`,
 		);
 		return 1;
 	}

@@ -24,11 +24,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   imported, never the browser's own text. Warns when a HAR or cURL source came from a different browser, and
   reminds you to delete the source file. `--profile` (or
   `$TRAWL_PROFILE_DIR`) is required. (#77)
+- **`trawl <url> --cookies <file>`.** Sends the cookies from a HAR,
+  `cookies.txt` or copy-as-cURL file with one fetch, without a profile, and
+  saves nothing: no profile, no temp file, and session cookies stay session
+  cookies (no 7-day expiry). Same filtering as `trawl cookies import`
+  (`--domain`, `--allow` and `--include-auth` now work on a fetch, but only
+  next to `--cookies`; without it each is an error). Prints names, domains
+  and expiry to stderr under `-S`, or when a cookie was dropped or skipped;
+  never values. A bad file, or one with no usable cookie left, exits 1 before
+  any request (robots.txt included) or browser launch. Rejected together with
+  `--profile` or `$TRAWL_PROFILE_DIR`, since a profile would keep the
+  cookies. The robots.txt request is still made without cookies. The MCP
+  server is unchanged. Library: `render(url, { cookies })`. (#78)
 
 ### Changed
 
 - **Minimum Node is now 22.** `engines.node` moves from `>=20` to `>=22`,
   matching the versions CI tests (22 and 24) now that Node 20 is end-of-life.
+
+### Fixed
+
+- **Cookie pre-check matches Chromium on four more rules.** The check that
+  sets aside cookies the browser would refuse (so one cannot sink the whole
+  batch) now also catches `__Http-` cookies that are not both `Secure` and
+  `HttpOnly`, `__Host-Http-` cookies that are not `HttpOnly`, a bare IPv6
+  domain such as `::1` (the bracketed `[::1]` is accepted), and a nameless
+  cookie whose value starts with `__Host-` or `__Secure-`. Each was checked
+  against real Chromium. A browser error whose `message` cannot even be read
+  now still gets the fixed message. (#78)
 
 ## [0.3.0] - 2026-11-03
 

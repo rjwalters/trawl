@@ -577,6 +577,7 @@ export async function runLogin(argv, deps = {}) {
 		(await import("./browser.mjs")).resolveHeadedExecutablePath;
 	const executablePath = resolveHeaded(
 		args["--executable-path"] ?? env.TRAWL_EXECUTABLE_PATH,
+		{ fromEnv: args["--executable-path"] === undefined && env.TRAWL_EXECUTABLE_PATH !== undefined },
 	);
 
 	const context = await launch(profileDir, { executablePath, headless: false });

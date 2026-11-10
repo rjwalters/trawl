@@ -24,9 +24,13 @@ npx --yes playwright install chromium --only-shell   # one-time browser fetch
 ```
 
 `trawl` depends on `playwright-core`, not the full `playwright` package, so
-installing it does not download a browser. It will use, in order: an
-explicit `--executable-path`, `$TRAWL_EXECUTABLE_PATH`, a cached
-`chrome-headless-shell`, then a system Chrome/Chromium.
+installing it does not download a browser. A fetch will use, in order: an
+explicit `--executable-path`, `$TRAWL_EXECUTABLE_PATH`, the browser
+`trawl login` recorded in the `--profile` directory (if any; see
+[Auth walls & signed-in sessions](#auth-walls--signed-in-sessions)), a cached
+`chrome-headless-shell`, then a system Chrome/Chromium. `trawl login` itself
+needs a browser that can open a window, so it never uses the headless shell
+(see below).
 
 ## Usage
 
@@ -322,16 +326,18 @@ window, even on macOS where the browser app keeps running.
 Login records the browser it used in the profile (`.trawl-browser`, mode
 0600, holding only that path and a timestamp), and a later
 `trawl <url> --profile <dir>` (or `trawl cookies import`) with that profile
-launches the same browser headless. A profile written by one Chromium
-version can't always be opened by another, and the cached headless shell is
-usually older than a system Chrome. An explicit `--executable-path` or
-`$TRAWL_EXECUTABLE_PATH` still overrides it.
+launches the same browser headless. This is a precaution: login usually
+runs a system Chrome newer than the cached headless shell, and Chromium
+doesn't promise that an older build reads a newer build's profile. An
+explicit `--executable-path` or `$TRAWL_EXECUTABLE_PATH` still overrides it.
 
 trawl uses a recorded path only if it is absolute and, after following
 symlinks, an executable regular file named like a Chrome/Chromium binary
 (`Google Chrome`, `Chromium`, `chrome`, `chrome-headless-shell`, …). It
 launches that resolved file. Any other marker (missing, unreadable,
-oversized, malformed, stale, or pointing elsewhere) is ignored, and the
+oversized, malformed, stale, pointing elsewhere, or (on macOS/Linux) owned
+by another user or writable by group or others, the marker itself or its
+profile directory) is ignored, and the
 browser is chosen exactly as without one. `trawl cookies import` reuses a
 recorded browser but never writes a marker; on a profile without one it
 uses the default headless shell.

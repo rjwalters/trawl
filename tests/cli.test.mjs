@@ -224,6 +224,7 @@ test("login with no --profile/TRAWL_PROFILE_DIR defaults to defaultProfileDir()"
 function fakeLoginDeps({ profileDir } = {}) {
 	const mkdirCalls = [];
 	const resolverCalls = [];
+	const resolverOpts = [];
 	const recorded = [];
 	const stderrLines = [];
 	const page = { goto: async () => {} };
@@ -245,8 +246,9 @@ function fakeLoginDeps({ profileDir } = {}) {
 				return context;
 			},
 			waitForUser: async () => {},
-			resolveHeadedExecutablePath: (explicit) => {
+			resolveHeadedExecutablePath: (explicit, opts) => {
 				resolverCalls.push(explicit);
+				resolverOpts.push(opts);
 				return explicit ?? "/fake/chrome";
 			},
 			recordProfileBrowser: (dir, exe) => recorded.push([dir, exe]),
@@ -254,6 +256,7 @@ function fakeLoginDeps({ profileDir } = {}) {
 		},
 		recorded,
 		resolverCalls,
+		resolverOpts,
 		mkdirCalls,
 		stderrLines,
 		gotoCalls,
@@ -633,6 +636,8 @@ test("login hands --executable-path, else TRAWL_EXECUTABLE_PATH, to the headed r
 	b.deps.env = { TRAWL_EXECUTABLE_PATH: "/env/chrome" };
 	await runLogin(["https://example.com", "--profile", "/tmp/p"], b.deps);
 	assert.deepEqual(b.resolverCalls, ["/env/chrome"]);
+	assert.deepEqual(a.resolverOpts, [{ fromEnv: false }], "explicit flag is not from env");
+	assert.deepEqual(b.resolverOpts, [{ fromEnv: true }], "env path is flagged so errors can name it");
 });
 
 test("login reuses the context's initial blank tab instead of opening a second", async () => {

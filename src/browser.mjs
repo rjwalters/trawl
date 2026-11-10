@@ -167,14 +167,18 @@ export class NoHeadedBrowserError extends Error {
 // is preferred over Playwright's Chrome for Testing build because it is
 // signed, so macOS Gatekeeper does not prompt on launch (#95). `explicit` is
 // --executable-path, else $TRAWL_EXECUTABLE_PATH (the caller resolves both).
+// `env.fromEnv` says `explicit` came from $TRAWL_EXECUTABLE_PATH, so an error
+// can name the variable to fix.
 export function resolveHeadedExecutablePath(explicit, env = {}) {
 	const exists = env.exists ?? existsSync;
+	const fromEnv = env.fromEnv === true;
 	const chosen = explicit ?? findSystemChrome(env) ?? findCachedFullChromium(env);
 	if (!chosen) throw new NoHeadedBrowserError();
 	if (isHeadlessShell(chosen)) {
 		throw new Error(
 			`${chosen} is chrome-headless-shell, which cannot open a window for trawl login. ` +
-				"Pass a full Chrome or Chromium with --executable-path.",
+				"Pass a full Chrome or Chromium with --executable-path" +
+				(fromEnv ? ", or unset or change $TRAWL_EXECUTABLE_PATH, which points at it." : "."),
 		);
 	}
 	if (!exists(chosen)) throw new Error(`Chromium binary not found at: ${chosen}`);
@@ -199,11 +203,13 @@ export class NoBrowserError extends Error {
 	}
 }
 
-// `trawl login` records the browser that wrote a profile, because a profile
-// written by one Chromium version cannot always be opened by another: the
-// cached headless shell (older) crashes on a profile a newer system Chrome
-// wrote ("Failed to read prefs in Local State"). Fetches and cookie imports
-// that use the profile then launch the same browser, headless.
+// `trawl login` records the browser that wrote a profile, and fetches and
+// cookie imports that use the profile launch that same browser, headless.
+// This is a precaution against version skew: login usually runs a system
+// Chrome that is newer than the cached headless shell, and Chromium makes no
+// promise that an older build reads a newer build's profile. (One crash was
+// seen during #95's development but did not reproduce: Chrome 157 writing
+// and shell 143 reading worked in every later run.)
 export const PROFILE_BROWSER_FILE = ".trawl-browser";
 
 // Holds only the browser path and when it was recorded, no user data; 0600
@@ -261,12 +267,21 @@ export function isLaunchableBrowser(p, fs, plat) {
 }
 
 // The browser recorded for `profileDir` (resolved real path), or null when
-// there is no usable marker: none, a directory, unreadable, oversized,
-// malformed, or a path launchableBrowser refuses. Every null falls back to
+// there is no usable marker: none, a directory, unreadable, oversized, not
+// privately owned (it or its directory), malformed, or a path
+// launchableBrowser refuses. Every null falls back to
 // the default resolution unchanged.
+// POSIX only: owned by `uid` and not writable by group or others. Windows
+// has no such mode bits, so it always passes there.
+function ownedPrivately(st, uid, plat) {
+	if (plat === "win32" || uid === undefined) return true;
+	return st.uid === uid && (st.mode & 0o022) === 0;
+}
+
 export function profileBrowser(
 	profileDir,
 	fs = { readFileSync, statSync, realpathSync, accessSync },
+	{ uid = process.getuid?.(), plat = platform() } = {},
 ) {
 	if (!profileDir) return null;
 	let executablePath;
@@ -274,6 +289,13 @@ export function profileBrowser(
 		const marker = path.join(profileDir, PROFILE_BROWSER_FILE);
 		const st = fs.statSync(marker);
 		if (!st.isFile() || st.size > MAX_MARKER_BYTES) return null;
+		// Someone else could have chosen this browser: ignore the marker if it,
+		// or the profile directory holding it, belongs to another user or is
+		// writable by group or others. A 0600 marker in a group-writable
+		// directory can still be replaced by the group, hence the directory.
+		if (!ownedPrivately(st, uid, plat) || !ownedPrivately(fs.statSync(profileDir), uid, plat)) {
+			return null;
+		}
 		({ executablePath } = JSON.parse(fs.readFileSync(marker, "utf8")));
 	} catch {
 		return null;

@@ -93,11 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and fails with install instructions when nothing headed exists. Login
   records that browser in the profile (`.trawl-browser`, 0600, path and
   timestamp only), and fetches and cookie imports with that profile launch
-  it headless, because the older headless shell crashes on a profile a newer
-  Chrome wrote. This changes which browser `--profile` fetches use for a
+  it headless, as a precaution against version skew (login usually runs a
+  system Chrome newer than the cached headless shell, and Chromium doesn't
+  promise an older build reads a newer build's profile). This changes which browser `--profile` fetches use for a
   login-written profile. A recorded path is used only if it is absolute and,
   after following symlinks, an executable regular file named like a
-  Chrome/Chromium binary; trawl launches the resolved file. Any other marker
+  Chrome/Chromium binary, and on macOS/Linux only if the marker and its
+  profile directory are owned by the current user and not writable by group
+  or others; trawl launches the resolved file. Any other marker
   is ignored and the browser is chosen exactly as before. An explicit path or
   `$TRAWL_EXECUTABLE_PATH` still wins. `trawl login` now creates new profile
   directories `0700`, as `cookies import` already did. A profile directory

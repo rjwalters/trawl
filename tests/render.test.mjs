@@ -1339,3 +1339,135 @@ test("an unwritable state dir warns on stderr and still renders", opts, async ()
 		["/robots.txt", "/page.html"],
 	);
 });
+
+// --- cookies on the robots.txt request (#79) ---
+
+const robotsCookie = (name, value, extra = {}) => ({
+	name,
+	value,
+	domain: "127.0.0.1",
+	path: "/",
+	expires: -1,
+	httpOnly: false,
+	secure: false,
+	...extra,
+});
+
+function robotsSpy() {
+	const seen = [];
+	const fetch = async (url, init) => {
+		seen.push([url, { ...init.headers }]);
+		return { ok: true, status: 200, text: async () => "User-agent: *\nDisallow:\n" };
+	};
+	return { seen, fetch };
+}
+
+test("the plain path sends one robots.txt request and no Cookie header", async () => {
+	const { seen, fetch } = robotsSpy();
+	await assert.rejects(
+		() => render("http://127.0.0.1:1/page", { ...NO_BROWSER, fetch, userAgent: "trawl/x" }),
+		/Chromium binary not found/,
+	);
+	assert.deepEqual(seen, [["http://127.0.0.1:1/robots.txt", { "User-Agent": "trawl/x" }]]);
+});
+
+test("cookies: the robots.txt request carries only the cookies that match it", async () => {
+	const { seen, fetch } = robotsSpy();
+	const cookies = [
+		robotsCookie("ok", "1"),
+		robotsCookie("other", "2", { domain: "example.com" }),
+		robotsCookie("secure", "3", { secure: true }),
+		robotsCookie("path", "4", { path: "/app" }),
+		robotsCookie("exact", "5", { path: "/robots.txt" }),
+	];
+	await assert.rejects(
+		() => render("http://127.0.0.1:1/app/page", { ...NO_BROWSER, fetch, cookies, userAgent: "trawl/x" }),
+		/Chromium binary not found/,
+	);
+	assert.deepEqual(seen, [
+		["http://127.0.0.1:1/robots.txt", { "User-Agent": "trawl/x", Cookie: "exact=5; ok=1" }],
+	]);
+});
+
+test("cookies: when none match robots.txt, no Cookie header at all", async () => {
+	const { seen, fetch } = robotsSpy();
+	const cookies = [robotsCookie("other", "2", { domain: "example.com" })];
+	await assert.rejects(
+		() => render("http://127.0.0.1:1/page", { ...NO_BROWSER, fetch, cookies, userAgent: "trawl/x" }),
+		/Chromium binary not found/,
+	);
+	assert.deepEqual(seen, [["http://127.0.0.1:1/robots.txt", { "User-Agent": "trawl/x" }]]);
+});
+
+test("cookies: a denial drops the 'no cookies' note only when cookies were sent", async () => {
+	const s = await serveRobots(status(503));
+	try {
+		await assert.rejects(
+			() => render(`${s.origin}/page`, { ...NO_BROWSER, cookies: [robotsCookie("k", "v4lu3-SECRET")] }),
+			(err) => {
+				assert.match(err.message, /returned HTTP 503 \(server error\)/);
+				assert.doesNotMatch(err.message, /browser-profile cookies/);
+				assert.ok(!err.message.includes("v4lu3-SECRET") && !String(err.stack).includes("v4lu3-SECRET"));
+				assert.equal(err.cause, undefined);
+				return true;
+			},
+		);
+		// Nothing matched: the request was cookie-less, and the note stays.
+		await assert.rejects(
+			() => render(`${s.origin}/page`, { ...NO_BROWSER, cookies: [robotsCookie("k", "v", { domain: "example.com" })] }),
+			UNREACHABLE_503,
+		);
+	} finally {
+		await s.close();
+	}
+});
+
+// Node's fetch is what follows a robots.txt redirect on the --cookies path.
+// It must not carry the Cookie header to a different origin: checked with
+// real servers, for a different host and for a different port.
+test("cookies: the Cookie header is not forwarded on a cross-origin robots.txt redirect", async () => {
+	const seen = [];
+	const listen = (name, handler) =>
+		new Promise((resolve) => {
+			const server = createServer((req, res) => {
+				seen.push([name, req.url, req.headers.cookie ?? null]);
+				handler(req, res);
+			});
+			server.listen(0, "127.0.0.1", () => resolve(server));
+		});
+	const target = await listen("target", (_req, res) => {
+		res.writeHead(200, { "content-type": "text/plain" });
+		res.end("User-agent: *\nDisallow:\n");
+	});
+	const tport = target.address().port;
+	const source = await listen("source", (req, res) => {
+		const to = req.headers.host.startsWith("localhost")
+			? `http://127.0.0.1:${tport}/robots.txt`
+			: `http://localhost:${tport}/robots.txt`;
+		res.writeHead(302, { location: to });
+		res.end();
+	});
+	const sport = source.address().port;
+	try {
+		for (const [host, domain] of [["127.0.0.1", "127.0.0.1"], ["localhost", "localhost"]]) {
+			await assert.rejects(
+				() =>
+					render(`http://${host}:${sport}/page`, {
+						...NO_BROWSER,
+						pacing: false,
+						cookies: [robotsCookie("k", "v", { domain })],
+					}),
+				/Chromium binary not found/,
+			);
+		}
+		assert.deepEqual(seen, [
+			["source", "/robots.txt", "k=v"],
+			["target", "/robots.txt", null],
+			["source", "/robots.txt", "k=v"],
+			["target", "/robots.txt", null],
+		]);
+	} finally {
+		await new Promise((r) => source.close(r));
+		await new Promise((r) => target.close(r));
+	}
+});

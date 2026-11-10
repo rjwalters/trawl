@@ -10,6 +10,7 @@ import {
 	evaluateRobots,
 	parseRobotsTxt,
 	productToken,
+	requestFetch,
 	robotsDenialMessage,
 	selectGroup,
 } from "../src/robots.mjs";
@@ -479,4 +480,139 @@ test("each retrieval failure names robots.txt, its cause, cookies, and the overr
 		assert.match(message, /no browser-profile cookies/);
 		assert.match(message, /Use --ignore-robots to override\.$/);
 	}
+});
+
+// --- the Cookie header and the context.request adapter (#79) ---
+
+test("a cookie string is sent as the Cookie header, and only when given", async () => {
+	const seen = [];
+	const fetch = async (_url, init) => {
+		seen.push(init.headers);
+		return ok("User-agent: *\nDisallow:\n");
+	};
+	await checkRobotsAllowed("https://example.com/", { userAgent: UA, fetch, cookie: "a=1; b=2" });
+	await checkRobotsAllowed("https://example.com/", { userAgent: UA, fetch });
+	await checkRobotsAllowed("https://example.com/", { userAgent: UA, fetch, cookie: "" });
+	assert.deepEqual(seen, [
+		{ "User-Agent": UA, Cookie: "a=1; b=2" },
+		{ "User-Agent": UA },
+		{ "User-Agent": UA },
+	]);
+});
+
+test("a cookie never reaches the verdict or the denial message", async () => {
+	const secret = "s3cr3t-c00kie-VALUE";
+	const verdicts = [
+		await checkRobotsAllowed("https://example.com/", {
+			cookie: `k=${secret}`,
+			fetch: async () => ({ ok: false, status: 503, text: async () => "" }),
+		}),
+		await checkRobotsAllowed("https://example.com/", {
+			cookie: `k=${secret}`,
+			fetch: async () => {
+				throw new Error("boom");
+			},
+		}),
+	];
+	for (const v of verdicts) {
+		assert.equal(v.allowed, false);
+		const message = robotsDenialMessage(v, { sentCookies: true });
+		assert.ok(!JSON.stringify(v).includes(secret));
+		assert.ok(!message.includes(secret), message);
+		assert.doesNotMatch(message, /no browser-profile cookies/);
+		assert.match(message, /^robots\.txt is unreachable: .*Use --ignore-robots to override\.$/);
+	}
+});
+
+// A stand-in for Playwright's APIRequestContext / APIResponse.
+function fakeRequest({ status = 200, body = "", get, text } = {}) {
+	const calls = [];
+	const disposed = [];
+	const request = {
+		get: async (url, options) => {
+			calls.push([url, options]);
+			if (get) return get(url, options);
+			return {
+				ok: () => status >= 200 && status <= 299,
+				status: () => status,
+				text: text ?? (async () => body),
+				dispose: async () => {
+					disposed.push(url);
+				},
+			};
+		},
+	};
+	return { request, calls, disposed };
+}
+
+test("requestFetch returns the fetch shape and passes the User-Agent explicitly", async () => {
+	const { request, calls, disposed } = fakeRequest({ body: "User-agent: *\nDisallow: /x\n" });
+	const v = await checkRobotsAllowed("https://example.com/x/y", { userAgent: UA, fetch: requestFetch(request) });
+	assert.deepEqual(v, { allowed: false, rule: "Disallow: /x", crawlDelay: null });
+	assert.equal(calls.length, 1);
+	const [url, options] = calls[0];
+	assert.equal(url, "https://example.com/robots.txt");
+	assert.deepEqual(options.headers, { "User-Agent": UA });
+	assert.equal(options.failOnStatusCode, false);
+	assert.equal(options.maxRedirects, 20);
+	// A backstop only, later than checkRobotsAllowed's own timer.
+	assert.equal(options.timeout, 11000);
+	assert.deepEqual(disposed, ["https://example.com/robots.txt"]);
+});
+
+test("requestFetch keeps the status rules: 4xx allows, 5xx is a server error", async () => {
+	for (const [status, expected] of [
+		[404, { allowed: true, rule: null, crawlDelay: null }],
+		[429, { allowed: true, rule: null, crawlDelay: null }],
+	]) {
+		const { request } = fakeRequest({ status });
+		assert.deepEqual(await checkRobotsAllowed("https://example.com/", { fetch: requestFetch(request) }), expected);
+	}
+	const { request } = fakeRequest({ status: 503 });
+	const v = await checkRobotsAllowed("https://example.com/", { fetch: requestFetch(request) });
+	assert.deepEqual(v.failure, { url: "https://example.com/robots.txt", kind: "server-error", status: 503 });
+});
+
+test("a hung context request is a timeout, not a network error", async () => {
+	const { request } = fakeRequest({ get: () => new Promise(() => {}) });
+	const v = await checkRobotsAllowed("https://example.com/", { timeout: 20, fetch: requestFetch(request) });
+	assert.equal(v.allowed, false);
+	assert.equal(v.failure.kind, "timeout");
+	// A body that hangs, too.
+	const slow = fakeRequest({ text: () => new Promise(() => {}) });
+	const w = await checkRobotsAllowed("https://example.com/", { timeout: 20, fetch: requestFetch(slow.request) });
+	assert.equal(w.failure.kind, "timeout");
+	assert.equal(slow.disposed.length, 1);
+});
+
+test("requestFetch never surfaces the browser's error text", async () => {
+	const secret = "s3cr3t-c00kie-VALUE";
+	const browserError = () => {
+		const err = new Error(`apiRequestContext.get: connect ECONNREFUSED; Cookie: k=${secret}`);
+		err.cause = { code: secret, message: secret };
+		err.code = secret;
+		return err;
+	};
+	const cases = [
+		fakeRequest({ get: () => Promise.reject(browserError()) }),
+		fakeRequest({ get: () => { throw browserError(); } }),
+		fakeRequest({ text: () => Promise.reject(browserError()) }),
+		fakeRequest({ get: async () => ({ ok: () => { throw browserError(); }, status: () => 200, dispose: async () => {} }) }),
+	];
+	for (const { request } of cases) {
+		const v = await checkRobotsAllowed("https://example.com/", { fetch: requestFetch(request) });
+		assert.equal(v.allowed, false);
+		assert.equal(v.failure.detail, "request failed");
+		assert.ok(!JSON.stringify(v).includes(secret));
+		assert.ok(!robotsDenialMessage(v, { sentCookies: true }).includes(secret));
+	}
+});
+
+test("without sentCookies the cookie note is kept verbatim", () => {
+	const verdict = { allowed: false, rule: null, failure: { url: "https://e.com/robots.txt", kind: "server-error", status: 503 } };
+	assert.equal(robotsDenialMessage(verdict), robotsDenialMessage(verdict, { sentCookies: false }));
+	assert.equal(
+		robotsDenialMessage(verdict, { sentCookies: true }),
+		"robots.txt is unreachable: https://e.com/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. Use --ignore-robots to override.",
+	);
 });

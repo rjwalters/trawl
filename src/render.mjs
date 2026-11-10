@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { chromium } from "playwright-core";
 import TurndownService from "turndown";
 import { resolveExecutablePath } from "./browser.mjs";
-import { addCookiesFailure } from "./cookies.mjs";
+import { addCookiesFailure, cookieHeaderFor } from "./cookies.mjs";
 import {
 	COOLDOWN_STATUSES,
 	CooldownError,
@@ -23,6 +23,7 @@ import {
 	ROBOTS_TIMEOUT_MS,
 	checkRobotsAllowed,
 	crawlDelayMs,
+	requestFetch,
 	robotsDenialMessage,
 } from "./robots.mjs";
 
@@ -507,7 +508,18 @@ export async function render(url, options = {}) {
 	// an unreachable robots.txt cannot block an explicit override either). A
 	// 5xx, network error, or timeout is a full disallow (RFC 9309 §2.3.1.4)
 	// and is reported as such rather than as a matched rule.
-	if (!opts.ignoreRobots && isHttpUrl(url)) {
+	//
+	// Which cookies the request carries depends on the path (#79):
+	//   - no cookies, no profile: none; Node fetch, before any browser work.
+	//   - `cookies` without `profileDir`: still Node fetch before the launch,
+	//     with a `Cookie` header of just the cookies that match
+	//     `<origin>/robots.txt` (none match: no header at all).
+	//   - `profileDir`: through the persistent context's `context.request`,
+	//     which shares the profile's cookie jar, so the browser launches
+	//     first (see `checkRobots` in the `try` below).
+	const robotsCheck = !opts.ignoreRobots && isHttpUrl(url);
+	const robotsViaProfile = robotsCheck && Boolean(opts.profileDir);
+	const checkRobots = async ({ fetch, cookie, sentCookies }) => {
 		const verdict = await checkRobotsAllowed(url, {
 			userAgent,
 			// Deliberately NOT coupled to `opts.timeout`. Playwright's convention
@@ -519,7 +531,8 @@ export async function render(url, options = {}) {
 			// `ROBOTS_TIMEOUT_MS` bounds this fetch independently at 10s — one
 			// fixed, sane budget.
 			timeout: ROBOTS_TIMEOUT_MS,
-			fetch: opts.fetch,
+			fetch,
+			...(cookie && { cookie }),
 			// Paced on the Crawl-delay stored by an earlier run (if any), since
 			// this run hasn't learned the current policy yet. A failed fetch
 			// records the attempt but keeps the stored delay.
@@ -529,17 +542,28 @@ export async function render(url, options = {}) {
 				gate: (start) => pacer.gate(start, { admit: () => admit() }),
 			}),
 		});
-		if (!verdict.allowed) throw new Error(robotsDenialMessage(verdict));
+		if (!verdict.allowed) {
+			throw new Error(robotsDenialMessage(verdict, { sentCookies }));
+		}
 		navCrawlDelayMs = crawlDelayMs(verdict.crawlDelay);
 		// Without pacing, honoring `Crawl-delay` means spacing the two requests
 		// this run makes — robots.txt, then the page. With pacing, the gate in
 		// front of the navigation enforces the same gap (and more).
 		if (!pacer && navCrawlDelayMs > 0) await sleep(navCrawlDelayMs);
+	};
+	if (robotsCheck && !robotsViaProfile) {
+		// A secret: it goes into the request header and nowhere else.
+		const cookie =
+			opts.cookies?.length > 0
+				? cookieHeaderFor(opts.cookies, `${new URL(url).origin}/robots.txt`)
+				: undefined;
+		await checkRobots({ fetch: opts.fetch, cookie, sentCookies: Boolean(cookie) });
 	}
 
 	// Under --ignore-robots there is no policy to honour, stored or fresh —
-	// only the minimum interval.
-	const navPolicy =
+	// only the minimum interval. Read when navigating, since on the
+	// `profileDir` path robots.txt is only fetched after the launch.
+	const navPolicy = () =>
 		navCrawlDelayMs !== undefined
 			? { crawlDelayMs: navCrawlDelayMs }
 			: { useStoredDelay: !opts.ignoreRobots };
@@ -549,7 +573,7 @@ export async function render(url, options = {}) {
 	const navigate = async (page, waitUntil, checkOpts) => {
 		const start = () => page.goto(url, { waitUntil, timeout: opts.timeout });
 		const gateAdmit = () => admit(checkOpts);
-		if (pacer) return pacer.gate(start, { ...navPolicy, admit: gateAdmit });
+		if (pacer) return pacer.gate(start, { ...navPolicy(), admit: gateAdmit });
 		gateAdmit();
 		return start();
 	};
@@ -603,7 +627,8 @@ export async function render(url, options = {}) {
 	// arrives — before goto() resolves, so a navigation that then times out
 	// waiting for networkidle, or a run that fails later on, still leaves the
 	// cooldown behind. Iframes and subresources are ignored, and robots.txt
-	// is fetched outside the browser, so neither ever lands here.
+	// is fetched outside the page (Node fetch, or `context.request` with a
+	// profile), so neither ever lands here.
 	const seenResponses = new WeakSet();
 	const onResponse = (response) => {
 		try {
@@ -654,6 +679,16 @@ export async function render(url, options = {}) {
 					`could not add cookies to the browser; the page was not fetched${known ? ` (${known})` : ""}`,
 				);
 			}
+		}
+		// The `profileDir` path's robots check, through the context so the
+		// profile's cookies go with it: after `addCookies`, so it uses the jar
+		// the page will. A denial, or an error from the pacing/cooldown gate,
+		// throws from here and the `finally` closes the context.
+		if (robotsViaProfile) {
+			await checkRobots({
+				fetch: requestFetch(context.request, { timeout: ROBOTS_TIMEOUT_MS }),
+				sentCookies: true,
+			});
 		}
 		page = await context.newPage();
 		page.on("response", onResponse);

@@ -17,7 +17,9 @@ had an `enum: [...FORMATS]` sitting directly above a hand-written `description`
 listing the same formats; adding `markdown` updated the enum and silently left
 the prose denying it. Derive from `FORMATS` (`FORMATS.join(", ")`) or import it.
 The README's usage block and MCP tool table are the remaining hand-maintained
-copies — check them against `node src/cli.mjs --help` when flags change.
+copies — `tests/readme.test.mjs` now enforces both (flags vs `--help`, tool
+arguments and `FORMATS` vs the MCP table); a failure names the flag or argument
+to update.
 
 **Detect "am I the entry point?" by real path, never by an `argv[1]` filename
 suffix.** A suffix test (`argv[1].endsWith("cli.mjs")`) fails for every

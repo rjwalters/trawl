@@ -906,6 +906,22 @@ test("render(): a CR/LF, NUL or control-character cookie is left out of robots.t
 	}
 });
 
+test("render(): `;` in a value or `=` in a name never reaches robots.txt, whole or mis-split", async () => {
+	const srv = await bytesServer();
+	try {
+		const { browserType } = fakeBrowser();
+		const cookies = [libCookie("lib", "LIBLEAK; injected=1"), libCookie("a=b", "LIBLEAK"), libCookie("ok", "fine")];
+		const result = await render(`${srv.origin}/page`, { ...LIB, browserType, cookies });
+		assert.equal(result.body, "Fixture");
+		const robots = srv.seen.filter((s) => s.url === "/robots.txt");
+		assert.equal(robots.length, 1);
+		assert.equal(robots[0].cookie.toString("latin1"), "ok=fine");
+		for (const s of srv.seen) assert.doesNotMatch(String(s.cookie?.toString("latin1")), /LIBLEAK|injected/);
+	} finally {
+		await srv.close();
+	}
+});
+
 test("render(): an injected fetch whose error quotes the Cookie header leaks none of it", async () => {
 	const cookies = [libCookie("k", AWKWARD), libCookie("k2", `${AWKWARD}-2`)];
 	const throwers = [

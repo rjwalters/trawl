@@ -8,14 +8,17 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { chromium } from "playwright-core";
 import { resolveExecutablePath } from "../src/browser.mjs";
 import { main, runLogin } from "../src/cli.mjs";
 import { createCooldownStore } from "../src/cooldown.mjs";
 import { CooldownError, render } from "../src/render.mjs";
+import { selfSignedCert } from "./selfsigned.mjs";
 
 let haveBrowser = true;
 try {
@@ -532,27 +535,124 @@ test("profileDir: a disallow closes the context and never opens a page", async (
 	]);
 });
 
+// Each injected failure carries the jar cookie's value in its message, its
+// stack and its cause (message, stack and code), so without the guard in
+// checkRobotsAllowed (a code from SAFE_ERROR_CODES or fixed text once a
+// Cookie header was sent) the value would reach the refusal (#93).
 test("profileDir: an unreachable robots.txt is refused, naming no cookie", async () => {
-	const secret = "SENTINEL-pr0f1le-err";
+	const quoting = (header, code) => {
+		const cause = new Error(`connect failed, request had Cookie: ${header}`);
+		cause.stack = `Error: ${header}\n    at ${header}`;
+		if (code) cause.code = code;
+		const err = new TypeError(`fetch failed: Cookie: ${header}`, { cause });
+		err.stack = `TypeError: fetch failed: ${header}\n    at ${header}`;
+		return err;
+	};
 	const cases = [
 		[() => robotsResponse(503), /returned HTTP 503 \(server error\)/],
 		[
-			() => {
-				throw new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }) });
+			(_url, init) => {
+				throw quoting(init.headers.Cookie);
+			},
+			/could not be fetched \(network error: request failed\)/,
+		],
+		[
+			(_url, init) => {
+				throw quoting(init.headers.Cookie, "ENOTFOUND");
 			},
 			/could not be fetched \(network error: ENOTFOUND\)/,
 		],
+		[
+			(_url, init) => {
+				throw quoting(init.headers.Cookie, `ENOTFOUND ${init.headers.Cookie}`);
+			},
+			/could not be fetched \(network error: request failed\)/,
+		],
+		[
+			(_url, init) => ({ ok: true, status: 200, text: async () => Promise.reject(quoting(init.headers.Cookie)) }),
+			/reading the body of .* failed \(request failed\)/,
+		],
 	];
 	for (const [onFetch, cause] of cases) {
-		const { result, events } = await renderProfile({ onFetch, jar: [jarCookie("k", secret)] });
-		assert.match(result.e?.message, /^robots\.txt is unreachable: http:\/\/127\.0\.0\.1:1\/robots\.txt /);
+		let sent;
+		const { result, events } = await renderProfile({
+			onFetch: (url, init) => {
+				sent = init.headers.Cookie;
+				return onFetch(url, init);
+			},
+			jar: [jarCookie("k", AWKWARD)],
+		});
+		assert.equal(sent, `k=${AWKWARD}`, "the jar cookie was sent");
+		assert.ok(result.e, "refused");
+		// First, so that a missing guard fails as the leak it is.
+		assertNoValue(errorText(result.e));
+		assert.match(result.e.message, /^robots\.txt is unreachable: (reading the body of )?http:\/\/127\.0\.0\.1:1\/robots\.txt /);
 		assert.match(result.e.message, cause);
-		assert.doesNotMatch(result.e.message, /browser-profile cookies/);
+		assert.doesNotMatch(result.e.message, /browser-profile cookies|No cookie from the profile/);
 		assert.match(result.e.message, /Use --ignore-robots to override\.$/);
 		assert.equal(result.e.cause, undefined);
-		assert.ok(!errorText(result.e).some((t) => t.includes(secret)));
 		assert.ok(events.includes("context.close") && !events.includes("newPage") && !events.includes("goto"));
 	}
+});
+
+test("profileDir: no matching jar cookie gets the profile's own note, not the plain one", async () => {
+	for (const jar of [[], [jarCookie("k", "v", { domain: "other.org" })]]) {
+		const { result, fetchCalls } = await renderProfile({ onFetch: () => robotsResponse(503), jar });
+		assert.equal(fetchCalls[0][1].headers.Cookie, undefined);
+		assert.equal(
+			result.e?.message,
+			"robots.txt is unreachable: http://127.0.0.1:1/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. No cookie from the profile matched robots.txt, so the request carried none, and a cookie-gated robots.txt can fail here even when the page itself would load. Use --ignore-robots to override.",
+		);
+	}
+});
+
+// #93: the jar already applied Chromium's Secure rule, which sends Secure
+// cookies to loopback over http; the robots request now matches the page.
+test("profileDir: a Secure jar cookie on loopback http goes to robots.txt; --cookies stays strict", async () => {
+	const jar = [jarCookie("sec", "S", { secure: true }), jarCookie("a", "1")];
+	const { result, fetchCalls } = await renderProfile({ onFetch: () => robotsResponse(200), jar });
+	assert.equal(result.e, undefined, result.e?.stack);
+	assert.equal(fetchCalls[0][1].headers.Cookie, "sec=S; a=1");
+	// The same cookies through --cookies (library `cookies`, no profile).
+	const seen = [];
+	const { browserType } = fakeBrowser();
+	await render(PROFILE_URL, {
+		...LIB,
+		browserType,
+		cookies: jar,
+		fetch: async (_url, init) => {
+			seen.push(init.headers.Cookie);
+			return robotsResponse(200);
+		},
+	});
+	assert.deepEqual(seen, ["a=1"]);
+});
+
+test("profileDir: a partitioned jar cookie from another site stays off robots.txt", async () => {
+	const partitioned = (name, partitionKey, crossSite) =>
+		jarCookie(name, AWKWARD, { secure: true, sameSite: "None", partitionKey, _crHasCrossSiteAncestor: crossSite });
+	const jar = [
+		partitioned("embed", "http://localhost", true),
+		partitioned("anc", "http://127.0.0.1", true),
+		partitioned("own", "http://127.0.0.1", false),
+		jarCookie("plain", "1"),
+	];
+	const { result, fetchCalls } = await renderProfile({ onFetch: () => robotsResponse(200), jar });
+	assert.equal(result.e, undefined, result.e?.stack);
+	assert.equal(fetchCalls[0][1].headers.Cookie, `own=${AWKWARD}; plain=1`);
+});
+
+test("profileDir: a cross-origin robots.txt redirect after sending cookies gets the fixed hint", async () => {
+	const redirected = () => ({ ...robotsResponse(503), redirected: true, url: "https://127.0.0.1:1/robots.txt" });
+	const { result } = await renderProfile({ onFetch: redirected, jar: [jarCookie("k", AWKWARD)] });
+	assert.equal(
+		result.e?.message,
+		"robots.txt is unreachable: http://127.0.0.1:1/robots.txt returned HTTP 503 (server error). RFC 9309 treats an unreachable robots.txt as disallowing the whole site. The robots.txt request was redirected to another origin, and cookies are not sent across a cross-origin redirect; fetching the page from that origin directly may get through. Use --ignore-robots to override.",
+	);
+	assertNoValue(errorText(result.e));
+	// No cookie sent: nothing was dropped, so no hint.
+	const none = await renderProfile({ onFetch: redirected, jar: [] });
+	assert.doesNotMatch(none.result.e?.message, /redirected/);
 });
 
 test("profileDir: a cooldown seen at the robots gate closes the context", async () => {
@@ -821,7 +921,7 @@ test("a cookie-gated robots.txt lets the fetch through with --cookies or an impo
 		assert.match(robots.at(-1).ua, /^trawl\//);
 		assert.ok(!viaCookies.stderr.includes(SENTINEL), viaCookies.stderr);
 
-		// (c) An imported profile: robots.txt via the context, with its jar.
+		// (c) An imported profile: robots.txt via Node fetch, with its jar.
 		const profile = join(dir, "profile");
 		const imported = await runBin(link, ["cookies", "import", file, "--profile", profile], env);
 		assert.equal(imported.code, 0, imported.stderr);
@@ -831,11 +931,15 @@ test("a cookie-gated robots.txt lets the fetch through with --cookies or an impo
 		assert.equal(viaProfile.code, 0, viaProfile.stderr);
 		assert.match(viaProfile.stdout, /cookie=\[gate=open[;\]]/);
 		assert.equal(robots.length, before + 1);
-		// trawl's http rule applies, so `sec` (secure) does not go along; the
-		// other host's never does.
+		// The jar's own filter applies (#93): Chromium sends Secure cookies to
+		// loopback http, so `sec` goes along, exactly as on the page request;
+		// the other host's never does.
 		const sent = robots.at(-1).cookie.split("; ");
 		assert.ok(sent.includes("gate=open"), robots.at(-1).cookie);
+		assert.ok(sent.includes(`sec=${SENTINEL}`), robots.at(-1).cookie);
 		assert.ok(!sent.some((c) => c.startsWith("far=")), robots.at(-1).cookie);
+		const pageCookies = viaProfile.stdout.match(/cookie=\[([^\]]*)\]/)[1].split("; ");
+		assert.deepEqual([...sent].sort(), [...pageCookies].sort());
 		assert.match(robots.at(-1).ua, /^trawl\//);
 		// The HAR records the page, not the robots.txt request, which goes
 		// through Node fetch.
@@ -1032,5 +1136,134 @@ test("render() with a CR/LF cookie value and a real browser: fixed message, no l
 		assert.deepEqual(srv.seen.map((s) => [s.url, s.cookie]), [["/robots.txt", null]]);
 	} finally {
 		await srv.close();
+	}
+});
+
+// --- #93: partitioned (CHIPS) cookies, against real Chromium ---
+
+// The issue's reproduction. A page on `127.0.0.1` iframes `localhost`, which
+// sets a partitioned cookie: it lands in `localhost`'s jar under the
+// `127.0.0.1` partition. A top-level visit to `localhost` sets an ordinary
+// cookie and one partitioned under its own site. Then the profile's own
+// top-level request to `localhost` is recorded, and the robots.txt request
+// that render() makes from the same profile must carry exactly those cookies.
+// `scheme` is "https" (self-signed; the Secure rule passes on its own, so this
+// is what fails without the partition rule) or "http" (loopback, where the
+// jar's own Secure exception applies too).
+async function partitionRig(scheme) {
+	const seen = [];
+	let port;
+	const handler = (req, res) => {
+		const host = req.headers.host?.split(":")[0];
+		seen.push({ host, url: req.url, cookie: req.headers.cookie ?? "" });
+		const headers = { "content-type": "text/html" };
+		if (req.url === "/embed") {
+			res.writeHead(200, headers);
+			return res.end(`<!doctype html><iframe src="${scheme}://localhost:${port}/setter"></iframe>`);
+		}
+		if (req.url === "/setter") {
+			headers["set-cookie"] = ["part=PARTITIONED-x9; Secure; SameSite=None; Partitioned; Path=/; Max-Age=3600"];
+		}
+		if (req.url === "/own") {
+			headers["set-cookie"] = [
+				"unpart=U; Path=/; Max-Age=3600",
+				"ownpart=O; Secure; SameSite=None; Partitioned; Path=/; Max-Age=3600",
+			];
+		}
+		if (req.url === "/robots.txt") {
+			res.writeHead(200, { "content-type": "text/plain" });
+			return res.end("User-agent: *\nDisallow:\n");
+		}
+		res.writeHead(200, headers);
+		res.end("<!doctype html><title>t</title><p>loaded</p>");
+	};
+	const server = scheme === "https" ? createHttpsServer(selfSignedCert(), handler) : createServer(handler);
+	await new Promise((r) => server.listen(0, "127.0.0.1", r));
+	port = server.address().port;
+	return {
+		seen,
+		origin: `${scheme}://localhost:${port}`,
+		embed: `${scheme}://127.0.0.1:${port}/embed`,
+		close: () => new Promise((r) => server.close(r)),
+	};
+}
+
+// Fills `profile` as described above and returns the cookies (sorted) the
+// browser itself sends on a top-level request to the site.
+async function seedPartitionedProfile(rig, profile) {
+	const context = await chromium.launchPersistentContext(profile, {
+		executablePath: resolveExecutablePath(),
+		headless: true,
+		ignoreHTTPSErrors: true,
+	});
+	try {
+		const page = await context.newPage();
+		await page.goto(`${rig.origin}/own`, { waitUntil: "load" });
+		await page.goto(rig.embed, { waitUntil: "load" });
+		const jar = await context.cookies(`${rig.origin}/robots.txt`);
+		const part = jar.find((c) => c.name === "part");
+		// Without this the test would pass vacuously.
+		assert.ok(part, `no partitioned cookie in the jar: ${JSON.stringify(jar.map((c) => c.name))}`);
+		assert.equal(typeof part.partitionKey, "string");
+		assert.match(part.partitionKey, /^https?:\/\/127\.0\.0\.1$/);
+		rig.seen.length = 0;
+		await page.goto(`${rig.origin}/top`, { waitUntil: "load" });
+		const top = rig.seen.find((s) => s.url === "/top");
+		return top.cookie.split("; ").filter(Boolean).sort();
+	} finally {
+		await context.close();
+	}
+}
+
+test("profileDir: a third-party partitioned cookie is not sent to robots.txt (https, self-signed)", browserOpts, async () => {
+	const rig = await partitionRig("https");
+	const dir = tempDir();
+	try {
+		const profile = join(dir, "p");
+		const browserSends = await seedPartitionedProfile(rig, profile);
+		assert.deepEqual(browserSends, ["ownpart=O", "unpart=U"]);
+		// Node fetch would refuse the self-signed certificate, so the robots
+		// request is captured by an injected fetch; it disallows, so render()
+		// stops before the page (which would need ignoreHTTPSErrors).
+		const sent = [];
+		const err = await render(`${rig.origin}/page`, {
+			format: "title",
+			pacing: false,
+			authCheck: false,
+			profileDir: profile,
+			fetch: async (url, init) => {
+				sent.push([url, init.headers.Cookie]);
+				return robotsResponse(200, "User-agent: *\nDisallow: /\n");
+			},
+		}).catch((e) => e);
+		assert.equal(err?.message, "robots.txt disallows this path (Disallow: /). Use --ignore-robots to override.");
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0][0], `${rig.origin}/robots.txt`);
+		assert.deepEqual(sent[0][1].split("; ").sort(), browserSends);
+		assert.ok(!sent[0][1].includes("PARTITIONED-x9"), sent[0][1]);
+	} finally {
+		await rig.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("profileDir: on loopback http, robots.txt gets what the page gets, partitioned cookies included or not alike", browserOpts, async () => {
+	const rig = await partitionRig("http");
+	const dir = tempDir();
+	try {
+		const profile = join(dir, "p");
+		const browserSends = await seedPartitionedProfile(rig, profile);
+		// Secure cookies go to http://localhost (Chromium's loopback rule).
+		assert.deepEqual(browserSends, ["ownpart=O", "unpart=U"]);
+		rig.seen.length = 0;
+		const result = await render(`${rig.origin}/page`, { format: "title", pacing: false, authCheck: false, profileDir: profile });
+		assert.equal(result.body, "t");
+		const robots = rig.seen.find((s) => s.url === "/robots.txt");
+		const page = rig.seen.find((s) => s.url === "/page");
+		assert.deepEqual(robots.cookie.split("; ").sort(), browserSends);
+		assert.deepEqual(page.cookie.split("; ").sort(), browserSends);
+	} finally {
+		await rig.close();
+		rmSync(dir, { recursive: true, force: true });
 	}
 });

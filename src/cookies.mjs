@@ -784,9 +784,16 @@ function headerSafe(c) {
  * above U+00FF, so the header is UTF-8 encoded and handed over one byte per
  * character; sending `café` as is would put the single byte `e9` on the wire
  * where the browser sends `c3 a9`.
+ *
+ * `jar: true` says `cookies` came from the browser's own URL filter
+ * (`context.cookies(url)` on a `--profile`), which already applied the
+ * `Secure` rule, Chromium's exception for `http://localhost` and
+ * `http://127.0.0.1` included, so `Secure` is not re-checked: the robots
+ * request then gets the `Secure` cookies the page request gets. Without it
+ * (`--cookies`), `Secure` goes only over https.
  */
-export function robotsCookieHeader(cookies, url, { now = Date.now() } = {}) {
-	const matching = matchingCookies(cookies, url, now);
+export function robotsCookieHeader(cookies, url, { now = Date.now(), jar = false } = {}) {
+	const matching = matchingCookies(cookies, url, now, jar);
 	const sendable = matching.filter(headerSafe);
 	const omitted = matching.filter((c) => !headerSafe(c)).map((c) => String(c.name ?? ""));
 	if (sendable.length === 0) return { header: undefined, omitted };
@@ -802,7 +809,10 @@ export function robotsCookieHeader(cookies, url, { now = Date.now() } = {}) {
  * `undefined` when no cookie matches. RFC 6265 5.4: domain (host-only vs
  * leading dot), path, `secure` only over https, not expired (-1 = session).
  * `httpOnly` and `sameSite` are ignored: this is a request of trawl's own to
- * the site's own origin. Longer paths first, ties in input order; a nameless
+ * the site's own origin. A partitioned cookie goes only where the browser
+ * would send it on a top-level request (see `partitionAllows`). With
+ * `{ jar: true }`, `secure` is left to the browser's filter that produced
+ * the list (see `robotsCookieHeader`). Longer paths first, ties in input order; a nameless
  * cookie contributes its value alone. The result is a secret: it belongs in a
  * request header and nowhere else (no log, no error, no `failure`).
  *
@@ -815,8 +825,41 @@ export function cookieHeaderFor(cookies, url, options = {}) {
 	return robotsCookieHeader(cookies, url, options).header;
 }
 
+/**
+ * True when a browser would send `cookie` on a top-level request to `url` as
+ * far as partitioning (CHIPS) goes. An unpartitioned cookie (no
+ * `partitionKey`) always passes. A partitioned one passes only when its
+ * partition is the top-level partition of `url` itself: `partitionKey` is
+ * exactly `url`'s scheme and host (`https://example.com`, no port) and
+ * Chromium's `_crHasCrossSiteAncestor` is `false`. Anything else, or anything
+ * this cannot read, is left out: a third-party embed's partitioned cookie
+ * belongs to that embed and must not go out on the site's own request.
+ *
+ * Exact host, not registrable domain: the browser keys a partition by site
+ * (`https://example.com` for a page on `www.example.com`), and telling a site
+ * from a host needs the public suffix list, so a cookie partitioned under
+ * `example.com` is not sent to `www.example.com/robots.txt` even though the
+ * browser would send it. Fewer cookies is the safe direction. Checked against
+ * Chromium 156 (playwright-core 1.64): `context.cookies(url)` returns
+ * `partitionKey` as a string such as `http://127.0.0.1`.
+ */
+export function partitionAllows(cookie, url) {
+	const key = cookie?.partitionKey;
+	if (key === undefined || key === null) return true;
+	if (typeof key !== "string" || cookie._crHasCrossSiteAncestor !== false) return false;
+	let target;
+	try {
+		target = new URL(url);
+	} catch {
+		return false;
+	}
+	return key.toLowerCase() === `${target.protocol}//${target.hostname.toLowerCase()}`;
+}
+
 // The cookies from `cookies` a browser would send to `url`, longest path first.
-function matchingCookies(cookies, url, now) {
+// `jar`: the list is from the browser's own URL filter, so `secure` is not
+// re-checked (see `robotsCookieHeader`).
+function matchingCookies(cookies, url, now, jar = false) {
 	let target;
 	try {
 		target = new URL(url);
@@ -830,7 +873,8 @@ function matchingCookies(cookies, url, now) {
 	for (const c of Array.isArray(cookies) ? cookies : []) {
 		if (!c || !cookieDomainMatches(c.domain, host)) continue;
 		if (!cookiePathMatches(c.path, target.pathname)) continue;
-		if (c.secure && !https) continue;
+		if (c.secure && !https && !jar) continue;
+		if (!partitionAllows(c, url)) continue;
 		const e = c.expires;
 		if (typeof e === "number" && e !== -1 && !(e > nowSec)) continue;
 		matching.push(c);

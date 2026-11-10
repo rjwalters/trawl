@@ -411,12 +411,18 @@ browser would send to `<origin>/robots.txt`: a host-only cookie only for its
 exact host, a `.example.com` cookie for that domain and its subdomains, a
 path of `/` or `/robots.txt`, a `Secure` cookie only over `https`, nothing
 expired. If none match, the request has no `Cookie` header at all. A redirect
-to another origin does not carry the header along; a redirect within the
-same origin does, so a cookie scoped to `/robots.txt` can reach another path
-on that host if `robots.txt` redirects there.
+to another origin (another host or port, or `http` to `https`) does not carry
+the header along, so a cookie-gated `robots.txt` reached that way is refused,
+and the error says the cookies did not follow the redirect; a redirect within
+the same origin does carry it, so a cookie scoped to `/robots.txt` can reach
+another path on that host if `robots.txt` redirects there. A `Set-Cookie` on
+the `robots.txt` response is ignored. A `--profile` fetch's `robots.txt`
+request follows the same redirect and `Set-Cookie` rules, with the cookies
+picked from the profile instead (see [Etiquette](#etiquette)).
 
 A cookie whose name or value holds a control character (CR, LF, NUL, tab,
-...) cannot go in a request header, so it is left out of the `robots.txt`
+...) or a `;`, or whose name holds an `=`, cannot go in a request header as
+given, so it is left out of the `robots.txt`
 request, which goes ahead with the other matching cookies, or with no
 `Cookie` header if none are left. (The browser refuses such a cookie too,
 so `--cookies` skips it by name before this point.) Non-ASCII values are
@@ -554,18 +560,33 @@ default rather than asking you to promise you will.
   request sends trawl's `User-Agent`, and the cookies a fetch would present:
   with `--cookies`, the ones that match `<origin>/robots.txt` (see
   [Cookies for a single fetch](#cookies-for-a-single-fetch)); with
-  `--profile`, it goes through that profile's browser context, so the
-  profile's cookies go with it by the browser's own rules, and a
-  `Set-Cookie` on the `robots.txt` response is kept in the profile as any
-  response's would be. On that path the browser starts before the
-  `robots.txt` check, so a run that `robots.txt` refuses still leaves behind
-  the profile directory (created if it did not exist) and, with `--har`, a
-  HAR file with no entries. A failure there is reported as a known error
-  code (`ECONNREFUSED`, `ENOTFOUND`, ...) or `request failed`, never the
-  browser's text; `ERR_INVALID_CHAR` means a cookie in the profile has a
-  character the browser's request client will not put in a header (anything
-  above U+00FF). A plain fetch sends no cookies, so a site that serves
-  an interstitial to cookie-less clients can still block it here.
+  `--profile`, the ones the profile's cookie jar holds for
+  `<origin>/robots.txt`. On both paths trawl makes that request itself
+  (Node's `fetch`), not the browser, with the cookies in a `Cookie` header:
+  a redirect to another origin (another host or port, or `http` to `https`)
+  drops the header, so a cookie-gated `robots.txt` reached through, say, an
+  `http`-to-`https` or `example.com`-to-`www.example.com` redirect is
+  refused, and the error adds that the cookies did not follow the redirect
+  (fetch the page from the origin it redirected to, or use
+  `--ignore-robots`); a redirect within the same origin keeps the header; and
+  a `Set-Cookie` on the `robots.txt` response is ignored, not stored in the
+  profile. On `--profile` the jar applies the browser's own matching rules,
+  `Secure` included, so a `Secure` cookie goes to `http://localhost` and
+  `http://127.0.0.1` there just as it does on the page request (with
+  `--cookies`, `Secure` goes only over `https`). A partitioned cookie (CHIPS)
+  goes along only when it belongs to that very site's own top-level
+  partition (same scheme and host): one set by a frame embedded in another
+  site, which the browser would not send on a visit to this site, never
+  does. A cookie partitioned under a parent domain (`example.com`, for a
+  fetch of `www.example.com`) is left out too, although the browser would
+  send it. On that path the browser starts before the `robots.txt` check, so
+  a run that `robots.txt` refuses still leaves behind the profile directory
+  (created if it did not exist) and, with `--har`, a HAR file with no
+  entries. When the request carried cookies, a failure is reported as a
+  known error code (`ECONNREFUSED`, `ENOTFOUND`, ...) or `request failed`,
+  never the underlying error's text. A plain fetch sends no cookies, so a
+  site that serves an interstitial to cookie-less clients can still block it
+  here.
 - **`--ignore-robots` overrides it**, because there are legitimate reasons:
   your own staging site, a page you are authenticated to, a `robots.txt`
   that blocks all bots but permits the human reading the same URL, or one

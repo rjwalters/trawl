@@ -10,6 +10,7 @@ import {
 	isAuthCookie,
 	MAX_EXPIRES,
 	parseCookies,
+	partitionAllows,
 	robotsCookieHeader,
 	sourceUserAgent,
 	summarize,
@@ -653,6 +654,81 @@ test("cookieHeaderFor: a secure cookie only over https", () => {
 	assert.equal(cookieHeaderFor(list, "http://example.com/robots.txt"), "p=2");
 	// No special case for localhost.
 	assert.equal(cookieHeaderFor([ck("s", "1", "localhost", { secure: true })], "http://localhost/robots.txt"), undefined);
+});
+
+// #93: on a --profile the list comes from `context.cookies(url)`, which has
+// already applied Chromium's Secure rule (loopback http counts as secure);
+// `jar: true` leaves Secure to it. Without it (--cookies) nothing changes.
+test("robotsCookieHeader: { jar: true } leaves Secure to the browser's filter; the default stays strict", () => {
+	const list = [ck("s", "1", "localhost", { secure: true }), ck("p", "2", "localhost")];
+	for (const url of ["http://localhost:8080/robots.txt", "https://localhost/robots.txt"]) {
+		assert.equal(robotsCookieHeader(list, url, { jar: true }).header, "s=1; p=2");
+	}
+	assert.equal(robotsCookieHeader(list, "http://localhost:8080/robots.txt").header, "p=2");
+	assert.equal(robotsCookieHeader(list, "http://localhost:8080/robots.txt", { jar: false }).header, "p=2");
+	assert.equal(cookieHeaderFor(list, "http://localhost:8080/robots.txt"), "p=2");
+	const ip = [ck("s", "1", "127.0.0.1", { secure: true })];
+	assert.equal(cookieHeaderFor(ip, "http://127.0.0.1:1/robots.txt", { jar: true }), "s=1");
+	assert.equal(cookieHeaderFor(ip, "http://127.0.0.1:1/robots.txt"), undefined);
+	// Only Secure is left to the browser: domain, path and expiry still apply.
+	assert.equal(cookieHeaderFor([ck("s", "1", "other.org", { secure: true })], "http://localhost/robots.txt", { jar: true }), undefined);
+	assert.equal(cookieHeaderFor([ck("s", "1", "localhost", { secure: true, path: "/x" })], "http://localhost/robots.txt", { jar: true }), undefined);
+	assert.equal(
+		cookieHeaderFor([ck("s", "1", "localhost", { secure: true, expires: NOW / 1000 - 1 })], "http://localhost/robots.txt", { jar: true, now: NOW }),
+		undefined,
+	);
+});
+
+// #93: the shape `context.cookies(url)` returns for a CHIPS cookie (Chromium
+// 156, playwright-core 1.64): `partitionKey` is the top-level site, and
+// `_crHasCrossSiteAncestor` says whether a cross-site frame sat in between.
+const part = (name, partitionKey, crossSite, extra = {}) =>
+	ck(name, "P", "localhost", { secure: true, sameSite: "None", partitionKey, _crHasCrossSiteAncestor: crossSite, ...extra });
+
+test("partitionAllows: only the URL's own top-level partition, never a cross-site one", () => {
+	const url = "https://localhost:8443/robots.txt";
+	// Unpartitioned: always.
+	assert.equal(partitionAllows(ck("u", "1", "localhost"), url), true);
+	assert.equal(partitionAllows(ck("u", "1", "localhost", { partitionKey: null }), url), true);
+	// Its own site, set at top level: the browser sends it on a top-level request.
+	assert.equal(partitionAllows(part("own", "https://localhost", false), url), true);
+	assert.equal(partitionAllows(part("own", "HTTPS://LocalHost", false), "https://LOCALHOST/robots.txt"), true);
+	// A third-party embed's partition (the issue's reproduction).
+	assert.equal(partitionAllows(part("embed", "https://127.0.0.1", true), url), false);
+	assert.equal(partitionAllows(part("embed", "https://127.0.0.1", false), url), false);
+	// Own site, but set below a cross-site frame: a different partition.
+	assert.equal(partitionAllows(part("anc", "https://localhost", true), url), false);
+	// The cross-site bit missing or not a boolean: not readable, left out.
+	assert.equal(partitionAllows(part("nobit", "https://localhost", undefined), url), false);
+	assert.equal(partitionAllows(part("nobit", "https://localhost", "false"), url), false);
+	// Scheme counts (schemeful site); a port in the key is not a site.
+	assert.equal(partitionAllows(part("scheme", "http://localhost", false), url), false);
+	assert.equal(partitionAllows(part("port", "https://localhost:8443", false), url), false);
+	// A registrable-domain key for a subdomain host is left out: telling a
+	// site from a host needs the public suffix list (fewer cookies is safe).
+	assert.equal(partitionAllows(part("site", "https://example.com", false), "https://www.example.com/robots.txt"), false);
+	assert.equal(partitionAllows(part("site", "https://example.com", false), "https://example.com/robots.txt"), true);
+	// Odd shapes and URLs.
+	for (const key of ["", 1, {}, ["https://localhost"], true]) {
+		assert.equal(partitionAllows(part("odd", key, false), url), false, JSON.stringify(key));
+	}
+	assert.equal(partitionAllows(part("own", "https://localhost", false), "not a url"), false);
+});
+
+test("robotsCookieHeader: a partitioned cookie from another site never reaches the header", () => {
+	const url = "https://localhost:8443/robots.txt";
+	const jar = [
+		part("part", "https://127.0.0.1", true, { value: "PARTITIONED" }),
+		ck("unpart", "U", "localhost"),
+		part("ownpart", "https://localhost", false, { value: "O" }),
+		part("anc", "https://localhost", true, { value: "Z" }),
+	];
+	assert.deepEqual(robotsCookieHeader(jar, url), { header: "unpart=U; ownpart=O", omitted: [] });
+	assert.equal(cookieHeaderFor(jar, url, { jar: true }), "unpart=U; ownpart=O");
+	// Over loopback http with { jar: true }, Secure partitioned cookies are
+	// still subject to the partition rule.
+	assert.equal(cookieHeaderFor(jar, "http://localhost:8080/robots.txt", { jar: true }), "unpart=U");
+	assert.equal(cookieHeaderFor(jar.slice(0, 1), url, { jar: true }), undefined);
 });
 
 test("cookieHeaderFor: expiry (past, future, session)", () => {

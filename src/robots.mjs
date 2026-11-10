@@ -241,7 +241,11 @@ export function safeErrorCode(err) {
 // The `--profile` path builds the same header from the context's jar. When a
 // `Cookie` header was sent, a failure's `detail` is an allowlisted error code
 // (SAFE_ERROR_CODES) or the fixed "request failed", never text taken from the
-// error; without one it is described as it always was.
+// error; without one it is described as it always was. When a `Cookie` header
+// was sent and the response came from another origin after a redirect, a
+// denied verdict also carries `crossOriginRedirect: true` (no URL), so the
+// refusal can say the cookies did not go along; without a header, or without
+// such a redirect, the verdict is exactly as before.
 //
 // `gate`, if given, wraps the moment the request is sent: it is called with a
 // `start` function and must call it (once) and return its result. This is how
@@ -276,6 +280,10 @@ export async function checkRobotsAllowed(url, options = {}) {
 	const controller = new AbortController();
 	let timer;
 	let started = false;
+	// Set once a response shows a cross-origin redirect after a Cookie header
+	// was sent (see `redirectedElsewhere`); marks a denial, never an allow.
+	let crossOrigin = false;
+	const denied = (verdict) => (crossOrigin ? { ...verdict, crossOriginRedirect: true } : verdict);
 	const timedOut = () => unreachable(robotsUrl, { kind: "timeout", timeout });
 	const start = () => {
 		started = true;
@@ -309,10 +317,11 @@ export async function checkRobotsAllowed(url, options = {}) {
 			});
 		}
 
+		if (sendsCookie && redirectedElsewhere(response, robotsUrl)) crossOrigin = true;
 		const status = Number(response.status);
 		if (!response.ok) {
 			if (status >= 500 && status <= 599) {
-				return unreachable(robotsUrl, { kind: "server-error", status });
+				return denied(unreachable(robotsUrl, { kind: "server-error", status }));
 			}
 			return ALLOWED;
 		}
@@ -320,21 +329,38 @@ export async function checkRobotsAllowed(url, options = {}) {
 		try {
 			text = await response.text();
 		} catch (err) {
-			if (controller.signal.aborted) return timedOut();
-			return unreachable(robotsUrl, {
-				kind: "read-error",
-				status,
-				detail: detailOf(err),
-			});
+			if (controller.signal.aborted) return denied(timedOut());
+			return denied(
+				unreachable(robotsUrl, {
+					kind: "read-error",
+					status,
+					detail: detailOf(err),
+				}),
+			);
 		}
 	} finally {
 		clearTimeout(timer);
 	}
 
-	return evaluateRobots(text, {
+	const verdict = evaluateRobots(text, {
 		userAgent,
 		path: `${target.pathname}${target.search}`,
 	});
+	return verdict.allowed ? verdict : denied(verdict);
+}
+
+// True when `response` arrived from another origin than `robotsUrl` after a
+// redirect (other host, other port, or http -> https). Reads defensively: a
+// response without `redirected` / `url`, or one that throws, is no redirect.
+function redirectedElsewhere(response, robotsUrl) {
+	try {
+		if (response.redirected !== true) return false;
+		const final = response.url;
+		if (typeof final !== "string" || final === "") return false;
+		return new URL(final).origin !== new URL(robotsUrl).origin;
+	} catch {
+		return false;
+	}
 }
 
 // Turn a denied robots verdict into an error message. A matched rule and a
@@ -343,12 +369,20 @@ export async function checkRobotsAllowed(url, options = {}) {
 // request carried no cookies it also says so — the usual reason a site that
 // loads fine in a browser still fails here. Pass `{ sentCookies: true }` when
 // it did (a matching --cookies header, or a profile's jar), where that note
-// would be false. Nothing here ever names a cookie.
-export function robotsDenialMessage(verdict, { sentCookies = false } = {}) {
+// would be false, and `{ profile: true }` on the `--profile` path, where the
+// note says no cookie from the profile went along instead. A verdict marked
+// `crossOriginRedirect` (see `checkRobotsAllowed`) gets a fixed hint that the
+// cookies did not follow the redirect. Nothing here ever names a cookie.
+export function robotsDenialMessage(verdict, { sentCookies = false, profile = false } = {}) {
 	const override = "Use --ignore-robots to override.";
+	const redirectHint = verdict?.crossOriginRedirect
+		? "The robots.txt request was redirected to another origin, and cookies " +
+			"are not sent across a cross-origin redirect; fetching the page from " +
+			"that origin directly may get through. "
+		: "";
 	const failure = verdict?.failure;
 	if (!failure) {
-		return `robots.txt disallows this path (${verdict?.rule}). ${override}`;
+		return `robots.txt disallows this path (${verdict?.rule}). ${redirectHint}${override}`;
 	}
 	const where = failure.url ?? "robots.txt";
 	let cause;
@@ -367,11 +401,15 @@ export function robotsDenialMessage(verdict, { sentCookies = false } = {}) {
 	}
 	const cookieNote = sentCookies
 		? ""
-		: "The robots.txt request " +
-			"sends no browser-profile cookies, so a cookie-gated robots.txt can " +
-			"fail here even when the page itself would load. ";
+		: profile
+			? "No cookie from the profile matched robots.txt, so the request " +
+				"carried none, and a cookie-gated robots.txt can fail here even " +
+				"when the page itself would load. "
+			: "The robots.txt request " +
+				"sends no browser-profile cookies, so a cookie-gated robots.txt can " +
+				"fail here even when the page itself would load. ";
 	return (
 		`robots.txt is unreachable: ${cause}. RFC 9309 treats an unreachable ` +
-		`robots.txt as disallowing the whole site. ${cookieNote}${override}`
+		`robots.txt as disallowing the whole site. ${cookieNote}${redirectHint}${override}`
 	);
 }

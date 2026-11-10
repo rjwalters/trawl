@@ -47,33 +47,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The robots.txt request now carries the fetch's cookies.** With
-  `--cookies`, it sends a `Cookie` header with just the cookies that match
-  `<origin>/robots.txt` (host-only vs `.domain`, path, `Secure` only over
-  https, not expired), and no header when none match; Node's fetch drops the
-  header on a redirect to another origin. With `--profile`, robots.txt is
-  fetched through the profile's browser context (`context.request`), so the
-  profile's cookies go with it, and the browser now starts before the
-  robots.txt check on that path. Either way it still sends trawl's
-  `User-Agent`, keeps its own 10s timeout, the 4xx/5xx rules, pacing and the
-  cooldown check, and `--ignore-robots` still skips it. A site whose
+- **The robots.txt request now carries the fetch's cookies.** A site whose
   robots.txt answers 503 to cookie-less clients no longer needs
-  `--ignore-robots` once its cookies are supplied. The "sends no
-  browser-profile cookies" note in the unreachable-robots.txt error is left
-  out when the request did carry cookies. A fetch with neither flag is
-  unchanged. The robots.txt request is not recorded by `--har` on either
-  path. The header always holds a value Node's fetch accepts: a cookie
-  whose name or value has a control character (CR, LF, NUL, tab, ...) is
-  left out of it (the fetch goes on with the rest, or no header), and
-  non-ASCII is sent as the UTF-8 bytes Chromium sends on the page request,
-  so a value such as `snow☃man` no longer fails robots.txt. When the
-  request carried cookies, a failure is described only by an allowlisted
-  error code (`ECONNREFUSED`, `UND_ERR_SOCKET`, `ENOTFOUND`, ...) or the
-  fixed `request failed`, never the error's text, which can quote the
-  header; `--profile` reports the same allowlisted codes instead of a bare
-  `request failed`. A same-origin redirect keeps the header. With
-  `--profile`, a robots.txt refusal still leaves the profile directory and,
-  with `--har`, an empty HAR. (#79, #87)
+  `--ignore-robots` once its cookies are supplied. trawl still makes the
+  request itself with Node's `fetch` (trawl's `User-Agent`, its own 10s
+  timeout, the 4xx/5xx rules, pacing and the cooldown check; `--ignore-robots`
+  still skips it), now with a `Cookie` header:
+  - With `--cookies`: the cookies that match `<origin>/robots.txt`
+    (host-only vs `.domain`, path, `Secure` only over https, not expired).
+  - With `--profile`: the cookies the profile's jar holds for
+    `<origin>/robots.txt`, by the browser's own rules, so a `Secure` cookie
+    goes to `http://localhost` and `http://127.0.0.1` as it does on the page
+    request. A partitioned (CHIPS) cookie goes only when it is in that site's
+    own top-level partition (same scheme and host); one set by a frame
+    embedded in another site is never sent. On this path the browser starts
+    before the robots.txt check, so a refused run still leaves the profile
+    directory and, with `--har`, an empty HAR.
+  - No cookie matches: no `Cookie` header at all. A fetch with neither flag
+    is unchanged.
+
+  On both paths a redirect to another origin drops the header (a same-origin
+  redirect keeps it), and a refusal after such a redirect says the cookies
+  did not follow it; a `Set-Cookie` on the robots.txt response is ignored;
+  and the request is not recorded by `--har`. The header always holds a value
+  Node's fetch accepts: a cookie with a control character (CR, LF, NUL, tab,
+  ...) or `;` in its name or value, or `=` in its name, is left out (the
+  request goes on with the rest, or no header), and non-ASCII is sent as the
+  UTF-8 bytes Chromium sends on the page request. When the request carried
+  cookies, a failure is described only by an allowlisted error code
+  (`ECONNREFUSED`, `UND_ERR_SOCKET`, `ENOTFOUND`, ...) or the fixed
+  `request failed`, never the error's text, which can quote the header. The
+  "sends no browser-profile cookies" note in the unreachable-robots.txt error
+  is left out when cookies were sent, and on `--profile` says instead that no
+  cookie from the profile matched. (#79, #87, #89, #91, #93)
 - **Minimum Node is now 22.** `engines.node` moves from `>=20` to `>=22`,
   matching the versions CI tests (22 and 24) now that Node 20 is end-of-life.
 

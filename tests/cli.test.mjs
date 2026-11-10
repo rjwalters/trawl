@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
 	mkdtempSync,
 	readdirSync,
@@ -16,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveExecutablePath } from "../src/browser.mjs";
 import {
 	defaultProfileDir,
+	defaultWaitForUser,
 	isMainModule,
 	main,
 	parseArgs,
@@ -198,6 +200,8 @@ test("login with no --profile/TRAWL_PROFILE_DIR defaults to defaultProfileDir()"
 			return context;
 		},
 		waitForUser: async () => {},
+		resolveHeadedExecutablePath: () => "/fake/chrome",
+		recordProfileBrowser: () => {},
 		stderr: (s) => stderrLines.push(s),
 	};
 
@@ -219,6 +223,8 @@ test("login with no --profile/TRAWL_PROFILE_DIR defaults to defaultProfileDir()"
 
 function fakeLoginDeps({ profileDir } = {}) {
 	const mkdirCalls = [];
+	const resolverCalls = [];
+	const recorded = [];
 	const stderrLines = [];
 	const page = { goto: async () => {} };
 	const gotoCalls = [];
@@ -239,8 +245,15 @@ function fakeLoginDeps({ profileDir } = {}) {
 				return context;
 			},
 			waitForUser: async () => {},
+			resolveHeadedExecutablePath: (explicit) => {
+				resolverCalls.push(explicit);
+				return explicit ?? "/fake/chrome";
+			},
+			recordProfileBrowser: (dir, exe) => recorded.push([dir, exe]),
 			stderr: (s) => stderrLines.push(s),
 		},
+		recorded,
+		resolverCalls,
 		mkdirCalls,
 		stderrLines,
 		gotoCalls,
@@ -607,4 +620,111 @@ test("treats --har-redact as a boolean", () => {
 	const args = parseArgs(["https://example.com", "--har-redact"]);
 	assert.equal(args["--har-redact"], true);
 	assert.deepEqual(args._, ["https://example.com"]);
+});
+
+// --- trawl login: headed browser + window-close detection (#95, #96) ---------
+
+test("login hands --executable-path, else TRAWL_EXECUTABLE_PATH, to the headed resolver", async () => {
+	const a = fakeLoginDeps({ profileDir: "/tmp/p" });
+	await runLogin(["https://example.com", "--profile", "/tmp/p", "--executable-path", "/opt/chrome"], a.deps);
+	assert.deepEqual(a.resolverCalls, ["/opt/chrome"]);
+
+	const b = fakeLoginDeps({ profileDir: "/tmp/p" });
+	b.deps.env = { TRAWL_EXECUTABLE_PATH: "/env/chrome" };
+	await runLogin(["https://example.com", "--profile", "/tmp/p"], b.deps);
+	assert.deepEqual(b.resolverCalls, ["/env/chrome"]);
+});
+
+test("login reuses the context's initial blank tab instead of opening a second", async () => {
+	const { deps, context, gotoCalls } = fakeLoginDeps({ profileDir: "/tmp/p" });
+	const blank = { goto: async (url) => gotoCalls.push(`blank:${url}`) };
+	context.pages = () => [blank];
+	let opened = 0;
+	context.newPage = async () => {
+		opened++;
+		return blank;
+	};
+	await runLogin(["https://example.com", "--profile", "/tmp/p"], deps);
+	assert.equal(opened, 0);
+	assert.deepEqual(gotoCalls, ["blank:https://example.com"]);
+});
+
+// A fake persistent context: an EventEmitter with live pages, like Playwright's.
+function fakeContext(pageCount) {
+	const context = new EventEmitter();
+	const pages = [];
+	const addPage = () => {
+		const page = new EventEmitter();
+		page.close = () => {
+			pages.splice(pages.indexOf(page), 1);
+			page.emit("close");
+		};
+		pages.push(page);
+		return page;
+	};
+	for (let i = 0; i < pageCount; i++) addPage();
+	context.pages = () => [...pages];
+	context.openPage = () => {
+		const page = addPage();
+		context.emit("page", page);
+		return page;
+	};
+	return context;
+}
+
+const fakeStdin = () => Object.assign(new EventEmitter(), { resume() {}, pause() {} });
+const settled = (p) => Promise.race([p.then(() => true), new Promise((r) => setTimeout(() => r(false), 20))]);
+
+test("waitForUser finishes when the last window/page closes (macOS keeps the app running)", async () => {
+	const context = fakeContext(1);
+	const done = defaultWaitForUser(context, fakeStdin());
+	assert.equal(await settled(done), false);
+	context.pages()[0].close();
+	assert.equal(await settled(done), true);
+});
+
+test("waitForUser keeps waiting while any page is still open, including popups", async () => {
+	const context = fakeContext(1);
+	const done = defaultWaitForUser(context, fakeStdin());
+	const popup = context.openPage(); // e.g. an OAuth sign-in popup
+	context.pages()[0].close();
+	assert.equal(await settled(done), false);
+	popup.close();
+	assert.equal(await settled(done), true);
+});
+
+test("waitForUser still finishes on browser exit or on Enter", async () => {
+	const a = fakeContext(1);
+	const exitDone = defaultWaitForUser(a, fakeStdin());
+	a.emit("close");
+	assert.equal(await settled(exitDone), true);
+
+	const b = fakeContext(1);
+	const stdin = fakeStdin();
+	const enterDone = defaultWaitForUser(b, stdin);
+	stdin.emit("data", "\n");
+	assert.equal(await settled(enterDone), true);
+});
+
+test("login records the browser it used in the profile", async () => {
+	const { deps, recorded } = fakeLoginDeps({ profileDir: "/tmp/p" });
+	await runLogin(["https://example.com", "--profile", "/tmp/p", "--executable-path", "/opt/chrome"], deps);
+	assert.deepEqual(recorded, [["/tmp/p", "/opt/chrome"]]);
+});
+
+test("login still succeeds when the browser cannot be recorded", async () => {
+	const { deps, stderrLines } = fakeLoginDeps({ profileDir: "/tmp/p" });
+	deps.recordProfileBrowser = () => {
+		throw new Error("read-only");
+	};
+	const code = await runLogin(["https://example.com", "--profile", "/tmp/p"], deps);
+	assert.equal(code, 0);
+	assert.match(stderrLines.join(""), /could not record the login browser/);
+});
+
+test("login creates a new profile directory 0700", async () => {
+	const { deps, mkdirCalls } = fakeLoginDeps({ profileDir: "/tmp/p" });
+	await runLogin(["https://example.com", "--profile", "/tmp/p"], deps);
+	const mkdirCall = mkdirCalls.find((c) => c[0] !== "launch");
+	assert.deepEqual(mkdirCall, ["/tmp/p", { recursive: true, mode: 0o700 }]);
 });

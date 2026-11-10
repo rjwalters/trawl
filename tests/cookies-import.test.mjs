@@ -753,3 +753,25 @@ test("an imported cookie is presented by a later fetch with --profile", browserO
 		rmSync(binDir, { recursive: true, force: true });
 	}
 });
+
+test("cookies import resolves the browser for its profile and writes no marker", async () => {
+	const dir = tempDir();
+	const file = writeSource(dir, "cookies.txt", TXT);
+	const { deps } = fakeDeps({ profileDir: "/p" });
+	deps.now = NOW_MS;
+	const resolverCalls = [];
+	deps.resolveExecutablePath = (...args) => {
+		resolverCalls.push(args);
+		return "/fake/chrome";
+	};
+	try {
+		assert.equal(await runCookiesImport([file, "--profile", "/p"], deps), 0);
+		// The profile is passed so a login-recorded browser is reused; with no
+		// marker, resolveExecutablePath falls back to the headless shell exactly
+		// as on main (covered in browser.test.mjs). Import never records one:
+		// only `trawl login` writes .trawl-browser.
+		assert.deepEqual(resolverCalls, [[undefined, { profileDir: "/p" }]]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

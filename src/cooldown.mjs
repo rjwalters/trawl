@@ -42,7 +42,6 @@ import {
 	createFileLock,
 	defaultStateDir,
 	originDigest,
-	stateOrigin,
 	writeJsonAtomic,
 } from "./state.mjs";
 
@@ -62,8 +61,6 @@ export const STALE_LOCK_MS = 30 * 1000;
 const MAX_TIME_MS = 8.64e15;
 const STATE_VERSION = 1;
 const ABSENT = new Set(["ENOENT", "ENOTDIR"]);
-
-export const cooldownOrigin = stateOrigin;
 
 export class CooldownError extends Error {
 	constructor({ origin, until, now, status, retrySuppressed = false }) {

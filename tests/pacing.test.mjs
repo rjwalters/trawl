@@ -25,7 +25,6 @@ import {
 	createPacer,
 	defaultStateDir,
 	originDigest,
-	pacingOrigin,
 	parseState,
 	validateMinInterval,
 } from "../src/pacing.mjs";
@@ -82,17 +81,6 @@ for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, MAX_MIN_INTERVAL_MS
 		assert.throws(() => validateMinInterval(bad, "--min-interval"), /--min-interval expects/);
 	});
 }
-
-test("pacingOrigin keys by scheme + host + effective port, never path", () => {
-	assert.equal(pacingOrigin("https://a.test/x?y=1"), "https://a.test");
-	assert.equal(pacingOrigin("https://a.test:443/other"), "https://a.test");
-	assert.equal(pacingOrigin("http://a.test:80/"), "http://a.test");
-	assert.equal(pacingOrigin("http://a.test:8080/"), "http://a.test:8080");
-	assert.notEqual(pacingOrigin("http://a.test/"), pacingOrigin("https://a.test/"));
-	assert.equal(pacingOrigin("file:///tmp/x.html"), null);
-	assert.equal(pacingOrigin("data:text/html,hi"), null);
-	assert.equal(pacingOrigin("not a url"), null);
-});
 
 test("defaultStateDir: TRAWL_STATE_DIR, then XDG_CACHE_HOME, then ~/.cache", () => {
 	assert.equal(defaultStateDir({ TRAWL_STATE_DIR: "/s" }, "/h"), "/s");

@@ -9,14 +9,12 @@ import { addCookiesFailure, cookieHeaderFor } from "./cookies.mjs";
 import {
 	COOLDOWN_STATUSES,
 	CooldownError,
-	cooldownOrigin,
 	createCooldownStore,
 } from "./cooldown.mjs";
 import {
 	DEFAULT_MIN_INTERVAL_MS,
 	createPacer,
 	defaultStateDir,
-	pacingOrigin,
 	validateMinInterval,
 } from "./pacing.mjs";
 import {
@@ -25,6 +23,7 @@ import {
 	crawlDelayMs,
 	robotsDenialMessage,
 } from "./robots.mjs";
+import { stateOrigin } from "./state.mjs";
 
 export { CooldownError };
 
@@ -514,7 +513,7 @@ export async function render(url, options = {}) {
 	// only; responses are still recorded. Non-http(s) URLs never touch it.
 	// Only the requested origin is admitted: a redirect to another origin is
 	// not intercepted, though a 429/503 there is recorded against it.
-	const origin = pacingOrigin(url);
+	const origin = stateOrigin(url);
 	const cooldown = origin ? createCooldownStore({ stateDir }) : null;
 	const admit = (checkOpts) => {
 		if (!cooldown) return;
@@ -687,7 +686,7 @@ export async function render(url, options = {}) {
 			if (!request.isNavigationRequest()) return;
 			if (request.frame() !== page.mainFrame()) return;
 			const status = response.status();
-			const at = cooldownOrigin(response.url());
+			const at = stateOrigin(response.url());
 			if (COOLDOWN_STATUSES.has(status)) {
 				cooldown.recordFailure(at, {
 					status,

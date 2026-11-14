@@ -41,7 +41,6 @@ import {
 	defaultStateDir,
 	originDigest,
 	realSleep,
-	stateOrigin,
 	writeJsonAtomic,
 } from "./state.mjs";
 
@@ -100,11 +99,6 @@ export function validateMinInterval(value, label = "minIntervalMs") {
 	}
 	return n;
 }
-
-// The pacing key: scheme + host + effective port, never a path. Returns null
-// for anything that is not http(s), which bypasses pacing (and the cache)
-// entirely.
-export const pacingOrigin = stateOrigin;
 
 // How long to wait before the next request. A `lastRequestAt` in the future
 // (the clock went backwards, or another host's clock is ahead) is clamped:

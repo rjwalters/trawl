@@ -582,9 +582,13 @@ default rather than asking you to promise you will.
 - **`robots.txt` is checked before every `http(s)` fetch.** A disallowed
   path fails with the rule that blocked it, naming `--ignore-robots`, and no
   page navigation happens. Matching is the classic baseline: `User-agent`
-  group selection (a group naming `trawl` beats `*`), longest matching path
-  prefix wins, and `Allow` breaks a tie with `Disallow`. Wildcard (`*`) and
-  end-anchor (`$`) patterns are not supported.
+  group selection (a group naming `trawl` beats `*`), longest matching rule
+  wins, and `Allow` breaks a tie with `Disallow`. Rule paths support the
+  RFC 9309 §2.2.3 special characters: `*` matches any run of characters
+  (including none, and it spans `/`), and a trailing `$` anchors the rule to
+  the end of the path — so `Disallow: /*.pdf$` refuses `/docs/a.pdf`. A `$`
+  anywhere else is literal. Percent-encoding is not normalised: both sides
+  are compared as written.
 - **An unreachable `robots.txt` blocks the run** (RFC 9309 §2.3.1.4). A 5xx,
   a network error (DNS failure, refused connection), a timeout (10s), or a
   response body that fails mid-read is treated as a full disallow, and the

@@ -1,10 +1,11 @@
 // A small, dependency-free robots.txt parser and matcher.
 //
-// Scope is deliberately the RFC 9309 baseline: `User-agent` grouping,
-// `Allow`/`Disallow` exact-prefix matching (longest match wins, `Allow`
-// breaks a tie), and `Crawl-delay`. Google's wildcard (`*`) and end-anchor
-// (`$`) path extensions are explicitly out of scope — a path is matched by
-// literal prefix comparison only.
+// Scope is the RFC 9309 baseline: `User-agent` grouping, `Allow`/`Disallow`
+// path matching (longest match wins, `Allow` breaks a tie), and `Crawl-delay`.
+// Rule paths honour the §2.2.3 special characters: `*` matches any run of
+// characters and a trailing `$` anchors the match to the end of the path.
+// Percent-encoding normalisation (§2.2.2) is out of scope — both sides are
+// compared exactly as given.
 //
 // This is a politeness mechanism, not a security boundary. Retrieval
 // failures follow RFC 9309 §2.3.1.3–4: a 4xx ("unavailable") means no
@@ -101,8 +102,56 @@ export function selectGroup(groups, userAgent) {
 	return merge(specific) ?? merge(groups.filter((g) => g.agents.includes("*")));
 }
 
-// Longest matching prefix wins; on an equal-length tie `Allow` beats
-// `Disallow`. An empty `Disallow:` value is the documented "allow
+// Match a rule path against `path`, honouring the RFC 9309 §2.2.3 `*`
+// wildcard and trailing `$` end anchor. The pattern is split on `*` and each
+// literal segment is matched at its earliest possible position, left to
+// right, so the cost is bounded by O(path length x pattern length) with no
+// backtracking at all.
+//
+// Earliest-position matching is complete here because `*` is the only
+// wildcard: matching a segment later than it could match only shortens the
+// suffix left for the remaining segments, so it can never rescue a match that
+// the earliest position rules out. That is what keeps a pattern like
+// `/*a*a*a*a*a*b` bounded, rather than needing a timeout or a length cap the
+// way a `*` -> `.*` regex translation would.
+//
+// A `$` is special only as the final character; anywhere else it is literal.
+function matchesPattern(pattern, path) {
+	let anchored = false;
+	let p = pattern;
+	if (p.endsWith("$")) {
+		anchored = true;
+		p = p.slice(0, -1);
+	}
+
+	const segments = p.split("*");
+
+	// No wildcard: identical to the old literal prefix test when unanchored.
+	if (segments.length === 1) {
+		return anchored ? path === segments[0] : path.startsWith(segments[0]);
+	}
+
+	// The text before the first `*` is anchored to the start of the path.
+	if (!path.startsWith(segments[0])) return false;
+	let pos = segments[0].length;
+
+	for (let i = 1; i < segments.length - 1; i++) {
+		const at = path.indexOf(segments[i], pos);
+		if (at === -1) return false;
+		pos = at + segments[i].length;
+	}
+
+	// The text after the last `*`. An empty tail means the pattern ended in
+	// `*`, which any remaining suffix satisfies.
+	const tail = segments[segments.length - 1];
+	if (tail === "") return true;
+	if (anchored) return path.length - tail.length >= pos && path.endsWith(tail);
+	return path.indexOf(tail, pos) !== -1;
+}
+
+// Longest matching rule wins; on an equal-length tie `Allow` beats
+// `Disallow`. The length compared is the rule's pattern as written, `*` and
+// `$` included. An empty `Disallow:` value is the documented "allow
 // everything" idiom and matches nothing.
 export function matchRule(group, path) {
 	if (!group) return { allowed: true, rule: null };
@@ -110,7 +159,7 @@ export function matchRule(group, path) {
 	let best = null;
 	for (const rule of group.rules) {
 		if (rule.path === "") continue;
-		if (!path.startsWith(rule.path)) continue;
+		if (!matchesPattern(rule.path, path)) continue;
 		if (
 			best === null ||
 			rule.path.length > best.path.length ||

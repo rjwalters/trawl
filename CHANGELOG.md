@@ -25,6 +25,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bad one is a tool error and the server keeps serving. Omitting all three
   leaves behaviour exactly as before.
 
+### Changed
+
+- **`robots.txt` rule paths now honour `*` and `$`** (RFC 9309 §2.2.3).
+  A `*` in an `Allow`/`Disallow` path matches any run of characters,
+  including none, and spans `/`; a trailing `$` anchors the rule to the end
+  of the path (path plus query, as matched today). A `$` anywhere else stays
+  literal. Previously these were compared as literal characters, so a common
+  real-world rule like `Disallow: /*.pdf$` never matched.
+
+  **More paths are now refused than before.** A site whose `robots.txt` uses
+  wildcards may now have paths blocked that earlier versions fetched. This is
+  the behaviour RFC 9309 requires; `--ignore-robots` still overrides it.
+
+  Longest match still wins and `Allow` still breaks a tie, now comparing the
+  rule's pattern as written. Rules without `*` or `$` behave exactly as
+  before. Matching is bounded — a pathological pattern such as
+  `/*a*a*a*a*a*b` cannot hang the run. Percent-encoding normalisation
+  (§2.2.2) remains out of scope.
+
 ## [0.4.0] - 2026-11-10
 
 `trawl` can now borrow the cookies your everyday browser already has: import

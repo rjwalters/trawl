@@ -21,6 +21,7 @@ import {
 	AWKWARD,
 	assertNoValue,
 	binLink,
+	browserExecutablePath,
 	browserOpts,
 	CLI_PATH,
 	errorText,
@@ -778,7 +779,7 @@ test("--cookies presents the cookie for one fetch only, from every format", brow
 	});
 	await new Promise((r) => server.listen(0, "127.0.0.1", r));
 	const origin = `http://127.0.0.1:${server.address().port}`;
-	const env = { HOME: home, TRAWL_PROFILE_DIR: "" };
+	const env = { HOME: home, TRAWL_PROFILE_DIR: "", TRAWL_EXECUTABLE_PATH: browserExecutablePath };
 	// The browser itself may write into $HOME on any launch (Chromium on Linux
 	// creates .cache and .local), so the bar is a plain fetch's footprint in a
 	// HOME of its own, not an empty directory.
@@ -859,7 +860,11 @@ test("a cookie-gated robots.txt lets the fetch through with --cookies or an impo
 	});
 	await new Promise((r) => server.listen(0, "127.0.0.1", r));
 	const origin = `http://127.0.0.1:${server.address().port}`;
-	const env = { HOME: home, TRAWL_PROFILE_DIR: "" };
+	const env = { HOME: home, TRAWL_PROFILE_DIR: "", TRAWL_EXECUTABLE_PATH: browserExecutablePath };
+	// Every runBin call here needs the variable, `cookies import` included:
+	// its resolver is the headless one (only `trawl login` needs a headed
+	// browser), and it never records a profile-browser marker, so the profile
+	// fetch has no profileBrowser path and resolves through the variable too.
 	const common = ["--no-auth-check", "--no-pacing"];
 	const file = writeSource(
 		dir,
@@ -1067,6 +1072,7 @@ test("--cookies with non-ASCII values: the page loads, robots.txt and page get t
 		const r = await runBin(link, [`${srv.origin}/`, "--cookies", file, "-S", "--no-auth-check", "--no-pacing", "-f", "text"], {
 			HOME: home,
 			TRAWL_PROFILE_DIR: "",
+			TRAWL_EXECUTABLE_PATH: browserExecutablePath,
 		});
 		assert.equal(r.code, 0, r.stderr);
 		assert.match(r.stdout, /page loaded/);

@@ -34,15 +34,24 @@ import { resolveExecutablePath } from "../src/browser.mjs";
 // `npm test` is always runnable (CLAUDE.md: "a green local run does not
 // always mean the render path was exercised"). CI installs Chromium to keep
 // them meaningful.
+let executablePath = null;
 let detected = true;
 try {
-	resolveExecutablePath();
+	executablePath = resolveExecutablePath();
 } catch {
 	detected = false;
 }
 
 /** True when a Chromium binary resolves on this host. */
 export const haveBrowser = detected;
+
+/**
+ * The binary `haveBrowser` was decided from, or null without one. A test that
+ * overrides $HOME for a subprocess passes it as $TRAWL_EXECUTABLE_PATH, so the
+ * child resolves the browser the guard resolved instead of looking under the
+ * temp HOME — where Playwright's cache is not (findCachedShell reads homedir).
+ */
+export const browserExecutablePath = executablePath;
 
 /** `node --test` options object: pass as a test's second argument. */
 export const browserOpts = {

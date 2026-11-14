@@ -5,7 +5,14 @@ import { createRequire } from "node:module";
 import { chromium } from "playwright-core";
 import TurndownService from "turndown";
 import { resolveExecutablePath } from "./browser.mjs";
-import { addCookiesFailure, cookieHeaderFor } from "./cookies.mjs";
+import {
+	CookieParseError,
+	addCookiesFailure,
+	browserWouldReject,
+	cookieHeaderFor,
+	filterCookies,
+	parseCookies,
+} from "./cookies.mjs";
 import {
 	COOLDOWN_STATUSES,
 	CooldownError,
@@ -26,7 +33,11 @@ import {
 	robotsDenialMessage,
 } from "./robots.mjs";
 
-export { CooldownError };
+// The public cookie surface, re-exported so a library caller can build the
+// list `{ cookies: [...] }` wants without a second entry point: the `exports`
+// map has one entry, and a `./cookies` subpath would expose every helper in
+// `cookies.mjs` rather than these four.
+export { CookieParseError, CooldownError, browserWouldReject, filterCookies, parseCookies };
 
 const REDACTED = "[redacted]";
 const REDACT_HEADERS = new Set([

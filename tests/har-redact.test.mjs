@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { redactHar, redactHarFile } from "../src/render.mjs";
+import { tmpFile as sharedTmpFile } from "./helpers.mjs";
 
 const SENTINEL = "s3cr3t-sentinel";
 
@@ -46,9 +45,7 @@ test("redactHar tolerates a HAR with no entries or cookies", () => {
 	assert.doesNotThrow(() => redactHar({ log: { entries: [{ request: {}, response: {} }] } }));
 });
 
-function tmpFile(name) {
-	return path.join(mkdtempSync(path.join(tmpdir(), "trawl-redact-")), name);
-}
+const tmpFile = (name) => sharedTmpFile(name, "trawl-redact-");
 
 test("redactHarFile rewrites a valid HAR in place", () => {
 	const file = tmpFile("ok.har");

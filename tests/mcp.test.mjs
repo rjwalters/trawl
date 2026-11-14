@@ -1,32 +1,23 @@
 // Unit tests for the MCP tool handlers. These drive `callTool` directly with
 // an injected `render`, so no MCP client, browser, or network is needed. The
-// handful of tests that do want a real render use the same `haveBrowser`
-// guard as tests/render.test.mjs.
+// handful of tests that do want a real render use the shared `browserOpts`
+// skip guard from tests/helpers.mjs.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { resolveExecutablePath } from "../src/browser.mjs";
 import {
 	DEFAULT_MAX_CHARS,
 	TOOLS,
+	MAX_WAIT_MS,
+	WAIT_UNTIL,
 	callTool,
 	maxChars,
 	renderOptionsFor,
 	truncate,
 } from "../src/mcp.mjs";
-
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+import { browserOpts as opts, fixtureUrl as sharedFixtureUrl } from "./helpers.mjs";
 
 // A render stub that records what it was handed and replays a canned result.
 function stubRender(body = "ok") {
@@ -137,6 +128,180 @@ test("callTool passes the mapped options through to render", async () => {
 	]);
 });
 
+// --- load controls: wait_until / settle_ms / timeout_ms ---------------------
+
+test("both tools advertise the three load controls", () => {
+	for (const tool of TOOLS) {
+		const props = tool.inputSchema.properties;
+		// Enum derived from WAIT_UNTIL, like `format`'s is from FORMATS: a
+		// hand-written copy here is exactly how the format list went stale.
+		assert.deepEqual(props.wait_until.enum, [...WAIT_UNTIL]);
+		assert.equal(props.settle_ms.type, "number");
+		assert.equal(props.settle_ms.minimum, 0);
+		assert.equal(props.settle_ms.maximum, MAX_WAIT_MS);
+		assert.equal(props.timeout_ms.type, "number");
+		// Playwright reads 0 as "no timeout"; this surface refuses it rather
+		// than letting an agent hang a stdio call with no way to cancel it.
+		assert.equal(props.timeout_ms.minimum, 1);
+		assert.equal(props.timeout_ms.maximum, MAX_WAIT_MS);
+		assert.match(props.timeout_ms.description, /no timeout/);
+	}
+});
+
+test("fetch_page maps the load controls onto render's option names", () => {
+	const { options } = renderOptionsFor("fetch_page", {
+		url: "https://example.com",
+		wait_until: "domcontentloaded",
+		settle_ms: 2000,
+		timeout_ms: 45000,
+	});
+	assert.equal(options.waitUntil, "domcontentloaded");
+	assert.equal(options.settle, 2000);
+	assert.equal(options.timeout, 45000);
+});
+
+test("fetch_links maps the load controls too", () => {
+	const { options } = renderOptionsFor("fetch_links", {
+		url: "https://example.com",
+		wait_until: "load",
+		settle_ms: 500,
+		timeout_ms: 1,
+	});
+	assert.equal(options.format, "links");
+	assert.equal(options.waitUntil, "load");
+	assert.equal(options.settle, 500);
+	assert.equal(options.timeout, 1);
+});
+
+// The guard for "omitting all three leaves behaviour exactly as today".
+// `render()` merges `{ ...DEFAULTS, ...options }` and an object spread does
+// NOT skip `undefined`, so an always-set key would overwrite
+// `waitUntil: "networkidle"` with `undefined` — making `page.goto` fall back
+// to Playwright's own `load` default and silently disabling the
+// networkidle->domcontentloaded retry this whole feature exists to reach.
+// The keys must be absent, not present-and-undefined.
+test("omitting the load controls leaves the keys absent, not undefined", () => {
+	for (const name of ["fetch_page", "fetch_links"]) {
+		const { options } = renderOptionsFor(name, { url: "https://example.com" });
+		assert.equal("waitUntil" in options, false, `${name} set waitUntil`);
+		assert.equal("settle" in options, false, `${name} set settle`);
+		assert.equal("timeout" in options, false, `${name} set timeout`);
+	}
+});
+
+test("a partial call sets only the load controls it was given", () => {
+	const { options } = renderOptionsFor("fetch_page", {
+		url: "https://example.com",
+		settle_ms: 1500,
+	});
+	assert.equal(options.settle, 1500);
+	assert.equal("waitUntil" in options, false);
+	assert.equal("timeout" in options, false);
+});
+
+// Mirrors `requireString`, which treats an explicit null as "not supplied".
+test("an explicit null load control counts as absent", () => {
+	const { options } = renderOptionsFor("fetch_page", {
+		url: "u",
+		wait_until: null,
+		settle_ms: null,
+		timeout_ms: null,
+	});
+	assert.equal("waitUntil" in options, false);
+	assert.equal("settle" in options, false);
+	assert.equal("timeout" in options, false);
+});
+
+test("settle_ms accepts 0 and both accept exactly MAX_WAIT_MS", () => {
+	const zero = renderOptionsFor("fetch_page", { url: "u", settle_ms: 0 });
+	assert.equal(zero.options.settle, 0);
+	const max = renderOptionsFor("fetch_page", {
+		url: "u",
+		settle_ms: MAX_WAIT_MS,
+		timeout_ms: MAX_WAIT_MS,
+	});
+	assert.equal(max.options.settle, MAX_WAIT_MS);
+	assert.equal(max.options.timeout, MAX_WAIT_MS);
+});
+
+test("rejects a wait_until outside the enum, naming the allowed values", () => {
+	assert.throws(
+		() => renderOptionsFor("fetch_page", { url: "u", wait_until: "bogus" }),
+		/"wait_until" must be one of: load, domcontentloaded, networkidle/,
+	);
+	assert.throws(
+		() => renderOptionsFor("fetch_links", { url: "u", wait_until: 42 }),
+		/"wait_until" must be one of: load, domcontentloaded, networkidle/,
+	);
+});
+
+test("rejects non-numeric and out-of-range load controls on both tools", () => {
+	const cases = [
+		[{ settle_ms: "2000" }, /"settle_ms" must be a number/],
+		[{ settle_ms: true }, /"settle_ms" must be a number/],
+		[{ settle_ms: Number.NaN }, /"settle_ms" must be a finite number/],
+		[
+			{ settle_ms: Number.POSITIVE_INFINITY },
+			/"settle_ms" must be a finite number/,
+		],
+		[{ settle_ms: -1 }, /"settle_ms" must be at least 0/],
+		[{ settle_ms: MAX_WAIT_MS + 1 }, /"settle_ms" must be at most 600000/],
+		[{ timeout_ms: 0 }, /"timeout_ms" must be at least 1/],
+		[{ timeout_ms: -5 }, /"timeout_ms" must be at least 1/],
+		[{ timeout_ms: MAX_WAIT_MS + 1 }, /"timeout_ms" must be at most 600000/],
+		[{ timeout_ms: "30s" }, /"timeout_ms" must be a number/],
+	];
+	for (const [extra, pattern] of cases) {
+		for (const name of ["fetch_page", "fetch_links"]) {
+			assert.throws(
+				() => renderOptionsFor(name, { url: "u", ...extra }),
+				pattern,
+				`${name} accepted ${JSON.stringify(extra)}`,
+			);
+		}
+	}
+});
+
+test("a rejected load control is a tool error and never reaches render", async () => {
+	const render = stubRender("body");
+	const bad = [
+		{ wait_until: "bogus" },
+		{ settle_ms: -1 },
+		{ settle_ms: "2000" },
+		{ settle_ms: Number.NaN },
+		{ timeout_ms: 0 },
+		{ timeout_ms: MAX_WAIT_MS + 1 },
+	];
+	for (const extra of bad) {
+		for (const name of ["fetch_page", "fetch_links"]) {
+			const result = await callTool(name, { url: "u", ...extra }, { render, env: {} });
+			assert.equal(result.isError, true, `${name} ${JSON.stringify(extra)}`);
+		}
+	}
+	assert.equal(render.calls.length, 0);
+
+	// ...and the server still serves the next, valid call.
+	const good = await callTool(
+		"fetch_page",
+		{ url: "u", wait_until: "domcontentloaded", settle_ms: 2000 },
+		{ render, env: {} },
+	);
+	assert.equal(good.isError, undefined);
+	assert.equal(text(good), "body");
+	assert.deepEqual(render.calls, [
+		{
+			url: "u",
+			options: {
+				format: "text",
+				selector: undefined,
+				waitForSelector: undefined,
+				waitUntil: "domcontentloaded",
+				settle: 2000,
+			},
+		},
+	]);
+});
+
 // --- truncation -------------------------------------------------------------
 
 test("leaves a body inside the budget alone", () => {
@@ -202,7 +367,12 @@ test("a missing browser becomes a tool error carrying the install hint", async (
 
 test("bad arguments become a tool error, not a throw", async () => {
 	const render = stubRender();
-	for (const args of [{}, { url: "u", format: "yaml" }]) {
+	for (const args of [
+		{},
+		{ url: "u", format: "yaml" },
+		{ url: "u", wait_until: "bogus" },
+		{ url: "u", timeout_ms: 0 },
+	]) {
 		const result = await callTool("fetch_page", args, { render, env: {} });
 		assert.equal(result.isError, true);
 	}
@@ -274,12 +444,7 @@ const SPA = `<!doctype html>
     '<h1>Hydrated</h1><a href="https://example.com/a">First</a>';
 </script>`;
 
-function fixtureUrl(html, name) {
-	const dir = mkdtempSync(path.join(tmpdir(), "trawl-mcp-test-"));
-	const file = path.join(dir, name);
-	writeFileSync(file, html);
-	return pathToFileURL(file).href;
-}
+const fixtureUrl = (html, name) => sharedFixtureUrl(html, name, "trawl-mcp-test-");
 
 test("fetch_page renders a real JS-built page", opts, async () => {
 	const result = await callTool("fetch_page", {

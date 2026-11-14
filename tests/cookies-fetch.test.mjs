@@ -6,48 +6,38 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 import { resolveExecutablePath } from "../src/browser.mjs";
 import { main, runLogin } from "../src/cli.mjs";
 import { createCooldownStore } from "../src/cooldown.mjs";
 import { CooldownError, render } from "../src/render.mjs";
+import {
+	AWKWARD,
+	assertNoValue,
+	binLink,
+	browserOpts,
+	CLI_PATH,
+	errorText,
+	netscape,
+	runBin,
+	tempDir as sharedTempDir,
+	writeSource,
+} from "./helpers.mjs";
 import { selfSignedCert } from "./selfsigned.mjs";
 
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const browserOpts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+process.env.TRAWL_STATE_DIR = sharedTempDir("trawl-state-");
 
-process.env.TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
-
-const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 const SENTINEL = "SENTINEL-c00k1e-v4lue-9f3e";
 const FUTURE = Math.floor(Date.now() / 1000) + 30 * 86400;
 const URL_ = "https://example.com/";
 
-function tempDir() {
-	return mkdtempSync(join(tmpdir(), "trawl-cookies-fetch-"));
-}
-
-function writeSource(dir, name, text) {
-	const file = join(dir, name);
-	writeFileSync(file, text);
-	return file;
-}
-
-function netscape(lines) {
-	return `# Netscape HTTP Cookie File\n${lines.map((l) => l.join("\t")).join("\n")}\n`;
-}
+const tempDir = () => sharedTempDir("trawl-cookies-fetch-");
 
 const TXT = netscape([
 	[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", SENTINEL],
@@ -364,21 +354,9 @@ test("render() without cookies (or with none) never calls addCookies", async () 
 	}
 });
 
-// A value with every character JSON or URL encoding rewrites, so an echo in
-// any encoding differs from the raw value and a plain `includes` would miss it.
-const AWKWARD = 'aw"KW\\rd/V4l+u3=Zq-77Xk';
-
-function assertNoValue(haystacks, value = AWKWARD) {
-	const forms = [value, encodeURIComponent(value), JSON.stringify(value), escape(value), value.slice(0, 8)];
-	for (let i = 0; i + 6 <= value.length; i++) forms.push(value.slice(i, i + 6));
-	for (const h of haystacks) {
-		for (const f of forms) assert.ok(!h.includes(f), `leaked ${JSON.stringify(f)} in ${JSON.stringify(h)}`);
-	}
-}
-
-function errorText(err) {
-	return [String(err?.message), String(err?.stack), String(err?.cause ?? ""), JSON.stringify(err)];
-}
+// `AWKWARD`, `assertNoValue` and `errorText` are shared (tests/helpers.mjs):
+// the value rewrites under every encoding, so an echo in any of them differs
+// from the raw value and a plain `includes` would miss it.
 
 test("an addCookies rejection in render() gets a fixed message; everything is closed", async () => {
 	const throwingMessage = (v) => {
@@ -781,21 +759,12 @@ test("the sentinel cookie value appears in no fetch output, on any path", async 
 });
 
 // --- end to end: a real browser, a real server, through a symlinked bin ---
-
-function runBin(link, args, env) {
-	return new Promise((resolve) => {
-		execFile(link, args, { env: { ...process.env, ...env }, timeout: 60000 }, (err, stdout, stderr) => {
-			resolve({ code: err?.code ?? 0, stdout, stderr });
-		});
-	});
-}
+// `runBin` and `binLink` are shared (tests/helpers.mjs).
 
 test("--cookies presents the cookie for one fetch only, from every format", browserOpts, async () => {
 	const dir = tempDir();
-	const binDir = tempDir();
+	const { dir: binDir, link } = binLink("trawl-cookies-fetch-");
 	const home = tempDir();
-	const link = join(binDir, "trawl");
-	symlinkSync(CLI_PATH, link);
 	const robotsCookies = [];
 	const server = createServer((req, res) => {
 		if (req.url === "/robots.txt") {
@@ -874,10 +843,8 @@ function filesUnder(root) {
 // imported --profile, through a symlinked bin and a real browser.
 test("a cookie-gated robots.txt lets the fetch through with --cookies or an imported --profile", browserOpts, async () => {
 	const dir = tempDir();
-	const binDir = tempDir();
+	const { dir: binDir, link } = binLink("trawl-cookies-fetch-");
 	const home = tempDir();
-	const link = join(binDir, "trawl");
-	symlinkSync(CLI_PATH, link);
 	const robots = [];
 	const server = createServer((req, res) => {
 		if (req.url === "/robots.txt") {
@@ -1084,10 +1051,8 @@ test("CLI: a robots.txt failure with cookies sent prints no cookie content", asy
 test("--cookies with non-ASCII values: the page loads, robots.txt and page get the same bytes", browserOpts, async () => {
 	const srv = await bytesServer();
 	const dir = tempDir();
-	const binDir = tempDir();
+	const { dir: binDir, link } = binLink("trawl-cookies-fetch-");
 	const home = tempDir();
-	const link = join(binDir, "trawl");
-	symlinkSync(CLI_PATH, link);
 	try {
 		const file = writeSource(
 			dir,

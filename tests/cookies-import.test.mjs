@@ -4,20 +4,10 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import {
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	rmSync,
-	statSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
 import { resolveExecutablePath } from "../src/browser.mjs";
 import { browserWouldReject } from "../src/cookies.mjs";
 import {
@@ -27,36 +17,27 @@ import {
 	runCookies,
 	runCookiesImport,
 } from "../src/cli.mjs";
+import {
+	AWKWARD,
+	assertNoValue,
+	binLink,
+	browserOpts,
+	CLI_PATH,
+	errorText,
+	netscape,
+	runBin,
+	tempDir as sharedTempDir,
+	writeSource,
+} from "./helpers.mjs";
 
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const browserOpts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+process.env.TRAWL_STATE_DIR = sharedTempDir("trawl-state-");
 
-process.env.TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
-
-const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 const SENTINEL = "SENTINEL-c00k1e-v4lue-9f3e";
 const FUTURE = Math.floor(Date.now() / 1000) + 30 * 86400;
 const NOW_MS = Date.now();
 const NOW_S = Math.floor(NOW_MS / 1000);
 
-function tempDir() {
-	return mkdtempSync(join(tmpdir(), "trawl-cookies-"));
-}
-
-function writeSource(dir, name, text) {
-	const file = join(dir, name);
-	writeFileSync(file, text);
-	return file;
-}
-
-function netscape(lines) {
-	return `# Netscape HTTP Cookie File\n${lines.map((l) => l.join("\t")).join("\n")}\n`;
-}
+const tempDir = () => sharedTempDir("trawl-cookies-");
 
 const TXT = netscape([
 	[".example.com", "TRUE", "/", "TRUE", String(FUTURE), "pref", SENTINEL],
@@ -406,23 +387,9 @@ test("zero survivors: the message names the filter that removed them", async () 
 
 // --- the context lifecycle ---
 
-// A value with every character JSON or URL encoding rewrites, so an echo in
-// any encoding differs from the raw value and a plain `includes` would miss it.
-const AWKWARD = 'aw"KW\\rd/V4l+u3=Zq-77Xk';
-
-// Every form a browser error could carry the value in, and every 6+ character
-// substring of it: none may reach stdout, stderr or the thrown error.
-function assertNoValue(haystacks, value = AWKWARD) {
-	const forms = [value, encodeURIComponent(value), JSON.stringify(value), escape(value), value.slice(0, 8)];
-	for (let i = 0; i + 6 <= value.length; i++) forms.push(value.slice(i, i + 6));
-	for (const h of haystacks) {
-		for (const f of forms) assert.ok(!h.includes(f), `leaked ${JSON.stringify(f)} in ${JSON.stringify(h)}`);
-	}
-}
-
-function errorText(err) {
-	return [String(err?.message), String(err?.stack), String(err?.cause ?? ""), JSON.stringify(err)];
-}
+// `AWKWARD`, `assertNoValue` and `errorText` are shared (tests/helpers.mjs):
+// every form a browser error could carry the value in, and every 6+ character
+// substring of it, none of which may reach stdout, stderr or the thrown error.
 
 test("the context is closed when addCookies throws, and no form of the value is echoed", async () => {
 	const dir = tempDir();
@@ -700,19 +667,11 @@ test("--help documents the subcommand and its flags", async () => {
 
 // --- end to end: import into a real profile, then fetch with it ---
 
-function runBin(link, args) {
-	return new Promise((resolve) => {
-		execFile(link, args, { env: process.env, timeout: 60000 }, (err, stdout, stderr) => {
-			resolve({ code: err?.code ?? 0, stdout, stderr });
-		});
-	});
-}
+// `runBin` and `binLink` are shared (tests/helpers.mjs).
 
 test("an imported cookie is presented by a later fetch with --profile", browserOpts, async () => {
 	const dir = tempDir();
-	const binDir = tempDir();
-	const link = join(binDir, "trawl");
-	symlinkSync(CLI_PATH, link);
+	const { link, cleanup: cleanupBin } = binLink("trawl-cookies-");
 	const server = createServer((req, res) => {
 		if (req.url === "/robots.txt") {
 			res.writeHead(404);
@@ -750,7 +709,7 @@ test("an imported cookie is presented by a later fetch with --profile", browserO
 	} finally {
 		await new Promise((r) => server.close(r));
 		rmSync(dir, { recursive: true, force: true });
-		rmSync(binDir, { recursive: true, force: true });
+		cleanupBin();
 	}
 });
 

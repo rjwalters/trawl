@@ -17,6 +17,7 @@ import {
 	safeErrorCode,
 	selectGroup,
 } from "../src/robots.mjs";
+import { AWKWARD, assertNoValue } from "./helpers.mjs";
 
 const UA = "trawl/0.1.0 (+https://github.com/rjwalters/trawl)";
 
@@ -672,17 +673,9 @@ test("without sentCookies the cookie note is kept verbatim", () => {
 
 // --- #87: with a Cookie header sent, a failure is a code or fixed text ---
 
-// Every character JSON or URL encoding rewrites, so an echo in any encoding
-// differs from the raw value; any 6-character run of it counts as a leak.
-const AWKWARD = 'aw"KW\\rd/V4l+u3=Zq-77Xk';
-
-function assertNoValue(haystacks, value = AWKWARD) {
-	const forms = [value, encodeURIComponent(value), JSON.stringify(value)];
-	for (let i = 0; i + 6 <= value.length; i++) forms.push(value.slice(i, i + 6));
-	for (const h of haystacks) {
-		for (const f of forms) assert.ok(!h.includes(f), `leaked ${JSON.stringify(f)} in ${JSON.stringify(h)}`);
-	}
-}
+// `AWKWARD` and `assertNoValue` are shared (tests/helpers.mjs): every
+// character JSON or URL encoding rewrites, so an echo in any encoding differs
+// from the raw value; any 6-character run of it counts as a leak.
 
 // Errors that quote the header everywhere an error can carry text.
 function quotingErrors(header) {

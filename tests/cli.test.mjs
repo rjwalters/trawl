@@ -1,20 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import {
-	mkdtempSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { createServer } from "node:http";
+import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { resolveExecutablePath } from "../src/browser.mjs";
+import { pathToFileURL } from "node:url";
 import {
 	defaultProfileDir,
 	defaultWaitForUser,
@@ -24,18 +15,20 @@ import {
 	parseViewport,
 	runLogin,
 } from "../src/cli.mjs";
-
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+import {
+	assertSpaced,
+	binLink,
+	browserOpts as opts,
+	CLI_PATH,
+	fixtureUrl as sharedFixtureUrl,
+	runBin,
+	serveLogged,
+	tempDir,
+} from "./helpers.mjs";
 
 // Spawned CLIs inherit this, so cross-run pacing state (src/pacing.mjs) never
 // lands in the real ~/.cache/trawl.
-process.env.TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+process.env.TRAWL_STATE_DIR = tempDir("trawl-state-");
 
 test("collects a bare url as a positional", () => {
 	assert.deepEqual(parseArgs(["https://example.com"])._, [
@@ -326,8 +319,6 @@ test("main() dispatches `trawl login <origin>` to runLogin", async () => {
 // test imports the module or spawns `node src/cli.mjs`, and both of those pass
 // even with the bug present.
 
-const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
-
 function runCli(entry, args = []) {
 	return new Promise((resolve) => {
 		execFile(process.execPath, [entry, ...args], (err, stdout, stderr) => {
@@ -337,10 +328,8 @@ function runCli(entry, args = []) {
 }
 
 test("isMainModule() resolves a symlinked entry back to this module", () => {
-	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	const { dir, link, cleanup } = binLink();
 	try {
-		const link = join(dir, "trawl");
-		symlinkSync(CLI_PATH, link);
 		// The exact comparison the shebang path makes for a global install.
 		assert.equal(isMainModule(link, pathToFileURL(CLI_PATH).href), true);
 		// An unrelated entry is still correctly "not main".
@@ -348,16 +337,13 @@ test("isMainModule() resolves a symlinked entry back to this module", () => {
 		// A missing argv[1] must not throw.
 		assert.equal(isMainModule(undefined, pathToFileURL(CLI_PATH).href), false);
 	} finally {
-		rmSync(dir, { recursive: true, force: true });
+		cleanup();
 	}
 });
 
 test("runs when invoked through a bin symlink, not just by real path", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	const { link, cleanup } = binLink();
 	try {
-		const link = join(dir, "trawl");
-		symlinkSync(CLI_PATH, link);
-
 		const viaLink = await runCli(link, ["--help"]);
 		// The bug was silence-with-exit-0, so assert on real output, not the code.
 		assert.ok(
@@ -371,31 +357,24 @@ test("runs when invoked through a bin symlink, not just by real path", async () 
 		assert.equal(viaLink.stdout, viaReal.stdout);
 		assert.equal(viaLink.code, viaReal.code);
 	} finally {
-		rmSync(dir, { recursive: true, force: true });
+		cleanup();
 	}
 });
 
 test("a symlinked CLI reports the same version as the real path", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
+	const { link, cleanup } = binLink();
 	try {
-		const link = join(dir, "trawl");
-		symlinkSync(CLI_PATH, link);
 		const { stdout, code } = await runCli(link, ["--version"]);
 		assert.equal(code, 0);
 		assert.match(stdout.trim(), /^\d+\.\d+\.\d+$/);
 	} finally {
-		rmSync(dir, { recursive: true, force: true });
+		cleanup();
 	}
 });
 
 // --- auth-wall exit code, end-to-end through the real CLI process (#22) ---
 
-function fixtureUrl(html, name) {
-	const dir = mkdtempSync(join(tmpdir(), "trawl-cli-fixture-"));
-	const file = join(dir, name);
-	writeFileSync(file, html);
-	return pathToFileURL(file).href;
-}
+const fixtureUrl = (html, name) => sharedFixtureUrl(html, name, "trawl-cli-fixture-");
 
 test("exits 3 and reports a login wall for a tiny sign-in page", opts, async () => {
 	const url = fixtureUrl(
@@ -439,93 +418,12 @@ test("--help documents the pacing flags and the state dir", async () => {
 	assert.match(stdout, /TRAWL_STATE_DIR/);
 });
 
-// Logs when each path was requested; anything unlisted is a 404.
-// The recorded start of the last gated request (`lastRequestAt` in the one
-// state file under `stateDir`), or null. The gate writes it just before
-// sending, so a server-side snapshot taken as a request arrives is that
-// request's recorded start. Spacing is asserted on these rather than on
-// arrival gaps: a fresh Node process's first fetch() takes 100-200ms (more
-// under load) to reach the server, so arrival gaps between a cold and a warm
-// request can be shorter than the interval the gate correctly enforced. See
-// the matching section comment in tests/render.test.mjs.
-function recordedStart(stateDir) {
-	const dir = join(stateDir, "pacing");
-	let files;
-	try {
-		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-	} catch {
-		return null;
-	}
-	if (files.length !== 1) return null;
-	try {
-		return JSON.parse(readFileSync(join(dir, files[0]), "utf8")).lastRequestAt ?? null;
-	} catch {
-		return null;
-	}
-}
-
-// Consecutive gated requests started >= minGapMs apart (exact, by recorded
-// start), and none arrived before its recorded start.
-function assertSpaced(hits, minGapMs) {
-	for (const h of hits) {
-		assert.equal(typeof h.recorded, "number", `${h.path} arrived with no recorded start`);
-		assert.ok(h.at >= h.recorded, `${h.path} arrived before its recorded start`);
-	}
-	for (let i = 1; i < hits.length; i++) {
-		const gap = hits[i].recorded - hits[i - 1].recorded;
-		assert.ok(
-			gap >= minGapMs,
-			`${hits[i - 1].path} -> ${hits[i].path} started only ${gap}ms apart ` +
-				`(want >= ${minGapMs})` +
-				(gap === 0 ? "; the earlier request arrived after the later one was recorded" : ""),
-		);
-	}
-}
-
-async function serveLogged(routes, { stateDir } = {}) {
-	const hits = [];
-	const server = createServer((req, res) => {
-		const { pathname } = new URL(req.url, "http://127.0.0.1");
-		hits.push({
-			path: pathname,
-			at: Date.now(),
-			recorded: stateDir ? recordedStart(stateDir) : null,
-		});
-		const body = routes[pathname];
-		if (body === undefined) {
-			res.writeHead(404);
-			res.end();
-			return;
-		}
-		res.writeHead(200, {
-			"content-type": pathname.endsWith(".txt") ? "text/plain" : "text/html",
-		});
-		res.end(body);
-	});
-	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-	return {
-		origin: `http://127.0.0.1:${server.address().port}`,
-		hits,
-		close: () => new Promise((resolve) => server.close(resolve)),
-	};
-}
-
-// Execute the bin symlink *directly* — shebang plus exec bit, the way a PATH
-// lookup runs an npm-installed `trawl` — rather than `node src/cli.mjs`.
-function runBin(link, args, env) {
-	return new Promise((resolve) => {
-		execFile(link, args, { env: { ...process.env, ...env } }, (err, stdout, stderr) => {
-			resolve({ code: err?.code ?? 0, stdout, stderr });
-		});
-	});
-}
-
-function binLink() {
-	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
-	const link = join(dir, "trawl");
-	symlinkSync(CLI_PATH, link);
-	return { link, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
-}
+// `serveLogged` logs when each path was requested and, given `stateDir`, the
+// recorded start of the request that hit it; `assertSpaced` checks consecutive
+// gated requests started >= minGapMs apart. Both are shared
+// (tests/helpers.mjs), along with `runBin` and `binLink` — see the section
+// comment there for why spacing is asserted on recorded starts rather than on
+// arrival gaps.
 
 const NO_SUCH_CHROME = join(tmpdir(), "trawl-no-such-chrome");
 
@@ -544,7 +442,7 @@ test("rejects a bad --min-interval before making any request", async () => {
 });
 
 test("two separate trawl processes are spaced by --min-interval (via the bin symlink)", async () => {
-	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	const TRAWL_STATE_DIR = tempDir("trawl-state-");
 	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" }, { stateDir: TRAWL_STATE_DIR });
 	const { link, cleanup } = binLink();
 	try {
@@ -572,7 +470,7 @@ test("two separate trawl processes are spaced by --min-interval (via the bin sym
 test("--no-pacing opts out: no cross-run wait and no state written", async () => {
 	const s = await serveLogged({ "/robots.txt": "User-agent: *\nAllow: /\n" });
 	const { link, cleanup } = binLink();
-	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	const TRAWL_STATE_DIR = tempDir("trawl-state-");
 	try {
 		for (let i = 0; i < 2; i++) {
 			await runBin(
@@ -591,7 +489,7 @@ test("--no-pacing opts out: no cross-run wait and no state written", async () =>
 });
 
 test("two CLI renders space every robots.txt and page request", opts, async () => {
-	const TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
+	const TRAWL_STATE_DIR = tempDir("trawl-state-");
 	const s = await serveLogged({
 		"/robots.txt": "User-agent: *\nAllow: /\n",
 		"/page.html": "<!doctype html><title>P</title><h1>Paced page</h1>",

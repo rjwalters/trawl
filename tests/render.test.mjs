@@ -13,18 +13,16 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { test } from "node:test";
-import { resolveExecutablePath } from "../src/browser.mjs";
 import { AuthWallError, detectAuthWall, render } from "../src/render.mjs";
-
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+import {
+	assertSpaced,
+	browserOpts as opts,
+	fixtureUrl as sharedFixtureUrl,
+	recordedStart,
+	serveLogged,
+	tmpFile as sharedTmpFile,
+} from "./helpers.mjs";
 
 // render() paces http(s) requests through a persistent per-origin state dir
 // (src/pacing.mjs). Point it at a throwaway directory so no test here ever
@@ -79,9 +77,7 @@ function pngSize(file) {
 	return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
 }
 
-function tmpFile(name) {
-	return path.join(mkdtempSync(path.join(tmpdir(), "trawl-shot-")), name);
-}
+const tmpFile = (name) => sharedTmpFile(name, "trawl-shot-");
 
 // Readability only treats a page as an article once it has a meaningful
 // amount of prose, so the structured fixture below pads itself past that
@@ -114,12 +110,7 @@ const APP_SHELL = `<!doctype html>
 <title>App shell</title>
 <div id="app"><img src="https://example.com/logo.png" alt="Logo"></div>`;
 
-function fixtureUrl(html, name) {
-	const dir = mkdtempSync(path.join(tmpdir(), "trawl-test-"));
-	const file = path.join(dir, name);
-	writeFileSync(file, html);
-	return pathToFileURL(file).href;
-}
+const fixtureUrl = (html, name) => sharedFixtureUrl(html, name, "trawl-test-");
 
 function harPath(name = "out.har") {
 	return path.join(mkdtempSync(path.join(tmpdir(), "trawl-har-")), name);
@@ -1158,76 +1149,14 @@ test("an explicit non-networkidle wait condition still fails on timeout, unretri
 // Spacing is then asserted on recorded starts with no tolerance, plus the
 // causal check that each request arrived no earlier than its recorded start.
 
-// The recorded start of the last gated request, or null if none yet. One
-// origin per test, so the pacing dir holds at most one state file (`.tmp`
-// files are in-flight writes, which are renamed atomically into place).
-function recordedStart(stateDir) {
-	const dir = path.join(stateDir, "pacing");
-	let files;
-	try {
-		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-	} catch {
-		return null;
-	}
-	if (files.length !== 1) return null;
-	try {
-		return JSON.parse(readFileSync(path.join(dir, files[0]), "utf8")).lastRequestAt ?? null;
-	} catch {
-		return null;
-	}
-}
-
-// Serves fixed bodies like `serve()` above, but logs when each path was hit
-// and, given `stateDir`, the recorded start of the request that hit it.
-async function serveLogged(routes, { stateDir } = {}) {
-	const hits = [];
-	const server = createServer((req, res) => {
-		const url = new URL(req.url, "http://127.0.0.1");
-		hits.push({
-			path: url.pathname,
-			at: Date.now(),
-			recorded: stateDir ? recordedStart(stateDir) : null,
-		});
-		const body = routes[url.pathname];
-		if (body === undefined) {
-			res.writeHead(404, { "content-type": "text/plain" });
-			res.end("not found");
-			return;
-		}
-		const type = url.pathname.endsWith(".txt") ? "text/plain" : "text/html";
-		res.writeHead(200, { "content-type": type });
-		res.end(body);
-	});
-	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-	const { port } = server.address();
-	return {
-		origin: `http://127.0.0.1:${port}`,
-		hits,
-		close: () => new Promise((resolve) => server.close(resolve)),
-	};
-}
+// `recordedStart`, `serveLogged` and `assertSpaced` implement exactly that:
+// they are shared with tests/cli.test.mjs through tests/helpers.mjs, which
+// carries this same reasoning next to them. `serveLogged` serves fixed bodies
+// like `serve()` above but also logs each hit; `assertSpaced` asserts the
+// spacing on recorded starts with no tolerance.
 
 function freshStateDir() {
 	return mkdtempSync(path.join(tmpdir(), "trawl-pacing-state-"));
-}
-
-// Every consecutive pair of gated requests started at least `minGapMs` apart
-// (by recorded start, exact), and none reached the server before it was
-// recorded. See the section comment above for why not arrival gaps.
-function assertSpaced(hits, minGapMs) {
-	for (const h of hits) {
-		assert.equal(typeof h.recorded, "number", `${h.path} arrived with no recorded start`);
-		assert.ok(h.at >= h.recorded, `${h.path} arrived before its recorded start`);
-	}
-	for (let i = 1; i < hits.length; i++) {
-		const gap = hits[i].recorded - hits[i - 1].recorded;
-		assert.ok(
-			gap >= minGapMs,
-			`${hits[i - 1].path} -> ${hits[i].path} started only ${gap}ms apart ` +
-				`(want >= ${minGapMs})` +
-				(gap === 0 ? "; the earlier request arrived after the later one was recorded" : ""),
-		);
-	}
 }
 
 // Capture what render() writes to stderr (the degraded-mode warning).

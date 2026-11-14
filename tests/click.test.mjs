@@ -2,29 +2,14 @@
 // run anywhere; the end-to-end ones need Chromium and skip cleanly without it.
 
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { resolveExecutablePath } from "../src/browser.mjs";
 import { parseArgs } from "../src/cli.mjs";
 import { ClickError, normalizeClickSteps, render } from "../src/render.mjs";
-
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+import { browserOpts as opts, runViaBin, tempDir } from "./helpers.mjs";
 
 // Never touch the real ~/.cache/trawl pacing state.
-process.env.TRAWL_STATE_DIR = mkdtempSync(join(tmpdir(), "trawl-state-"));
-
-const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
+process.env.TRAWL_STATE_DIR = tempDir("trawl-state-");
 
 // Content that exists only after a click. "#open" reveals a panel; "#more",
 // which only exists inside that panel, appends a second line after a short
@@ -304,17 +289,7 @@ test("a navigation late in the run never returns the other page", opts, async ()
 
 // --- CLI, through a bin symlink (the shape a PATH install runs) -------------
 
-function runBin(args) {
-	const dir = mkdtempSync(join(tmpdir(), "trawl-bin-"));
-	const link = join(dir, "trawl");
-	symlinkSync(CLI_PATH, link);
-	return new Promise((resolve) => {
-		execFile(link, args, (err, stdout, stderr) => {
-			rmSync(dir, { recursive: true, force: true });
-			resolve({ code: err?.code ?? 0, stdout, stderr });
-		});
-	});
-}
+const runBin = (args) => runViaBin(args, {}, "trawl-bin-");
 
 test("trawl --click ... --then-wait ... -s reads the revealed panel", opts, async () => {
 	const s = await serve();

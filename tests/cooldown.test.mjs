@@ -7,7 +7,7 @@
 // requests they receive. Nothing here reads or writes the real ~/.cache.
 
 import assert from "node:assert/strict";
-import { execFile, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -15,15 +15,13 @@ import {
 	readFileSync,
 	readdirSync,
 	rmSync,
-	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { resolveExecutablePath } from "../src/browser.mjs";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "../src/cli.mjs";
 import {
 	CooldownError,
@@ -41,22 +39,14 @@ import {
 import { callTool } from "../src/mcp.mjs";
 import { createPacer } from "../src/pacing.mjs";
 import { CooldownError as ExportedCooldownError, render } from "../src/render.mjs";
+import { binLink, browserOpts as browser, runBin } from "./helpers.mjs";
 
 // render() defaults to $TRAWL_STATE_DIR; never let it fall through to the
 // user's real cache.
 process.env.TRAWL_STATE_DIR = mkdtempSync(path.join(tmpdir(), "trawl-state-"));
 
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const browser = { skip: haveBrowser ? false : "no Chromium binary installed" };
-
 const ORIGIN = "https://example.test";
 const COOLDOWN_URL = new URL("../src/cooldown.mjs", import.meta.url).href;
-const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 const NO_BROWSER = { executablePath: path.join(tmpdir(), "trawl-no-such-chrome") };
 const T0 = Date.UTC(2026, 10, 3, 12, 0, 0);
 
@@ -833,20 +823,11 @@ test("click steps still work, and their navigation guard still fails the run", b
 });
 
 // --- the CLI, through a bin symlink as a PATH lookup runs it ---
-
-function runBin(link, args, env) {
-	return new Promise((resolve) => {
-		execFile(link, args, { env: { ...process.env, ...env } }, (err, stdout, stderr) => {
-			resolve({ code: err?.code ?? 0, stdout, stderr });
-		});
-	});
-}
+// `binLink` and `runBin` are shared (tests/helpers.mjs).
 
 test("the CLI exits 22 on a 503, then 4 with empty stdout until --ignore-cooldown", browser, async () => {
 	const TRAWL_STATE_DIR = freshDir();
-	const binDir = freshDir();
-	const link = path.join(binDir, "trawl");
-	symlinkSync(CLI_PATH, link);
+	const { link, cleanup } = binLink("trawl-cooldown-");
 	const s = await serve({ "/robots.txt": ROBOTS, "/page": respond(503, { "retry-after": "90" }) });
 	try {
 		const url = `${s.origin}/page`;
@@ -870,6 +851,6 @@ test("the CLI exits 22 on a 503, then 4 with empty stdout until --ignore-cooldow
 		assert.equal(s.count("/page"), 2);
 	} finally {
 		await s.close();
-		rmSync(binDir, { recursive: true, force: true });
+		cleanup();
 	}
 });

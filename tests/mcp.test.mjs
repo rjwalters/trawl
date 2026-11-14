@@ -1,16 +1,12 @@
 // Unit tests for the MCP tool handlers. These drive `callTool` directly with
 // an injected `render`, so no MCP client, browser, or network is needed. The
-// handful of tests that do want a real render use the same `haveBrowser`
-// guard as tests/render.test.mjs.
+// handful of tests that do want a real render use the shared `browserOpts`
+// skip guard from tests/helpers.mjs.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { resolveExecutablePath } from "../src/browser.mjs";
 import {
 	DEFAULT_MAX_CHARS,
 	TOOLS,
@@ -21,14 +17,7 @@ import {
 	renderOptionsFor,
 	truncate,
 } from "../src/mcp.mjs";
-
-let haveBrowser = true;
-try {
-	resolveExecutablePath();
-} catch {
-	haveBrowser = false;
-}
-const opts = { skip: haveBrowser ? false : "no Chromium binary installed" };
+import { browserOpts as opts, fixtureUrl as sharedFixtureUrl } from "./helpers.mjs";
 
 // A render stub that records what it was handed and replays a canned result.
 function stubRender(body = "ok") {
@@ -455,12 +444,7 @@ const SPA = `<!doctype html>
     '<h1>Hydrated</h1><a href="https://example.com/a">First</a>';
 </script>`;
 
-function fixtureUrl(html, name) {
-	const dir = mkdtempSync(path.join(tmpdir(), "trawl-mcp-test-"));
-	const file = path.join(dir, name);
-	writeFileSync(file, html);
-	return pathToFileURL(file).href;
-}
+const fixtureUrl = (html, name) => sharedFixtureUrl(html, name, "trawl-mcp-test-");
 
 test("fetch_page renders a real JS-built page", opts, async () => {
 	const result = await callTool("fetch_page", {

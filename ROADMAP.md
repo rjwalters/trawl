@@ -3,7 +3,7 @@
 `trawl` fetches client-rendered web pages from the command line, as a library
 and as a read-only MCP server, and behaves politely by default while doing it.
 
-Status as of 2026-11-13, `main` @ `a940713`.
+Status as of 2026-11-14, `main` @ `ad07538`.
 
 This file is the hand-written direction. `WORK_PLAN.md` is the generated view
 of the tracker's label state and `WORK_LOG.md` the generated record of what
@@ -11,9 +11,11 @@ merged; neither is edited by hand.
 
 ## Where it stands
 
-Released: **0.4.0** (tag `v0.4.0`, `CHANGELOG.md`; `[Unreleased]` is empty).
-Everything below is on `main` and covered by `npm test`, which CI runs on
-Node 22 and Node 24 (`.github/workflows/ci.yml`, Ubuntu).
+Released: **0.4.0** (tag `v0.4.0`, `CHANGELOG.md`). `[Unreleased]` holds two
+entries awaiting a 0.5.0 cut: the MCP load controls and the `robots.txt`
+`*`/`$` matching described below. Everything in the table is on `main` and
+covered by `npm test`, which CI runs on Node 22 and Node 24
+(`.github/workflows/ci.yml`, Ubuntu).
 
 | Area | State | Evidence |
 | --- | --- | --- |
@@ -21,70 +23,81 @@ Node 22 and Node 24 (`.github/workflows/ci.yml`, Ubuntu).
 | `networkidle` timeout retried once with `domcontentloaded` | done | `src/render.mjs`, README "Pages that never go idle" |
 | Click steps (`--click`, `--then-wait`) on the CLI and library | done | #56, `tests/click.test.mjs` |
 | HAR capture, `--har-omit-content`, `--har-redact` | done | #84 / PR #85, `tests/har-redact.test.mjs` |
-| `robots.txt` check before every `http(s)` fetch; unreachable means disallow | done, prefix matching only | #37, `src/robots.mjs` |
+| `robots.txt` check before every `http(s)` fetch; unreachable means disallow | done | #37, `src/robots.mjs` |
+| `robots.txt` rule paths honour `*` and a trailing `$` (RFC 9309 §2.2.3) | done | #109 / PR #114, `tests/robots.test.mjs` |
 | Per-origin pacing across runs, `Crawl-delay` honored | done | #38, `src/pacing.mjs` |
 | Per-origin cooldown after 429/503 (exit code 4) | done | #39 / PR #61, `src/cooldown.mjs` |
 | Auth-wall detection, `--profile`, `trawl login` (headed, finishes on window close) | done | #22, #24, #95, #96 / PR #98 |
 | Cookie import from HAR, `cookies.txt` or copy-as-cURL; `--cookies` for one fetch | done | #36, #76 to #79 / PRs #81, #82, #83, #86 |
 | Cookies sent on the `robots.txt` request, header-safe and kept out of errors | done | #87, #89, #91, #93 / PRs #88, #90, #92, #94 |
-| MCP server: `fetch_page`, `fetch_links`, output budget | done, one wait control only | `src/mcp.mjs`, `tests/mcp.test.mjs` |
+| MCP server: `fetch_page`, `fetch_links`, output budget | done | `src/mcp.mjs`, `tests/mcp.test.mjs` |
+| MCP load controls: `wait_until`, `settle_ms`, `timeout_ms` on both tools | done | #110 / PR #117, `tests/mcp.test.mjs` |
 | README usage block and MCP tool table pinned to `--help` and the tool schema | done | #74 / PR #80, `tests/readme.test.mjs` |
+| Shared test helpers (browser skip guard, `runBin`, `assertNoValue`) | done | #115 / PR #121, `tests/helpers.mjs` |
 
-The tracker holds no open work item today. The one open issue, #106, is the
-Champion's hold digest (zero holds), not work. There are no open pull requests.
+The tracker holds six open issues and one other open pull request. #106 is the
+Champion's hold digest (zero holds), not work. The rest is live work: #111 and
+#112 are the two remaining Now items below, #116 and #122 are test-reliability
+defects, and #120 is a Hermit simplification proposal awaiting a Champion
+decision. PR #119 is approved (`loom:pr`) and waiting to merge.
 
 ## Now
 
-Each of these can start today and fits one pull request. None has an issue yet.
+Each of these fits one pull request, and each has an issue filed.
 
-1. **`robots.txt` wildcard and end-anchor matching.** `matchRule` in
-   `src/robots.mjs` compares by literal prefix, so a rule such as
-   `Disallow: /*.pdf$` or `Disallow: /private/*/drafts` never matches and the
-   path is fetched. RFC 9309 section 2.2.3 lists `*` and `$` among the special
-   characters a crawler must support.
-   Done when: `matchRule` treats `*` as any run of characters and a trailing
-   `$` as end of path; the longest-match and `Allow`-wins-ties rules still
-   hold; `tests/robots.test.mjs` covers both; and the README Etiquette
-   sentence "Wildcard (`*`) and end-anchor (`$`) patterns are not supported"
-   is replaced. Blocked by: nothing. Note: the module header calls this out of
-   scope on purpose, so this reverses an earlier choice.
-
-2. **Load controls on the MCP tools.** `fetch_page` takes only `url`,
-   `format`, `selector` and `wait_for`; `fetch_links` only `url` and
-   `selector`. An agent cannot pass the README's own recipe for pages that
-   never go idle (`--wait-until domcontentloaded --settle <ms>`), so every
-   such page waits out the default timeout before the retry.
-   Done when: both tools accept optional `wait_until`, `settle_ms` and
-   `timeout_ms`, validated and mapped in `renderOptionsFor`; the README MCP
-   table lists them and `tests/readme.test.mjs` passes; `tests/mcp.test.mjs`
-   covers the mapping and the rejections. The surface stays read-only: no
-   click, no cookies, no profile. Blocked by: nothing.
-
-3. **Make the cookie helpers importable.** The README's library section tells
-   callers to prepare `{ cookies: [...] }` with `parseCookies`, `filterCookies`
-   and `browserWouldReject` "in `src/cookies.mjs`", but `package.json`
-   `exports` exposes only `.` (`src/render.mjs`), which does not re-export
-   them, so an installed package cannot import them.
+1. **Make the cookie helpers importable** (#111, PR #119 approved and awaiting
+   merge). The README's library section tells callers to prepare
+   `{ cookies: [...] }` with `parseCookies`, `filterCookies` and
+   `browserWouldReject` "in `src/cookies.mjs`", but `package.json` `exports`
+   exposes only `.` (`src/render.mjs`), which imports `addCookiesFailure` and
+   `cookieHeaderFor` without re-exporting the three the README names — so an
+   installed package cannot import them.
    Done when: the three functions (and `CookieParseError`) are importable from
    the published entry points, a test imports them through the package name
    rather than a relative path, and the README shows the import line.
-   Blocked by: nothing.
+   Blocked by: nothing; the work is done and merging #119 closes it.
 
-4. **Bring the README Status section up to date.** It still describes "the
-   first milestone set" and omits clicking, sign-in, cookies, pacing and
-   cooldowns; "see the issues for what's next" points at an empty tracker.
+2. **Bring the README Status section up to date** (#112, currently
+   `loom:blocked`). `README.md:577-582` still describes "the first milestone
+   set" and omits clicking, sign-in, cookies, pacing and cooldowns; "see the
+   issues for what's next" points the reader at a tracker that no longer
+   matches it.
    Done when: the section names the current capability set in a few lines and
-   links this file. Blocked by: nothing.
+   links this file. Blocked by: this file landing on `main` — that is what the
+   issue is waiting for, so the hold clears on merge rather than needing a
+   decision.
+
+3. **Make the `runBin` cookie-fetch tests skip instead of fail when Chromium
+   is only in the real `HOME`** (#116, `loom:issue`). Three tests in
+   `tests/cookies-fetch.test.mjs` override `HOME` to a temp dir so a fetch's
+   `$HOME` footprint can be measured, but Playwright resolves its browser
+   cache relative to `HOME`, so the subprocess finds nothing while the shared
+   skip guard — which resolves in the ambient environment — says "run".
+   Done when: the guard and the subprocess agree on the same `HOME`, so a host
+   with Chromium only in `~/.cache/ms-playwright` skips cleanly rather than
+   failing on exit code 1. Blocked by: nothing.
+
+4. **Report a `runBin` timeout as a failure, not exit code 0** (#122,
+   `loom:triage`). `tests/helpers.mjs` resolves `{ code: err?.code ?? 0 }`,
+   but when `execFile` kills the child on its own 60s timeout Node reports
+   `err.code === null` with `err.signal === "SIGTERM"` — so a hang is
+   indistinguishable from a clean run with empty output.
+   Done when: a killed child reports a non-zero code (or the signal) and a
+   test pins that, so a hang fails loudly. Blocked by: curation only — the
+   issue still needs `loom:curated` before dispatch.
 
 ## Next
 
-- **Release 0.5.0.** Unblocked once items 1 to 3 have merged. Done when
-  `CHANGELOG.md` has a dated `[0.5.0]` entry, `package.json` matches, and the
-  tag exists. Item 1 changes which paths are refused, so the entry must say
-  so. Publishing to npm is a maintainer step.
-- **Pin the denial message for pattern rules.** Unblocked by item 1. A denial
-  names the rule line that matched; done when a test pins that message for a
-  `*` rule and a `$` rule and the README Etiquette section shows one example.
+- **Release 0.5.0.** Unblocked once #119 has merged; items 2 to 4 above are
+  documentation and test hygiene and need not gate the cut. Done when
+  `CHANGELOG.md` has a dated `[0.5.0]` entry, `package.json` matches (it still
+  reads `0.4.0`), and the tag exists. The two `[Unreleased]` entries are
+  already written, and the `robots.txt` one already states that more paths are
+  refused than before — that note must survive into the release entry.
+  Publishing to npm is a maintainer step.
+- **Decide #120** (remove the `pacingOrigin`/`cooldownOrigin` aliases for
+  `stateOrigin`). A Hermit proposal, so it needs a Champion decision before it
+  is work. Done when the issue is promoted or closed with a rationale.
 
 ## Later
 
@@ -109,12 +122,24 @@ Direction, each with the question to answer first.
   `src/browser.mjs` has Windows paths, but CI runs on Ubuntu only. Question:
   which of the browser-resolution and login tests can run headless on those
   runners?
+- **Percent-encoding normalisation in `robots.txt` matching** (RFC 9309
+  §2.2.2). Both sides are compared exactly as given, so `/a/~file` and
+  `/a/%7Efile` are different paths. Question: does any real `robots.txt`
+  depend on the normalised reading?
 
 ## Blocked and waiting
 
-Nothing is parked on a decision or an upstream release. Equally, **nothing is
-dispatchable from the tracker today**: the four Now items need issues filed
-before any of them can be picked up.
+Nothing is parked on an upstream release. Two items wait on something other
+than an available pair of hands, and one tracker entry is not work at all:
+
+- **#112** waits on this file reaching `main`, which is the whole of its
+  blocker — no decision needed.
+- **#120** waits on a Champion decision, as every proposal does.
+- **#106** is not work: it is the Champion's merge-risk hold digest, currently
+  recording zero holds.
+
+Everything else in the tracker is dispatchable: #116 is `loom:issue`, #111 has
+an approved PR awaiting merge, and #122 needs curation rather than a decision.
 
 ## Not planned
 

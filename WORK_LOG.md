@@ -3,6 +3,16 @@
 Chronological record of merged PRs and closed issues, newest first.
 Maintained by the Loom Guide role; entries are appended automatically.
 
+### 2026-11-14
+
+- **PR #121**: test: share the browser guard, runBin and assertNoValue via tests/helpers.mjs
+- **PR #117**: feat: accept wait_until, settle_ms and timeout_ms on the MCP tools
+- **PR #114**: feat: honour `*` wildcard and `$` end anchor in robots.txt rule paths
+- **Issue #118** (closed): Deduplicate the haveBrowser test guard into one helper, and make it actually check launchability
+- **Issue #115** (closed): Consolidate duplicated test helpers into tests/helpers.mjs (7 copies of the browser skip guard, 5 of runBin, 3 drifted assertNoValue)
+- **Issue #110** (closed): MCP: accept wait_until, settle_ms and timeout_ms on fetch_page and fetch_links
+- **Issue #109** (closed): robots.txt: support `*` and `$` in Allow/Disallow paths (RFC 9309 section 2.2.3)
+
 ### 2026-11-12
 
 - **PR #105**: Bump Repo Skills 0.26.0 -> 0.26.1

@@ -115,6 +115,113 @@ test("Disallow: / blocks the whole site", () => {
 	assert.equal(verdict("User-agent: *\nDisallow: /", "/").allowed, false);
 });
 
+// --- RFC 9309 §2.2.3: the `*` wildcard and the `$` end anchor ---
+
+test("`*` matches any run of characters mid-path, including none", () => {
+	const text = "User-agent: *\nDisallow: /private/*/drafts";
+	assert.equal(verdict(text, "/private/x/drafts").allowed, false);
+	assert.equal(verdict(text, "/private/a/b/drafts").allowed, false);
+	// `*` spans `/`: RFC 9309 has no segment-scoped wildcard.
+	assert.equal(verdict(text, "/private//drafts").allowed, false);
+	assert.equal(verdict(text, "/private/x/other").allowed, true);
+});
+
+test("a trailing `*` is equivalent to the prefix before it", () => {
+	const text = "User-agent: *\nDisallow: /fish*";
+	assert.equal(verdict(text, "/fish.html").allowed, false);
+	assert.equal(verdict(text, "/fishheads").allowed, false);
+	assert.equal(verdict(text, "/fish").allowed, false);
+	assert.equal(verdict(text, "/catfish").allowed, true);
+});
+
+test("a trailing `$` anchors the rule to the end of the path", () => {
+	const text = "User-agent: *\nDisallow: /*.pdf$";
+	assert.equal(verdict(text, "/docs/a.pdf").allowed, false);
+	assert.equal(verdict(text, "/a.pdf").allowed, false);
+	// The query string is part of the matched path, so it defeats the anchor.
+	assert.equal(verdict(text, "/docs/a.pdf?x=1").allowed, true);
+	assert.equal(verdict(text, "/a.pdf/more").allowed, true);
+});
+
+test("`$` is a literal character anywhere but the final position", () => {
+	const text = "User-agent: *\nDisallow: /a$b";
+	assert.equal(verdict(text, "/a$bc").allowed, false);
+	assert.equal(verdict(text, "/ab").allowed, true);
+});
+
+test("`*` and `$` combine in one pattern", () => {
+	const text = "User-agent: *\nDisallow: /archive/*/*.tar.gz$";
+	assert.equal(verdict(text, "/archive/2024/backup.tar.gz").allowed, false);
+	assert.equal(verdict(text, "/archive/a/b/c/x.tar.gz").allowed, false);
+	assert.equal(verdict(text, "/archive/2024/backup.tar.gz.sig").allowed, true);
+	// Needs a `/` after the first wildcard, which this path has no room for.
+	assert.equal(verdict(text, "/archive/backup.tar.gz").allowed, true);
+});
+
+test("a longer Allow pattern overrides a shorter Disallow pattern", () => {
+	const text = "User-agent: *\nDisallow: /docs/*\nAllow: /docs/*/public$";
+	const allowed = verdict(text, "/docs/a/public");
+	assert.equal(allowed.allowed, true);
+	assert.equal(allowed.rule, "Allow: /docs/*/public$");
+	assert.equal(verdict(text, "/docs/a/private").allowed, false);
+});
+
+test("Allow breaks an equal-length tie between wildcard patterns", () => {
+	const text = "User-agent: *\nDisallow: /x/*/y\nAllow: /x/*/y";
+	const result = verdict(text, "/x/a/y");
+	assert.equal(result.allowed, true);
+	assert.equal(result.rule, "Allow: /x/*/y");
+});
+
+test("`Disallow: *` matches every path; `Disallow: $` matches none", () => {
+	assert.equal(
+		verdict("User-agent: *\nDisallow: *", "/anything").allowed,
+		false,
+	);
+	// An empty anchored pattern can never equal the `/` default path.
+	assert.equal(verdict("User-agent: *\nDisallow: $", "/anything").allowed, true);
+	assert.equal(verdict("User-agent: *\nDisallow: $", "").allowed, true);
+});
+
+test("percent-encoding is still not normalised on either side", () => {
+	const text = "User-agent: *\nDisallow: /*~file";
+	assert.equal(verdict(text, "/a/~file").allowed, false);
+	assert.equal(verdict(text, "/a/%7Efile").allowed, true);
+});
+
+test("a wildcard rule's denial message still quotes the matched rule line", () => {
+	const result = verdict("User-agent: *\nDisallow: /*.pdf$", "/docs/a.pdf");
+	assert.equal(result.allowed, false);
+	assert.equal(result.rule, "Disallow: /*.pdf$");
+	assert.equal(
+		robotsDenialMessage(result),
+		"robots.txt disallows this path (Disallow: /*.pdf$). " +
+			"Use --ignore-robots to override.",
+	);
+});
+
+test("wildcard matching is bounded: a pathological rule cannot hang", () => {
+	// `/*a*a*a*a*a*b` against a run of `a` with no `b` is the shape that makes
+	// a naive `*` -> `.*` regex backtrack catastrophically: measured at 7.6s
+	// for a 120-character path, growing ~4x per 20 characters. The segment
+	// matcher is O(path x pattern) with no backtracking, so it returns in
+	// well under a millisecond. The 1,000ms bound is ample for the matcher and
+	// still fails loudly on a regex regression.
+	const text = "User-agent: *\nDisallow: /*a*a*a*a*a*b";
+
+	const smallStart = process.hrtime.bigint();
+	assert.equal(verdict(text, `/${"a".repeat(120)}`).allowed, true);
+	const smallMs = Number(process.hrtime.bigint() - smallStart) / 1e6;
+	assert.ok(smallMs < 1000, `120-character path took ${smallMs.toFixed(1)}ms`);
+
+	// Only reached when the bound above held, so a regressed implementation
+	// fails on the 120-character case rather than hanging here.
+	const bigStart = process.hrtime.bigint();
+	assert.equal(verdict(text, `/${"a".repeat(100_000)}`).allowed, true);
+	const bigMs = Number(process.hrtime.bigint() - bigStart) / 1e6;
+	assert.ok(bigMs < 1000, `100,000-character path took ${bigMs.toFixed(1)}ms`);
+});
+
 test("a group naming our product token wins over the wildcard group", () => {
 	const text = `User-agent: *
 Disallow: /

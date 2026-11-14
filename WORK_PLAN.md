@@ -14,45 +14,48 @@ _None._
 
 `loom:very-important` (one counts per workspace); every stage takes these first.
 
-- **#109**: robots.txt: support `*` and `$` in Allow/Disallow paths (RFC 9309 section 2.2.3)
+_None._
 
 ## Important
 
 `loom:important`; taken before unlabelled work.
 
-- **#110**: MCP: accept wait_until, settle_ms and timeout_ms on fetch_page and fetch_links
 - **#111**: Library: cookie helpers named in the README cannot be imported from the installed package
+- **#112**: README: bring the Status section up to date and link ROADMAP.md
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#120**: Remove the pacingOrigin/cooldownOrigin aliases: three names for one stateOrigin
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#111**: Library: cookie helpers named in the README cannot be imported from the installed package
+- **#116**: tests: cookies-fetch runBin tests fail instead of skipping when Chromium is only in HOME's Playwright cache
+- **#123**: Remove the duplicated test HTTP fixture servers: the helper group #115 missed (serve vs serveLogged, 23 copies of the listen/close trailer)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#108**: docs: roadmap as of 2026-11-13
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-_None._
+- **#108**: docs: roadmap as of 2026-11-13
+- **#119**: feat: re-export the cookie helpers from the package entry point
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#109**: robots.txt: support `*` and `$` in Allow/Disallow paths (RFC 9309 section 2.2.3) *(curated)*
-- **#110**: MCP: accept wait_until, settle_ms and timeout_ms on fetch_page and fetch_links *(curated)*
+- **#111**: Library: cookie helpers named in the README cannot be imported from the installed package *(curated)*
+- **#116**: tests: cookies-fetch runBin tests fail instead of skipping when Chromium is only in HOME's Playwright cache *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -67,12 +70,12 @@ _None._
 | Bucket | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Very important | 1 |
+| Very important | 0 |
 | Important | 2 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 0 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 2 |
 | Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |

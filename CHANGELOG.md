@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Load controls on the MCP tools.** `fetch_page` and `fetch_links` now
+  accept optional `wait_until` (`load` | `domcontentloaded` |
+  `networkidle`), `settle_ms` and `timeout_ms`, mapping onto the renderer's
+  `waitUntil`, `settle` and `timeout`. An agent can finally reach the
+  "Pages that never go idle" recipe the README gives CLI users
+  (`--wait-until domcontentloaded --settle <ms>`); before this, such a page
+  waited out the full 30,000 ms default on every call before the automatic
+  `domcontentloaded` retry, and a page needing a longer settle or timeout
+  could not be tuned through MCP at all. `settle_ms` and `timeout_ms` are
+  bounded at 600,000 ms, `settle_ms` accepts `0` and `timeout_ms` requires
+  at least `1` — it deliberately does not take Playwright's `0` meaning
+  "no timeout", which would hang a tool call uncancellably. Values are
+  validated in the mapping as well as advertised in the JSON schema, so a
+  bad one is a tool error and the server keeps serving. Omitting all three
+  leaves behaviour exactly as before.
+
 ## [0.4.0] - 2026-11-10
 
 `trawl` can now borrow the cookies your everyday browser already has: import

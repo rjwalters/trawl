@@ -545,11 +545,18 @@ talked into pressing things on it.
 
 | Tool | Arguments |
 | --- | --- |
-| `fetch_page` | `url`, `format?` (`text`\|`html`\|`links`\|`title`\|`markdown`), `selector?`, `wait_for?` |
-| `fetch_links` | `url`, `selector?` |
+| `fetch_page` | `url`, `format?` (`text`\|`html`\|`links`\|`title`\|`markdown`), `selector?`, `wait_for?`, `wait_until?` (`load`\|`domcontentloaded`\|`networkidle`), `settle_ms?`, `timeout_ms?` |
+| `fetch_links` | `url`, `selector?`, `wait_until?` (`load`\|`domcontentloaded`\|`networkidle`), `settle_ms?`, `timeout_ms?` |
 
 `fetch_links` exists separately so an agent can crawl without pulling whole
-page bodies into its context. Results longer than 100,000 characters are
+page bodies into its context. Both tools take the load controls the CLI
+exposes as `--wait-until`, `--settle` and `--timeout`, so the "Pages that never
+go idle" recipe above is reachable from an agent too: pass
+`{"wait_until": "domcontentloaded", "settle_ms": 2000}` rather than waiting out
+the 30,000 ms default. `settle_ms` and `timeout_ms` are capped at 600,000 ms,
+and `timeout_ms` must be at least 1 — unlike the CLI's `--timeout`, it will not
+take `0` as Playwright's "no timeout", which would hang a tool call with no way
+to cancel it. Results longer than 100,000 characters are
 truncated with a notice saying so; set `TRAWL_MCP_MAX_CHARS` to change the
 budget. A failed fetch comes back as a tool error — the server keeps serving.
 Tool calls are paced per origin with the default 1000 ms floor, shared with

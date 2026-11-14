@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bad one is a tool error and the server keeps serving. Omitting all three
   leaves behaviour exactly as before.
 
+- **The cookie helpers the README names are now importable.** `parseCookies`,
+  `filterCookies`, `browserWouldReject` and `CookieParseError` are re-exported
+  from the package entry point, so `import { parseCookies } from
+  "@rjwalters/trawl"` works. The README had told library callers to use them
+  "in `src/cookies.mjs`", but `exports` lists only the main entry, so every
+  route to them failed with `ERR_PACKAGE_PATH_NOT_EXPORTED` — leaving
+  `render(url, { cookies })` documented with no supported way to build the
+  list it takes. Re-exporting rather than adding a `./cookies` subpath keeps
+  the public surface to these four names instead of all of `cookies.mjs`.
+  Nothing else about the entry point changes, and `src/cookies.mjs` itself
+  stays an unreachable subpath.
+
 ### Changed
 
 - **`robots.txt` rule paths now honour `*` and `$`** (RFC 9309 §2.2.3).

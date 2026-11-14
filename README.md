@@ -494,11 +494,42 @@ browser profile instead of a fresh one each call, the library equivalent of
 
 `{ cookies: [...] }` is the library side of `--cookies`: Playwright cookie
 objects (`name`, `value`, `domain`, `path`, `expires`, `httpOnly`, `secure`),
-already parsed and filtered (`parseCookies`, `filterCookies` and
-`browserWouldReject` in `src/cookies.mjs` do that), added to the context
-before the page loads and passed through unchanged. With `profileDir` as well
-they are written into that profile. If the browser refuses them, `render()`
-rejects with a fixed message that never quotes the browser's error.
+added to the context before the page loads and passed through unchanged. With
+`profileDir` as well they are written into that profile. If the browser
+refuses them, `render()` rejects with a fixed message that never quotes the
+browser's error.
+
+`parseCookies`, `filterCookies`, `browserWouldReject` and `CookieParseError`
+are exported for building that list — the same three steps the CLI runs for
+`--cookies`:
+
+```js
+import { readFileSync } from "node:fs";
+import {
+  browserWouldReject,
+  filterCookies,
+  parseCookies,
+  render,
+} from "@rjwalters/trawl";
+
+// Auto-detects HAR / Netscape cookies.txt / copy-as-cURL. Throws
+// CookieParseError (fixed message, never echoes the input) if it is none.
+const parsed = parseCookies(readFileSync("cookies.txt", "utf8"));
+
+// Returns a report, not an array — the list is `.cookies`. `includeAuth`
+// defaults to false, so pass it to keep the sign-in cookies.
+const { cookies } = filterCookies(parsed, {
+  domain: "example.com",
+  includeAuth: true,
+});
+
+// One cookie Chromium would refuse fails the whole batch, so set those aside.
+const accepted = cookies.filter((c) => !browserWouldReject(c));
+
+const { body } = await render("https://example.com/dashboard", {
+  cookies: accepted,
+});
+```
 
 `render()` accepts the same click steps as `{ click: [...] }`: each entry is
 a CSS selector string, or `{ selector, waitFor }` for the `--then-wait` form.

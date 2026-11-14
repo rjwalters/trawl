@@ -14,13 +14,14 @@ _None._
 
 `loom:very-important` (one counts per workspace); every stage takes these first.
 
-_None._
+- **#109**: robots.txt: support `*` and `$` in Allow/Disallow paths (RFC 9309 section 2.2.3)
 
 ## Important
 
 `loom:important`; taken before unlabelled work.
 
-_None._
+- **#110**: MCP: accept wait_until, settle_ms and timeout_ms on fetch_page and fetch_links
+- **#111**: Library: cookie helpers named in the README cannot be imported from the installed package
 
 ## Ready
 
@@ -38,7 +39,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#108**: docs: roadmap as of 2026-11-13
 
 ## Approved (Awaiting Merge)
 
@@ -50,7 +51,8 @@ _None._
 
 Issues carrying `loom:curated`.
 
-_None._
+- **#109**: robots.txt: support `*` and `$` in Allow/Disallow paths (RFC 9309 section 2.2.3) *(curated)*
+- **#110**: MCP: accept wait_until, settle_ms and timeout_ms on fetch_page and fetch_links *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -65,13 +67,13 @@ _None._
 | Bucket | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Very important | 0 |
-| Important | 0 |
+| Very important | 1 |
+| Important | 2 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 0 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
